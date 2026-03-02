@@ -1,15 +1,29 @@
 Start the issue worker orchestrator for this repository in autonomous mode.
 
+## Target Repository
+
+The `--repo` argument controls which repository this worker operates on:
+
+| Invocation | Behaviour |
+|---|---|
+| *(no flag)* | Operate on the current working directory. Fails if cwd is not a git repo. |
+| `--repo owner/name` | Operate on an existing remote GitHub repo. All `gh` commands use `--repo owner/name`. |
+| `--repo name` | Scaffold a new private GitHub repo named `name`, then operate on it. |
+| `--repo path/to/local/dir` | Operate on the local directory. Fails if it is not a git repo. |
+
+All `gh` commands in this skill must be scoped with `--repo <owner>/<name>` when the target is a remote repo.
+All `git` commands must be run with `-C <local_path>` (or inside the cloned directory) when operating on a local path.
+
 ## Setup
 
 1. Detect the default branch:
    ```bash
-   DEFAULT_BRANCH=$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name')
+   DEFAULT_BRANCH=$(gh repo view --repo <owner>/<repo> --json defaultBranchRef --jq '.defaultBranchRef.name')
    ```
 
 2. Ensure you're on the default branch:
    ```bash
-   git checkout $DEFAULT_BRANCH && git pull origin $DEFAULT_BRANCH
+   git -C <local_path> checkout $DEFAULT_BRANCH && git -C <local_path> pull origin $DEFAULT_BRANCH
    ```
 
 3. Run startup checks per the Orchestrator-Dispatch Protocol in ~/.claude/CLAUDE.md:

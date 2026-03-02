@@ -408,11 +408,13 @@ class TestRunPlanIssues:
 
 
 class TestDesignWorkerCommand:
-    def test_missing_repo_fails(self) -> None:
+    def test_no_repo_outside_git_dir_fails(self, tmp_path: Path) -> None:
+        """design-worker without --repo fails when cwd is not a git repo."""
         runner = CliRunner()
-        result = runner.invoke(design_worker, ["--research-milestone", "v1"])
+        with runner.isolated_filesystem(temp_dir=tmp_path):
+            result = runner.invoke(design_worker, ["--research-milestone", "v1"])
         assert result.exit_code != 0
-        assert "Missing option" in result.output or "--repo" in result.output
+        assert "not a git repository" in result.output or "Error" in result.output
 
     def test_missing_research_milestone_fails(self) -> None:
         runner = CliRunner()
@@ -453,11 +455,13 @@ class TestDesignWorkerCommand:
 
 
 class TestPlanIssuesCommand:
-    def test_missing_repo_fails(self) -> None:
+    def test_no_repo_outside_git_dir_fails(self, tmp_path: Path) -> None:
+        """plan-issues without --repo fails when cwd is not a git repo."""
         runner = CliRunner()
-        result = runner.invoke(plan_issues, ["--impl-milestone", "v1"])
+        with runner.isolated_filesystem(temp_dir=tmp_path):
+            result = runner.invoke(plan_issues, ["--impl-milestone", "v1"])
         assert result.exit_code != 0
-        assert "Missing option" in result.output or "--repo" in result.output
+        assert "not a git repository" in result.output or "Error" in result.output
 
     def test_missing_impl_milestone_fails(self) -> None:
         runner = CliRunner()

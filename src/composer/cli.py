@@ -304,6 +304,263 @@ def _sanitize_issue_body(text: str, max_chars: int = MAX_PROMPT_CHARS) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _is_git_repo(path: str) -> bool:
+    """Return True if *path* is inside a git repository.
+
+    Runs ``git -C <path> rev-parse --git-dir`` and checks the exit code.
+
+    Args:
+        path: Filesystem path to test.
+
+    Returns:
+        True if the path is inside a git repo; False otherwise.
+    """
+    result = subprocess.run(
+        ["git", "-C", path, "rev-parse", "--git-dir"],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def _scaffold_new_repo(name: str) -> str:
+    """Create a new local directory, init git, and push to GitHub as a private repo.
+
+    Steps:
+      1. Create ``<name>/`` directory with a minimal README.md and .gitignore
+      2. ``git init``, ``git add .``, ``git commit -m "init"``
+      3. ``gh repo create <name> --private --source=. --push``
+
+    Args:
+        name: Repository name (no slashes). Used for directory and GitHub repo names.
+
+    Returns:
+        Absolute path to the newly-created local directory.
+
+    Raises:
+        click.ClickException: If directory creation, git init, or gh repo create fails.
+    """
+    repo_path = os.path.abspath(name)
+
+    if os.path.exists(repo_path):
+        raise click.ClickException(
+            f"Directory '{repo_path}' already exists. Remove it or choose a different name."
+        )
+
+    try:
+        os.makedirs(repo_path)
+    except OSError as exc:
+        raise click.ClickException(f"Failed to create directory '{repo_path}': {exc}") from exc
+
+    # Write a minimal README
+    readme_path = os.path.join(repo_path, "README.md")
+    with open(readme_path, "w", encoding="utf-8") as fh:
+        fh.write(f"# {name}\n\nInitialized by breadmin-composer.\n")
+
+    # Write a minimal .gitignore
+    gitignore_path = os.path.join(repo_path, ".gitignore")
+    with open(gitignore_path, "w", encoding="utf-8") as fh:
+        fh.write("__pycache__/\n*.pyc\n.env\n")
+
+    # git init
+    init = subprocess.run(
+        ["git", "init"],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+    )
+    if init.returncode != 0:
+        raise click.ClickException(f"git init failed in '{repo_path}':\n{init.stderr}")
+
+    # git add .
+    add = subprocess.run(
+        ["git", "add", "."],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+    )
+    if add.returncode != 0:
+        raise click.ClickException(f"git add failed in '{repo_path}':\n{add.stderr}")
+
+    # git commit
+    commit = subprocess.run(
+        ["git", "commit", "-m", "init"],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+    )
+    if commit.returncode != 0:
+        raise click.ClickException(f"git commit failed in '{repo_path}':\n{commit.stderr}")
+
+    # gh repo create
+    create = subprocess.run(
+        ["gh", "repo", "create", name, "--private", "--source=.", "--push"],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+    )
+    if create.returncode != 0:
+        raise click.ClickException(f"gh repo create failed for '{name}':\n{create.stderr}")
+
+    return repo_path
+
+
+def _resolve_repo(repo_arg: str | None) -> tuple[str, str | None]:
+    """Resolve the ``--repo`` argument to a (repo_ref, local_path) pair.
+
+    The ``repo_ref`` is what gets passed to ``gh --repo``.  ``local_path`` is
+    the working directory for ``git`` commands (or ``None`` when the repo is
+    purely remote and already cloned via ``gh``).
+
+    Resolution rules
+    ----------------
+    1. ``repo_arg`` is ``None`` (no ``--repo`` flag)
+       → validate that cwd is a git repo; raise ClickException if not.
+       → return (github_remote_from_cwd, cwd)
+
+    2. ``repo_arg`` contains ``/`` and matches ``owner/name``
+       → treat as an existing remote repo; no local scaffolding.
+       → return (repo_arg, None)
+
+    3. ``repo_arg`` is a plain name with no ``/`` (no directory separators)
+       → scaffold a new private GitHub repo called ``name``.
+       → return (owner/name, abs_path_to_new_dir)
+
+    4. ``repo_arg`` is a path that contains ``os.sep`` or starts with ``.``
+       → treat as a local directory path; fail if not a git repo.
+       → return (github_remote_from_path, abs_path)
+
+    Args:
+        repo_arg: Raw value of the ``--repo`` CLI option, or ``None``.
+
+    Returns:
+        A ``(repo_ref, local_path)`` tuple where:
+        - ``repo_ref`` is a ``owner/name`` string (for ``gh --repo``) or an
+          empty string when the repo can only be identified by its local path.
+        - ``local_path`` is the absolute filesystem path, or ``None`` for a
+          purely remote operation.
+
+    Raises:
+        click.ClickException: On validation failure or scaffold error.
+    """
+    # -----------------------------------------------------------------------
+    # Case 1: No --repo flag → operate on cwd
+    # -----------------------------------------------------------------------
+    if repo_arg is None:
+        cwd = os.getcwd()
+        if not _is_git_repo(cwd):
+            raise click.ClickException(
+                "current directory is not a git repository.\n"
+                "Run from inside a git repo, or pass --repo <owner/name>."
+            )
+        # Try to infer owner/name from the remote URL
+        repo_ref = _infer_github_repo_from_path(cwd) or ""
+        return repo_ref, cwd
+
+    # -----------------------------------------------------------------------
+    # Case 2: Looks like "owner/name" — exactly two non-empty parts separated
+    # by a single "/" with no leading ".", no leading "/", and no additional "/"
+    # characters (so "a/b/c" or "./foo/bar" fall through to Case 3).
+    # -----------------------------------------------------------------------
+    _github_slug_re = re.compile(r"^[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+$")
+    if _github_slug_re.match(repo_arg):
+        return repo_arg, None
+
+    # -----------------------------------------------------------------------
+    # Case 3: Looks like a local path (starts with . or / or contains multiple
+    # path components that are not a two-part GitHub slug)
+    # -----------------------------------------------------------------------
+    if repo_arg.startswith(".") or repo_arg.startswith("/") or "/" in repo_arg:
+        abs_path = os.path.abspath(repo_arg)
+        if not os.path.isdir(abs_path):
+            raise click.ClickException(f"'{repo_arg}' is not a directory.")
+        if not _is_git_repo(abs_path):
+            raise click.ClickException(
+                f"'{abs_path}' is not a git repository.\n"
+                "Pass --repo <owner/name> to use a remote repo, or run from inside a git repo."
+            )
+        repo_ref = _infer_github_repo_from_path(abs_path) or ""
+        return repo_ref, abs_path
+
+    # -----------------------------------------------------------------------
+    # Case 4: Plain name with no slashes → scaffold a new private repo
+    # -----------------------------------------------------------------------
+    local_path = _scaffold_new_repo(repo_arg)
+    # After scaffolding, infer the remote owner/name
+    repo_ref = _infer_github_repo_from_path(local_path) or repo_arg
+    return repo_ref, local_path
+
+
+def _infer_github_repo_from_path(path: str) -> str | None:
+    """Infer the GitHub ``owner/name`` from the git remote URL at *path*.
+
+    Checks ``origin`` first, then falls back to the first remote found.
+    Handles both HTTPS (``https://github.com/owner/name.git``) and SSH
+    (``git@github.com:owner/name.git``) remote URL formats.
+
+    Args:
+        path: Absolute path to a git repository.
+
+    Returns:
+        ``owner/name`` string, or ``None`` if no GitHub remote is found.
+    """
+    result = subprocess.run(
+        ["git", "-C", path, "remote", "get-url", "origin"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        # Try listing all remotes
+        list_result = subprocess.run(
+            ["git", "-C", path, "remote"],
+            capture_output=True,
+            text=True,
+        )
+        if list_result.returncode != 0 or not list_result.stdout.strip():
+            return None
+        first_remote = list_result.stdout.strip().splitlines()[0]
+        result = subprocess.run(
+            ["git", "-C", path, "remote", "get-url", first_remote],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return None
+
+    url = result.stdout.strip()
+    return _parse_github_owner_name(url)
+
+
+def _parse_github_owner_name(url: str) -> str | None:
+    """Extract ``owner/name`` from a GitHub remote URL.
+
+    Supports:
+    - ``https://github.com/owner/name.git``
+    - ``https://github.com/owner/name``
+    - ``git@github.com:owner/name.git``
+    - ``git@github.com:owner/name``
+
+    Args:
+        url: Remote URL string.
+
+    Returns:
+        ``owner/name`` without ``.git`` suffix, or ``None`` if not a GitHub URL.
+    """
+    import re as _re
+
+    # HTTPS: https://github.com/owner/name[.git]
+    https_match = _re.match(r"https?://github\.com/([^/]+/[^/]+?)(?:\.git)?$", url)
+    if https_match:
+        return https_match.group(1)
+
+    # SSH: git@github.com:owner/name[.git]
+    ssh_match = _re.match(r"git@github\.com:([^/]+/[^/]+?)(?:\.git)?$", url)
+    if ssh_match:
+        return ssh_match.group(1)
+
+    return None
+
+
 def _gh(
     args: list[str], *, repo: str | None = None, check: bool = True
 ) -> subprocess.CompletedProcess:
@@ -2614,12 +2871,113 @@ def _run_plan_issues(
 
 
 # ---------------------------------------------------------------------------
+# Plan-milestones helpers
+# ---------------------------------------------------------------------------
+
+
+def _run_plan_milestones(
+    repo: str,
+    version: str,
+    config: Config,
+    checkpoint: Checkpoint,
+    dry_run: bool = False,
+) -> None:
+    """Dispatch a single plan-milestones agent to create a milestone pair and seed issues.
+
+    Builds a prompt by injecting the ``plan-milestones`` skill file and
+    invoking ``runner.run()`` once. The agent reads the spec, creates
+    milestones, and files seed research issues.
+
+    Args:
+        repo:       GitHub repository in ``owner/repo`` format.
+        version:    Version identifier (e.g. ``"MVP"``, ``"v2"``).
+        config:     Validated Config instance.
+        checkpoint: Active Checkpoint instance.
+        dry_run:    If True, print the prompt length without executing.
+    """
+    checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
+    today = date.today().isoformat()
+
+    base_prompt = (
+        f"## Session Parameters\n"
+        f"- Repository: {repo}\n"
+        f"- Version: {version}\n"
+        f"- Session Date: {today}\n\n"
+        f"You are the plan-milestones orchestrator for the `{repo}` repository.\n"
+        f"Read the spec at `docs/specs/{version}.md`, create the milestone pair, "
+        f"and file seed research issues following the skill instructions below."
+    )
+    prompt = inject_skill("plan-milestones", base_prompt)
+
+    if dry_run:
+        click.echo(
+            f"[dry-run] Would dispatch plan-milestones agent for version "
+            f"{version!r} in repo {repo!r}"
+        )
+        click.echo(f"[dry-run] Prompt length: {len(prompt)} chars")
+        return
+
+    logger.log_conductor_event(
+        run_id=checkpoint.run_id,
+        phase="dispatch",
+        event_type="plan_milestones_start",
+        payload={"repo": repo, "version": version},
+        log_dir=config.log_dir.expanduser(),
+    )
+
+    env = build_subprocess_env(config)
+    result = runner.run(
+        prompt=prompt,
+        allowed_tools=[
+            "Bash",
+            "Read",
+            "Glob",
+            "Grep",
+            "mcp__notion__API-post-page",
+        ],
+        env=env,
+        max_turns=200,
+    )
+
+    logger.log_conductor_event(
+        run_id=checkpoint.run_id,
+        phase="dispatch",
+        event_type="plan_milestones_complete",
+        payload={
+            "repo": repo,
+            "version": version,
+            "subtype": result.subtype,
+            "is_error": result.is_error,
+            "error_code": result.error_code,
+        },
+        log_dir=config.log_dir.expanduser(),
+    )
+    session.save(checkpoint, checkpoint_path)
+
+    if result.is_error:
+        click.echo(
+            f"Plan-milestones completed with error: {result.subtype} / {result.error_code}",
+            err=True,
+        )
+    else:
+        click.echo(f"Plan-milestones complete for version '{version}'.")
+
+
+# ---------------------------------------------------------------------------
 # Entry points
 # ---------------------------------------------------------------------------
 
 
 @click.command("impl-worker")
-@click.option("--repo", required=True, help="Target repo in OWNER/REPO format")
+@click.option(
+    "--repo",
+    default=None,
+    help=(
+        "Target repository. Accepts: 'owner/name' (existing remote), "
+        "'name' (new private repo to scaffold), 'path/to/local/dir' (local git repo), "
+        "or omit to operate on the current working directory."
+    ),
+)
 @click.option("--milestone", default=None, help="Milestone name to process")
 @click.option("--model", default=None, help="Override Claude model")
 @click.option("--max-budget", type=float, default=None, help="USD budget cap")
@@ -2627,7 +2985,7 @@ def _run_plan_issues(
 @click.option("--dry-run", is_flag=True, help="Print invocation without executing")
 @click.option("--resume", default=None, help="Resume a previous session by ID")
 def impl_worker(
-    repo: str,
+    repo: str | None,
     milestone: str | None,
     model: str | None,
     max_budget: float | None,
@@ -2636,7 +2994,8 @@ def impl_worker(
     resume: str | None,
 ) -> None:
     """Process implementation issues headlessly via claude -p."""
-    overrides: dict = {"github_repo": repo}
+    repo_ref, _local_path = _resolve_repo(repo)
+    overrides: dict = {"github_repo": repo_ref or None, "target_repo": repo_ref or None}
     if model:
         overrides["model"] = model
     if max_budget is not None:
@@ -2656,7 +3015,7 @@ def impl_worker(
     )
 
     _run_impl_worker(
-        repo=repo,
+        repo=repo_ref,
         milestone=milestone or "",
         config=_config,
         checkpoint=_checkpoint,
@@ -2665,7 +3024,15 @@ def impl_worker(
 
 
 @click.command("research-worker")
-@click.option("--repo", required=True, help="Target repo in OWNER/REPO format")
+@click.option(
+    "--repo",
+    default=None,
+    help=(
+        "Target repository. Accepts: 'owner/name' (existing remote), "
+        "'name' (new private repo to scaffold), 'path/to/local/dir' (local git repo), "
+        "or omit to operate on the current working directory."
+    ),
+)
 @click.option("--milestone", required=True, help="Milestone name to process")
 @click.option("--model", default=None, help="Override Claude model")
 @click.option("--max-budget", type=float, default=None, help="USD budget cap")
@@ -2673,7 +3040,7 @@ def impl_worker(
 @click.option("--dry-run", is_flag=True, help="Print invocation without executing")
 @click.option("--resume", default=None, help="Resume a previous session by ID")
 def research_worker(
-    repo: str,
+    repo: str | None,
     milestone: str,
     model: str | None,
     max_budget: float | None,
@@ -2682,7 +3049,8 @@ def research_worker(
     resume: str | None,
 ) -> None:
     """Process research issues for a milestone headlessly via claude -p."""
-    overrides: dict = {"github_repo": repo}
+    repo_ref, _local_path = _resolve_repo(repo)
+    overrides: dict = {"github_repo": repo_ref or None, "target_repo": repo_ref or None}
     if model:
         overrides["model"] = model
     if max_budget is not None:
@@ -2702,7 +3070,7 @@ def research_worker(
     )
 
     _run_research_worker(
-        repo=repo,
+        repo=repo_ref,
         milestone=milestone,
         config=_config,
         checkpoint=_checkpoint,
@@ -2711,20 +3079,29 @@ def research_worker(
 
 
 @click.command("design-worker")
-@click.option("--repo", required=True, help="Target repo in OWNER/REPO format")
+@click.option(
+    "--repo",
+    default=None,
+    help=(
+        "Target repository. Accepts: 'owner/name' (existing remote), "
+        "'name' (new private repo to scaffold), 'path/to/local/dir' (local git repo), "
+        "or omit to operate on the current working directory."
+    ),
+)
 @click.option(
     "--research-milestone", required=True, help="Completed research milestone to translate"
 )
 @click.option("--model", default=None, help="Override Claude model")
 @click.option("--dry-run", is_flag=True, help="Print planned issues without creating them")
 def design_worker(
-    repo: str,
+    repo: str | None,
     research_milestone: str,
     model: str | None,
     dry_run: bool,
 ) -> None:
     """Translate research docs into HLD and LLD design documents via claude -p."""
-    overrides: dict = {"github_repo": repo}
+    repo_ref, _local_path = _resolve_repo(repo)
+    overrides: dict = {"github_repo": repo_ref or None, "target_repo": repo_ref or None}
     if model:
         overrides["model"] = model
 
@@ -2739,7 +3116,7 @@ def design_worker(
     )
 
     _run_design_worker(
-        repo=repo,
+        repo=repo_ref,
         research_milestone=research_milestone,
         config=_config,
         checkpoint=_checkpoint,
@@ -2748,20 +3125,29 @@ def design_worker(
 
 
 @click.command("plan-issues")
-@click.option("--repo", required=True, help="Target repo in OWNER/REPO format")
+@click.option(
+    "--repo",
+    default=None,
+    help=(
+        "Target repository. Accepts: 'owner/name' (existing remote), "
+        "'name' (new private repo to scaffold), 'path/to/local/dir' (local git repo), "
+        "or omit to operate on the current working directory."
+    ),
+)
 @click.option(
     "--impl-milestone", required=True, help="Implementation milestone to file issues against"
 )
 @click.option("--model", default=None, help="Override Claude model")
 @click.option("--dry-run", is_flag=True, help="Print planned milestones without creating them")
 def plan_issues(
-    repo: str,
+    repo: str | None,
     impl_milestone: str,
     model: str | None,
     dry_run: bool,
 ) -> None:
     """File stage/impl issues from HLD and LLD design docs via claude -p."""
-    overrides: dict = {"github_repo": repo}
+    repo_ref, _local_path = _resolve_repo(repo)
+    overrides: dict = {"github_repo": repo_ref or None, "target_repo": repo_ref or None}
     if model:
         overrides["model"] = model
 
@@ -2776,8 +3162,52 @@ def plan_issues(
     )
 
     _run_plan_issues(
-        repo=repo,
+        repo=repo_ref,
         impl_milestone=impl_milestone,
+        config=_config,
+        checkpoint=_checkpoint,
+        dry_run=dry_run,
+    )
+
+
+@click.command("plan-milestones")
+@click.option(
+    "--repo",
+    default=None,
+    help=(
+        "Target repository. Accepts: 'owner/name' (existing remote), "
+        "'name' (new private repo to scaffold), 'path/to/local/dir' (local git repo), "
+        "or omit to operate on the current working directory."
+    ),
+)
+@click.option("--version", required=True, help="Version name (e.g. 'MVP', 'v2')")
+@click.option("--model", default=None, help="Override Claude model")
+@click.option("--dry-run", is_flag=True, help="Print planned milestones without creating them")
+def plan_milestones(
+    repo: str | None,
+    version: str,
+    model: str | None,
+    dry_run: bool,
+) -> None:
+    """Create a milestone pair and seed research issues from a spec via claude -p."""
+    repo_ref, _local_path = _resolve_repo(repo)
+    overrides: dict = {"github_repo": repo_ref or None, "target_repo": repo_ref or None}
+    if model:
+        overrides["model"] = model
+
+    config = load_config(**overrides)
+    checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
+
+    _config, _checkpoint = startup_sequence(
+        config=config,
+        checkpoint_path=checkpoint_path,
+        milestone=version,
+        stage="plan-milestones",
+    )
+
+    _run_plan_milestones(
+        repo=repo_ref,
+        version=version,
         config=_config,
         checkpoint=_checkpoint,
         dry_run=dry_run,
@@ -2790,11 +3220,24 @@ def composer() -> None:
 
 
 @composer.command("health")
-@click.option("--repo", default=None, help="Repo to check (OWNER/REPO)")
+@click.option(
+    "--repo",
+    default=None,
+    help=(
+        "Target repository. Accepts: 'owner/name' (existing remote), "
+        "'name' (new private repo to scaffold), 'path/to/local/dir' (local git repo), "
+        "or omit to operate on the current working directory."
+    ),
+)
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 def health_cmd(repo: str | None, as_json: bool) -> None:
     """Run preflight checks."""
-    config = load_config(**({} if not repo else {"github_repo": repo}))
+    repo_ref, _local_path = _resolve_repo(repo)
+    overrides: dict = {}
+    if repo_ref:
+        overrides["github_repo"] = repo_ref
+        overrides["target_repo"] = repo_ref
+    config = load_config(**overrides)
     checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
     chk = session.load(checkpoint_path)
     report = health.check_all(config, chk)

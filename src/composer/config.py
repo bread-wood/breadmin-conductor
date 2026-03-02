@@ -115,6 +115,15 @@ class Config(BaseSettings):
         validation_alias=AliasChoices("GITHUB_REPO", "github_repo"),
         description='GitHub repository in "owner/repo" format',
     )
+    target_repo: str | None = Field(
+        default=None,
+        description=(
+            "Resolved target repository. "
+            "For remote repos: 'owner/name' string. "
+            "For local repos: absolute path string. "
+            "None means operate on the current working directory."
+        ),
+    )
 
     # --- Health checks ---
     max_orphaned_issues: int = Field(

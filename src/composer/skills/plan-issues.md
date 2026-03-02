@@ -6,12 +6,26 @@ test requirements, and a verified dependency graph. It runs **after** design-wor
 all design docs and **before** impl-worker begins. It creates GitHub issues only — no code,
 no design docs, no source file changes.
 
+## Target Repository
+
+The `--repo` argument controls which repository this worker operates on:
+
+| Invocation | Behaviour |
+|---|---|
+| *(no flag)* | Operate on the current working directory. Fails if cwd is not a git repo. |
+| `--repo owner/name` | Operate on an existing remote GitHub repo. All `gh` commands use `--repo owner/name`. |
+| `--repo name` | Scaffold a new private GitHub repo named `name`, then operate on it. |
+| `--repo path/to/local/dir` | Operate on the local directory. Fails if it is not a git repo. |
+
+All `gh` commands in this skill must be scoped with `--repo <owner>/<name>` when the target is a remote repo.
+All `git` commands must be run with `-C <local_path>` (or inside the cloned directory) when operating on a local path.
+
 ## Setup
 
 1. Detect the default branch:
    ```bash
-   DEFAULT_BRANCH=$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name')
-   git checkout $DEFAULT_BRANCH && git pull origin $DEFAULT_BRANCH
+   DEFAULT_BRANCH=$(gh repo view --repo <owner>/<repo> --json defaultBranchRef --jq '.defaultBranchRef.name')
+   git -C <local_path> checkout $DEFAULT_BRANCH && git -C <local_path> pull origin $DEFAULT_BRANCH
    ```
 
 2. Run startup checks per the Orchestrator-Dispatch Protocol in ~/.claude/CLAUDE.md.
@@ -21,7 +35,7 @@ no design docs, no source file changes.
 ## Inputs
 
 The plan-issues orchestrator requires:
-- `--repo` — the target repository in `OWNER/REPO` format
+- `--repo` — the target repository (optional; defaults to cwd)
 - `--impl-milestone` — the implementation milestone to file issues against
 
 Verify the impl milestone exists:

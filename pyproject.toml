@@ -15,11 +15,12 @@ dependencies = [
 ]
 
 [project.scripts]
-impl-worker     = "composer.cli:impl_worker"
-research-worker = "composer.cli:research_worker"
-design-worker   = "composer.cli:design_worker"
-plan-issues     = "composer.cli:plan_issues"
-composer        = "composer.cli:composer"
+impl-worker      = "composer.cli:impl_worker"
+research-worker  = "composer.cli:research_worker"
+design-worker    = "composer.cli:design_worker"
+plan-issues      = "composer.cli:plan_issues"
+plan-milestones  = "composer.cli:plan_milestones"
+composer         = "composer.cli:composer"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/composer"]
