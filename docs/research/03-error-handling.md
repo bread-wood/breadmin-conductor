@@ -513,8 +513,12 @@ Rate limit events from `claude -p` produce the following observable signals (fro
 1. **Exit code**: `1` (generic — not specific to rate limits)
 2. **Result subtype**: `"error_during_operation"` (when rate limit fires mid-session)
 3. **Result text**: `"API Error: Rate limit reached"`
-4. **Stderr**: May contain `"You've hit your limit · resets <timestamp>"` (confirmed in interactive
-   mode; unconfirmed in headless `-p` mode — see Section 8.1)
+4. **Stderr**: The `"You've hit your limit · resets <timestamp>"` TUI overlay does **NOT** appear
+   as plain text on stderr in `-p` mode (TUI-only React/Ink component). [INFERRED-HIGH — see
+   Section 9.2]
+   **Stdout (stream-json)**: A `rate_limit_event` JSON object IS emitted on stdout. Fields:
+   `status`, `isUsingOverage`, `overageDisabledReason`, and conditionally `resetsAt` and
+   `rateLimitType`. [CONFIRMED-INDIRECT — see Section 9.3]
 5. **HTTP 429** or possibly **HTTP 402** (for weekly cap on Max plans — see #23 and #64)
 
 The conductor must check signals 2 and 3 together (both the subtype and the result text) because
@@ -765,21 +769,18 @@ async def reconcile_issue(issue_number: int, branch: str, repo: str) -> None:
 
 ## 8. Follow-Up Research Recommendations
 
-### 8.1 Empirical Verification of Stderr Message in `-p` Mode [BLOCKS_IMPL]
+### 8.1 Empirical Verification of Stderr Message in `-p` Mode [RESOLVED — see Section 9]
 
 **Question**: Does `claude -p` emit the `"You've hit your limit · resets <timestamp>"` message to
 stderr in headless mode, or is this message only shown in the interactive TUI?
 
-**Why it blocks implementation**: The reset timestamp heuristic in doc #23 (Section 4) and the
-rate limit classification in Section 5 of this document both depend on being able to parse this
-message from stderr. If it does not appear in headless mode, conductor must fall back to
-consecutive-count inference, which is less accurate and slower to classify weekly caps.
+**Status**: Resolved by issue #84 research (2026-03-02). See **Section 9** for full findings.
 
-**Method**: Run `claude -p "..." 2>stderr.txt` from an account near its limit; inspect `stderr.txt`
-for the reset message. Requires an account near the 5-hour or weekly limit to trigger.
-
-**Suggested issue**: Create if not already covered — distinct from #23 (which analyzed the message
-format) and not yet covered by #41 (empirical verification suite).
+**Summary**: The `"You've hit your limit"` message is a TUI-only React/Ink rendered component and
+does NOT appear as plain text on stderr. Instead, a `rate_limit_event` JSON object is emitted on
+**stdout** as part of the stream-json NDJSON output. The stderr-based heuristic should be replaced
+by parsing `rate_limit_event.rateLimitType` and `rate_limit_event.resetsAt` from stdout.
+[INFERRED-HIGH — see Section 9 for confidence assessment and evidence]
 
 ### 8.2 Empirical Verification of `result.subtype` for Rate Limit Events [BLOCKS_IMPL]
 
@@ -853,7 +854,203 @@ claude -p sessions (exit 143)`). Defer to that issue.
 
 ---
 
-## 9. Sources
+## 9. Rate Limit Message Visibility in Headless Mode (Issue #84)
+
+**Issue**: #84
+**Date**: 2026-03-02
+**Status**: Research complete
+
+### 9.1 The Core Question
+
+Section 8.1 of this document (now superseded by this section) asked whether `claude -p` emits the
+`"You've hit your limit · resets <timestamp>"` message to stderr in headless mode. The
+classification procedure in Section 5 and doc #23 both depend on parsing this string from
+subprocess output. If it does not appear in headless mode, the reset-timestamp heuristic cannot
+be applied from stderr.
+
+### 9.2 Finding: The TUI Message Does NOT Appear as Plain Text on stderr in -p Mode
+
+[INFERRED-HIGH] The `"You've hit your limit · resets <timestamp>"` string is a **React/Ink
+TUI component** rendered to the interactive terminal. It does not appear as capturable plain text
+on stderr when `claude -p` runs as a subprocess. This finding is supported by multiple converging
+lines of evidence:
+
+1. **Ink renders to the terminal, not to a redirectable stream.** Claude Code's TUI is built with
+   React and the Ink library, which uses ANSI escape sequences to draw to the terminal. The overlay
+   is a rendered component, not a plain-text write to stderr. Ink's `useStderr()` hook exists for
+   intentional stderr writes, but there is no evidence the rate limit overlay uses it — it is
+   displayed as part of Ink's normal rendering loop.
+
+2. **Automation tools that detect rate limits use tmux screen capture, not stderr parsing.**
+   `autoclaude` (github.com/henryaj/autoclaude) is the primary community tool for rate-limit
+   detection and auto-resume. Its documentation explicitly states it works by "monitoring tmux
+   panes" and looking for the `"limit reached ∙ resets Xpm"` pattern in the visible terminal
+   content. It requires tmux to function and cannot work from subprocess stderr. If the message
+   were available on stderr, a much simpler `2>stderr.txt && grep "resets"` approach would suffice.
+   The tmux-capture requirement is strong circumstantial evidence that the message is
+   TUI-only.
+
+3. **No community report shows the "You've hit your limit" string captured from stderr in a
+   subprocess context.** A broad survey of GitHub issues (25+ issues with this exact title),
+   automation tool documentation, CI/CD guides, and SDK troubleshooting pages found no instance
+   where a user captured this string via stderr redirection from `claude -p`. All captures of this
+   message describe interactive sessions.
+
+4. **Claude Code's own debug output routing is inconsistent.** Issue #4859 (closed as
+   NOT_PLANNED) confirmed that even `--debug` output is routed to **stdout** rather than stderr in
+   `-p` mode. This documents that Claude Code does not reliably use stderr for diagnostic output
+   in headless mode.
+
+### 9.3 What IS Available on stdout in -p Mode
+
+[INFERRED-HIGH] Instead of the TUI string, two machine-readable rate limit signals are emitted
+to **stdout** as part of the stream-json NDJSON output:
+
+**Signal A: `rate_limit_event` JSON object**
+
+Added in Claude Code v2.1.30 (`SDKRateLimitInfo` and `SDKRateLimitEvent` types). Confirmed to
+appear on stdout because the `claude-agent-sdk-python` SDK reads subprocess stdout as
+newline-delimited JSON and crashes with `MessageParseError("Unknown message type: rate_limit_event")`
+when this event appears (GitHub issue #26498, DeepWiki analysis of `SubprocessCLITransport`).
+The crash would be impossible unless the event was received on stdout.
+
+Example structure (from GitHub issue #29330 session log):
+
+```json
+{
+  "type": "rate_limit_event",
+  "rate_limit_info": {
+    "status": "rejected",
+    "overageDisabledReason": "org_level_disabled",
+    "isUsingOverage": false
+  }
+}
+```
+
+Additional fields seen in other reports (Hikari desktop implementation):
+- `resetsAt` — Unix timestamp of when the rate limit resets (present in some versions)
+- `rateLimitType` — e.g., `"five_hour"` or `"seven_day"` (present in some versions)
+- `overageStatus` — overage availability state
+
+**Critical note**: The `resetsAt` and `rateLimitType` fields are not consistently present in all
+observed examples of `rate_limit_event`. When `status` is `"rejected"` (hard block), the
+confirmed minimal payload contains only `status`, `isUsingOverage`, and
+`overageDisabledReason`. The timestamp and window-type fields may only appear when `status` is
+`"allowed_warning"` (approaching limit) or in newer Claude Code versions. The exact field
+population is version-dependent and [INFERRED] from partial evidence.
+
+**Signal B: `result` event text**
+
+The `result` event in stream-json includes the text `"API Error: Rate limit reached"` when rate
+limiting fires. This is confirmed in multiple issue reports and is emitted to stdout alongside
+the exit code 1. Example (from GitHub issue #29330):
+
+```json
+{
+  "model": "<synthetic>",
+  "usage": {"input_tokens": 0, "output_tokens": 0},
+  "content": [{"type": "text", "text": "API Error: Rate limit reached"}],
+  "error": "rate_limit"
+}
+```
+
+**Signal C: `rate_limit_event` in the session JSONL transcript**
+
+Claude Code also writes `rate_limit_event` entries to the session JSONL transcript file at
+`~/.claude/projects/<encoded-path>/<session-id>.jsonl`. This is separate from the subprocess
+stdout. The JSONL file is written regardless of output format (text/json/stream-json) and
+persists after the subprocess exits. For post-hoc analysis, conductor can inspect the session
+file to find the rate limit event and its fields.
+
+### 9.4 Impact on the Reset-Timestamp Heuristic
+
+The classification procedure in Section 5 and doc #23 relies on parsing the `"resets ..."` string
+from stderr to compute `delta = resets_at - now()` for the 5-hour vs. weekly cap distinction.
+This heuristic is affected as follows:
+
+| Heuristic Signal | Status in -p Mode |
+|---|---|
+| `"You've hit your limit · resets <timestamp>"` string on stderr | **UNAVAILABLE** — TUI-only |
+| `rate_limit_event.resetsAt` field on stdout | **CONDITIONALLY AVAILABLE** — present in some versions/states; absent in others |
+| `rate_limit_event.rateLimitType` field on stdout | **CONDITIONALLY AVAILABLE** — if present, directly classifies window type (no heuristic needed) |
+| `/api/oauth/usage` endpoint (Step 1 of classification procedure) | **AVAILABLE** — not affected by -p mode |
+| Consecutive-count fallback (Step 3) | **AVAILABLE** — not affected by -p mode |
+
+**Revised classification procedure recommendation:**
+
+1. Check `/api/oauth/usage` endpoint first (as documented in Section 5.2 and doc #23 Section 5.1).
+2. Parse `rate_limit_event.rateLimitType` from stdout stream-json if available — if present, this
+   is the most direct machine-readable signal and should supersede the timestamp heuristic.
+3. Parse `rate_limit_event.resetsAt` from stdout stream-json if available — apply the delta
+   threshold from doc #23 Section 4.1.
+4. Fall back to consecutive-count inference (Step 3 of doc #23).
+
+The stderr-based heuristic (previously listed as Step 2 in Section 5.2) should be removed from
+the implementation. The replacement is parsing `rate_limit_event.rateLimitType` and
+`rate_limit_event.resetsAt` from stdout stream-json output.
+
+### 9.5 Updated Section 5.1 Signal Table
+
+Section 5.1 listed:
+
+> **Stderr**: May contain `"You've hit your limit · resets <timestamp>"` (confirmed in interactive
+> mode; unconfirmed in headless `-p` mode — see Section 8.1)
+
+This should now read:
+
+> **Stderr**: The `"You've hit your limit · resets <timestamp>"` message is a TUI component
+> rendered by React/Ink and does **NOT** appear as plain text on stderr in `-p` mode.
+> [INFERRED-HIGH — see Section 9.2]
+>
+> **Stdout (stream-json)**: The `rate_limit_event` JSON object is emitted to stdout between turns
+> in stream-json mode. Fields include `status`, `isUsingOverage`, `overageDisabledReason`, and
+> conditionally `resetsAt` and `rateLimitType`. [CONFIRMED-INDIRECT via SDK crash evidence — see
+> Section 9.3]
+
+### 9.6 Confidence Assessment
+
+| Claim | Confidence |
+|---|---|
+| `"You've hit your limit"` text does NOT appear on stderr in -p mode | [INFERRED-HIGH] — converging indirect evidence from tmux tool design, no counter-examples, Ink architecture |
+| `rate_limit_event` appears on stdout in stream-json mode | [CONFIRMED-INDIRECT] — SDK crash proves receipt from subprocess stdout |
+| `rate_limit_event` minimal fields: `status`, `isUsingOverage`, `overageDisabledReason` | [DOCUMENTED] — from live session log in issue #29330 |
+| `rate_limit_event.resetsAt` present when `status == "rejected"` | [INFERRED] — seen in Hikari implementation parsing; absent in issue #29330 example; version-dependent |
+| `rate_limit_event.rateLimitType` distinguishes 5-hour vs. weekly | [INFERRED] — field naming mirrors internal binary fields; not empirically confirmed in a rejected-state event |
+| `result` event contains `"API Error: Rate limit reached"` text on exit | [INFERRED-HIGH] — multiple issue reports consistent; no counter-examples |
+
+No claim in this section reaches [EMPIRICAL] because no controlled test running `claude -p` to
+a rate limit while capturing stdout and stderr separately has been published. The convergent
+evidence is strong but indirect.
+
+### 9.7 Follow-Up Recommendations
+
+1. **Empirical capture of stdout stream-json during a rate limit event** — Run
+   `claude -p "..." --output-format stream-json 2>stderr.txt` from an account at or near its
+   limit. Capture the full stdout NDJSON. Verify: (a) that `rate_limit_event` appears on stdout,
+   (b) the complete field set, (c) whether `resetsAt` and `rateLimitType` are present for a
+   `"rejected"` status event vs. `"allowed_warning"`. Verify stderr.txt is empty (or contains
+   only startup noise without the "You've hit your limit" string). This is the only test that
+   would elevate claims to [EMPIRICAL]. **Already tracked by issue #92** (Research: Empirical
+   capture of rate_limit_event full schema in stream-json output).
+
+2. **Update conductor's classify_rate_limit implementation** — Replace the stderr regex
+   (`parse_reset_from_stderr`) with a stdout stream-json parser that extracts
+   `rate_limit_event.rateLimitType` and `rate_limit_event.resetsAt` when present. The consecutive-
+   count fallback remains as the last resort. Implementation task (post-M1).
+
+3. **Handle `rate_limit_event` in stream-json parsing** — The conductor's subprocess runner must
+   not crash when it receives `rate_limit_event` (as the early Python agent SDK did). The event
+   should be parsed and stored for later use by `classify_rate_limit()`. Implementation task
+   (post-M1).
+
+4. **Verify `rate_limit_event` field stability across versions** — The `resetsAt` and
+   `rateLimitType` fields are not consistently documented. A version matrix (2.1.30 through
+   current) confirming field presence/absence would reduce reliance on the OAuth endpoint fallback.
+   **Covered by issue #92**.
+
+---
+
+## 10. Sources
 
 - [Run Claude Code programmatically — Claude Code Docs](https://code.claude.com/docs/en/headless) — `-p` mode usage, `--output-format stream-json`, session ID capture, stream-json event types
 - [CLI reference — Claude Code Docs](https://code.claude.com/docs/en/cli-reference) — All CLI flags; `--max-turns`, `--max-budget-usd`, `--output-format`, exit semantics; `claude auth status` exits 0/1
@@ -885,3 +1082,13 @@ claude -p sessions (exit 143)`). Defer to that issue.
 - [Auto-rerun GitHub workflow on failure — GitHub Community](https://github.com/orgs/community/discussions/67654) — CI re-run trigger patterns; `gh run rerun` API
 - [Tackling the "Partial Completion" Problem in LLM AI Agents — Medium](https://medium.com/@georgekar91/tackling-the-partial-completion-problem-in-llm-agents-9a7ec8949c84) — Partial completion taxonomy; detection patterns for LLM agents
 - [Claude Code Troubleshooting — Claude Code Docs](https://code.claude.com/docs/en/troubleshooting) — Official troubleshooting guidance; authentication errors; common exit codes
+- [GitHub Issue #26498: claude-agent-sdk: MessageParseError on rate_limit_event message type](https://github.com/anthropics/claude-code/issues/26498) — **Primary source for Section 9.3.** Confirms `rate_limit_event` is emitted on **stdout** by the Claude Code CLI subprocess; SDK's `SubprocessCLITransport` reads stdout NDJSON and crashes when it encounters this unknown type; `types.py` defines `"rate_limit"` as a known `SystemMessageSubtype` but parser lacked a handler
+- [DeepWiki — anthropics/claude-agent-sdk-python](https://deepwiki.com/anthropics/claude-agent-sdk-python) — Confirms `SubprocessCLITransport` reads subprocess stdout as NDJSON; `rate_limit_event` received from stdout; v0.1.40 fixed crash by silently skipping unknown message types; stderr is separately monitored with safety limits
+- [GitHub Issue #29330: Opus 1M context window suddenly returns "Rate limit reached"](https://github.com/anthropics/claude-code/issues/29330) — **Primary source for Section 9.3 minimal payload.** Provides confirmed `rate_limit_event` structure from session JSONL: `{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false}}`; confirms synthetic response with `"API Error: Rate limit reached"` text
+- [autoclaude — automatically resume Claude Code when you hit your rate limit](http://autoclaude.blmc.dev/) — Confirms rate limit detection uses **tmux pane content** monitoring (looking for `"limit reached ∙ resets Xpm"` pattern), not stderr; requires tmux to function; cannot operate from subprocess stderr — strong indirect evidence that the TUI message is not available on stderr
+- [GitHub — henryaj/autoclaude](https://github.com/henryaj/autoclaude/) — Source code and docs confirm tmux screen capture as the sole detection mechanism; no stderr parsing implemented
+- [GitHub Issue #4859: code CLI debug and verbose modes do not output to stderr](https://github.com/anthropics/claude-code/issues/4859) — Confirms that even `--debug` output goes to **stdout** not stderr in `-p` mode; `--verbose` has no effect; issue closed NOT_PLANNED — documents Claude Code's non-standard stderr usage in headless mode
+- [GitHub Issue #18388: Rate Limit Message Infinite Loop](https://github.com/anthropics/claude-code/issues/18388) — Documents TUI rendering of rate limit message (`"You're out of extra usage · resets 3pm"`) as a rendered component in the interactive terminal; confirms TUI-layer display
+- [feat: parse and display rate_limit_event messages from Claude CLI — hikari-desktop](https://git.nhcarrigan.com/nhcarrigan/hikari-desktop/commit/1c02ca1bb587ea06cd6ad72fcb88d788cdf7d117) — Provides example `rate_limit_event` structure with `resetsAt`, `requests_limit`, `tokens_limit`, `retry_after_ms` fields (from a different context/version); confirms the event comes from the CLI's stream output and can contain a reset timestamp
+- [GitHub — vadimdemedes/ink](https://github.com/vadimdemedes/ink) — Ink renders React components to terminal using ANSI escape sequences; `useStderr()` exists for intentional stderr writes; no evidence the rate limit overlay uses it; normal render output is not plain-text-capturable from stderr
+- [Claude Code v2.1.30 changelog — SDKRateLimitInfo and SDKRateLimitEvent types added](https://claudefa.st/blog/guide/changelog) — Version in which `SDKRateLimitInfo` and `SDKRateLimitEvent` were introduced to the SDK (v2.1.30); enables consumers to receive rate limit status updates including utilization, reset times, and overage information
