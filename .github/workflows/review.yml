@@ -1,0 +1,38 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Claude Code Review
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          direct_prompt: |
+            Review this pull request for the breadmin-composer Python CLI package.
+
+            Focus on:
+            - **Correctness**: logic errors, off-by-one, wrong conditionals, missing edge cases
+            - **Security**: credential exposure in logs or env, prompt injection vectors, shell metacharacter injection
+            - **Module isolation**: changes must stay within the module boundary defined in CLAUDE.md (config.py, runner.py+session.py, logger.py, health.py, cli.py+skills/, pyproject.toml)
+            - **LLD conformance**: implementation must match the design in docs/design/lld/<module>.md — flag deviations that would break the stated interface or schema
+            - **Test coverage**: every public function must have at least one unit test; flag untested paths
+            - **Error handling**: all error subtypes from the taxonomy in docs/design/HLD.md §4 must be handled; no silent swallows
+            - **Style**: consistent with existing code; no unnecessary abstractions; no commented-out code
+
+            Post inline comments on specific lines where issues are found.
+            Be concise — one comment per distinct issue.
+            Do not approve or request changes. Comment only.
+            Skip doc-only PRs (changes only to docs/ or *.md files).
