@@ -124,7 +124,7 @@ def test_tools_design_contains_gh_only() -> None:
 
 
 def test_tools_impl_agent_contains_expected_tools() -> None:
-    assert set(TOOLS_IMPL_AGENT) == {"gh", "bash", "read", "edit", "write"}
+    assert set(TOOLS_IMPL_AGENT) == {"gh", "bash", "read", "edit", "write", "Glob", "Grep"}
 
 
 # ---------------------------------------------------------------------------

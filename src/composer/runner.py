@@ -25,7 +25,7 @@ from pathlib import Path
 
 TOOLS_RESEARCH: list[str] = ["gh", "bash", "read", "web_search"]
 TOOLS_DESIGN: list[str] = ["gh"]
-TOOLS_IMPL_AGENT: list[str] = ["gh", "bash", "read", "edit", "write"]
+TOOLS_IMPL_AGENT: list[str] = ["gh", "bash", "read", "edit", "write", "Glob", "Grep"]
 
 # ---------------------------------------------------------------------------
 # RunResult dataclass
