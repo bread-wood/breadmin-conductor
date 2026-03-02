@@ -56,6 +56,30 @@ For each selected issue, sequentially:
 Launch sub-agents in parallel using `Agent(isolation: "worktree")`.
 Follow the Sub-Agent Instructions Template from ~/.claude/CLAUDE.md.
 
+Include the following test generation instructions in every sub-agent prompt:
+
+### Test Generation (required for all impl agents)
+
+**Before writing implementation**, identify tests needed from the LLD acceptance criteria
+in the issue. Write test stubs first; they define the expected interface.
+
+Cover all applicable tiers:
+
+| Tier | When | File |
+|------|------|------|
+| **Unit** | Always — one test per new public function/method | `tests/unit/test_<module>.py` |
+| **Integration** | When the change spans module boundaries (e.g. runner → logger) | `tests/integration/test_<module>.py` |
+| **Smoke** | When CLI entry points are added or changed | `tests/smoke/test_cli.py` |
+| **E2E** | When the issue affects full pipeline behavior | `tests/e2e/` |
+
+Rules:
+1. **Test-first for new public functions** — write the stub before the implementation.
+2. **No untested public functions** — every new public function needs at least one test.
+   Do not create the PR until this is true.
+3. **Derive tests from the LLD** — implement the test cases the design specifies;
+   do not invent coverage for things not in scope.
+4. **Naming**: test files match `test_<module>.py`; test functions match `test_<what_it_does>`.
+
 ### Step 3 — Monitor & Continue
 
 As **each agent completes** (do not wait for the entire batch):
