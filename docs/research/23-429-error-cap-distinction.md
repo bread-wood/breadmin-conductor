@@ -15,6 +15,13 @@ When `claude -p` encounters a subscription rate limit, it returns a generic 429 
 cap exhaustion. However, multiple signals exist for making this determination programmatically, each
 at different levels of reliability:
 
+0. **HTTP 402 status code** — [DOCUMENTED, SCOPE RESOLVED — see Section 2.5 and Section 10.1]
+   Issue #30484 (openclaw/openclaw, March 2026) and research for issue #64 (2026-03-02) determined
+   that **HTTP 402 is NOT a reliable discriminator for weekly cap vs. 5-hour window exhaustion.**
+   It signals extra usage (overage) billing authorization failure — a separate condition from
+   standard rate limit window exhaustion. Both 5-hour and weekly cap exhaustion return HTTP 429
+   when extra usage is not involved. See Section 2.5 for full findings.
+
 1. **`anthropic-ratelimit-unified-*` response headers** — the most reliable signal, but inaccessible
    from outside the Claude Code subprocess in current releases (March 2026). These headers explicitly
    label the active window type (`five_hour` vs. `seven_day` via the
@@ -34,9 +41,11 @@ at different levels of reliability:
    indicate the weekly cap has been hit (because overage does not automatically unlock a depleted
    weekly budget in all configurations). This is an indirect signal only.
 
-The conductor's post-429 governor should use a two-stage approach: (1) attempt to query the
-`/api/oauth/usage` endpoint to get explicit per-window data, (2) fall back to the reset timestamp
-heuristic when the endpoint is unavailable.
+The conductor's error handler should use a three-stage approach: (0) check the HTTP status code
+— if 402, classify as `extra_usage_billing_failure` and handle as a billing condition (not a
+window exhaustion); (1) for HTTP 429, attempt to query the `/api/oauth/usage` endpoint to get
+explicit per-window data; (2) fall back to the reset timestamp heuristic when the endpoint is
+unavailable.
 
 ---
 
@@ -207,22 +216,112 @@ consistent with a 5-hour window reset.
 - Issue #14470 documents a case where the reset time shown was incorrect relative to the `/usage`
   command output (9pm vs. 5pm). Display-layer bugs exist.
 
-### 2.5 HTTP 402 Status Code (Weekly Cap on Some Configurations)
+### 2.5 HTTP 402 Status Code — Issue #64 Research Findings (2026-03-02)
 
-[DOCUMENTED, UNCONFIRMED SCOPE] GitHub issue #30484 (filed against the `openclaw` project, which
-uses the Claude Code API) reports that hitting the Claude Max plan rate limits sometimes returns
-**HTTP 402** ("Payment Required") instead of HTTP 429. This may represent a different code path for
-weekly cap exhaustion vs. 5-hour window exhaustion, or it may be a billing-state-specific branch
-(e.g., when extra usage would normally be offered but is disabled).
+**Prior status: [DOCUMENTED, UNCONFIRMED SCOPE]. Updated status: [DOCUMENTED — scope resolved;
+original hypothesis refuted].**
 
-This is a significant finding: if weekly cap exhaustion consistently returns 402 rather than 429,
-conductor can use the HTTP status code as a discriminator. However, the evidence is a single
-third-party bug report; this has not been confirmed across multiple accounts or Claude Code versions.
-The field is tagged [DOCUMENTED] for the bug report's existence but [INFERRED] for the hypothesis
-that 402 signals weekly exhaustion specifically.
+#### 2.5.1 Source Evidence
 
-The conductor should handle HTTP 402 as at least as severe as 429 (same backoff/requeue behavior)
-and should flag it for investigation when observed.
+GitHub issue #30484 ("Claude Max plan rate limits return HTTP 402 instead of 429 — triggers false
+billing error warnings", filed March 1, 2026, against `openclaw/openclaw`) documents that a Claude
+Max plan account with **Extra Usage enabled** received HTTP 402 responses from the Anthropic API
+during usage-limit events. Key context from the bug report:
+
+- User's plan: Claude Max ($100/month)
+- Extra Usage status: **enabled**, balance $41.36 remaining out of $50 monthly limit
+- Trigger: Rate limits firing "especially when image analysis or high-traffic Slack channels are
+  active" within the Max plan's usage window
+- A second reporter (kobie3717, March 2, 2026) hit the same issue with "97% daily usage remaining"
+- The issue generated five PRs (#30490, #30508, #30515, #30687, #30780), with PR #30780
+  implementing provider-aware 402 handling: "treats Anthropic 402 as rate_limit"
+
+Note: the issue title uses "rate limits" generically. Neither the body nor any comment specifies
+whether the 402 fires on 5-hour window exhaustion or weekly cap exhaustion specifically.
+
+#### 2.5.2 Anthropic SDK Behavior for HTTP 402
+
+[DOCUMENTED] The Anthropic Python SDK (`anthropic-sdk-python`) does **not** define a specific
+exception class for HTTP 402. The `_make_status_error` method in `_client.py` explicitly maps
+429 to `RateLimitError` and 500+ to `InternalServerError`. **All other codes including 402 fall
+through to the generic `APIStatusError`.** The `_should_retry` method only auto-retries 408, 409,
+429, and 500+; **HTTP 402 does NOT trigger automatic retry.**
+
+The official Anthropic API errors documentation (`platform.claude.com/docs/en/api/errors`) lists
+400, 401, 403, 404, 413, 429, 500, and 529. **HTTP 402 is not listed** — confirming it is not
+part of the standard API error schema.
+
+#### 2.5.3 Resolved Scope: 402 Is a Billing Layer Signal, Not a Window-Type Discriminator
+
+[DOCUMENTED, INFERRED MECHANISM] The most coherent explanation consistent with the evidence:
+
+**HTTP 402 fires when:** The Anthropic subscription API routes a request through an extra usage
+(overage) billing authorization path and that path fails — due to a billing authorization failure,
+transient payment processing error, or internal billing state inconsistency. This is a
+**billing-layer event**, separate from the quota enforcement path that returns 429.
+
+**HTTP 429 fires when:** Standard rate limit quota is exhausted — either the 5-hour rolling window
+or the weekly active-hours cap. These are **quota-enforcement events**, independent of billing.
+
+**Critical finding for the original research question:** HTTP 402 is **NOT** a reliable discriminator
+for weekly cap vs. 5-hour window exhaustion. The original hypothesis — "if 402 = weekly cap and
+429 = 5-hour window, the HTTP status code is the simplest discriminator" — is **refuted** by the
+available evidence. The 402 condition is orthogonal to the 5-hour/weekly distinction.
+
+Supporting evidence: the openclaw reporter had $41.36 extra usage balance remaining when 402 fired.
+This is inconsistent with "extra usage balance exhausted." It suggests 402 may also fire during
+billing authorization routing failures even when credits exist (transient billing layer errors, or
+a discrepancy between the subscription quota state and the extra usage authorization path).
+
+#### 2.5.4 What Remains Unknown
+
+1. **JSON body structure for 402**: No network capture from a live Anthropic 402 response has been
+   published. [INFERRED] The body likely follows the standard Anthropic error format:
+   ```json
+   {
+     "type": "error",
+     "error": {
+       "type": "<unknown — candidates: billing_error, payment_required_error, invalid_request_error>",
+       "message": "<billing-related message>"
+     },
+     "request_id": "<req_id>"
+   }
+   ```
+   The `error.type` value is unknown. No source confirms this.
+
+2. **`claude -p` stream-json output for 402**: When Claude Code's internal API call receives a
+   402, the stream-json layer output is unknown. Possible outcomes:
+   - A `result` event with `is_error: true` and billing-specific error text
+   - The same generic `"API Error: Rate limit reached"` text as for 429
+   - A `rate_limit_event` message (as documented for 429 in issue #26498)
+   See Section 10.1 for the follow-up empirical verification recommendation.
+
+3. **Pro plan 402 behavior**: Issue #30484 is Max plan specific. Whether Pro plan extra usage
+   exhaustion also returns 402 is unknown.
+
+4. **Whether 402 fires without extra usage enabled**: If extra usage is disabled entirely, does the
+   API ever return 402? Unknown — 402 may be strictly conditional on extra usage being configured.
+
+#### 2.5.5 Conductor Decision Rule: 402 Handling
+
+Given the research findings, the correct conductor decision rule is:
+
+```
+if http_status == 402:
+    CLASSIFY: extra_usage_billing_failure
+    ALERT: "HTTP 402 — extra usage billing failure (not a standard rate limit event)"
+    ACTION: Halt new dispatches; log full response body for investigation
+    RECOVERY: Check extra usage balance/payment method; manual billing resolution required
+    NOTE: Do NOT apply rate-limit window backoff.
+          Do NOT treat as weekly_cap or five_hour exhaustion.
+
+elif http_status == 429:
+    Proceed to window classification (Section 5 decision tree)
+```
+
+HTTP 402 and HTTP 429 require fundamentally different recovery actions. The 5-hour vs. weekly
+distinction for HTTP 429 must still be resolved via the Section 5 decision tree; HTTP 402 bypasses
+that tree entirely.
 
 ---
 
@@ -404,14 +503,35 @@ always means "no overage consumed."
 
 ### 5.1 Signal Priority Order
 
-For the post-429 handler in the conductor governor:
+For the post-error handler in the conductor governor. **Updated 2026-03-02 (issue #64) to add
+HTTP status pre-check before window classification. HTTP 402 is a billing event, not a window
+discriminator — see Section 2.5.**
 
 ```
-POST-429 CLASSIFICATION PROCEDURE
-══════════════════════════════════
+RATE LIMIT ERROR CLASSIFICATION PROCEDURE
+══════════════════════════════════════════
+
+Pre-Step: HTTP Status Code Gate
+──────────────────────────────────
+  If http_status == 402:
+    → CLASSIFY: extra_usage_billing_failure
+    → ALERT: "HTTP 402 — extra usage billing failure (not a standard rate limit event)"
+    → ACTION: Halt new dispatches; log full response body for investigation
+    → RECOVERY: Check extra usage balance/payment method; manual billing resolution
+    → NOTE: Do NOT apply rate-limit window backoff.
+             Do NOT treat as weekly_cap or five_hour exhaustion (see Section 2.5).
+    → STOP. Do not continue to Steps 1-3.
+
+  If http_status == 429:
+    → CONTINUE to Step 1 below
+
+  If http_status >= 500 (transient server error):
+    → Apply exponential backoff (base 30s, max 300s); retry; not a rate limit event
 
 Step 1: Check /api/oauth/usage endpoint
 ───────────────────────────────────────
+  [For HTTP 429 only]
+
   GET https://api.anthropic.com/api/oauth/usage
   Authorization: Bearer <claude.ai session token>
   anthropic-beta: oauth-2025-04-20
@@ -435,6 +555,8 @@ Step 1: Check /api/oauth/usage endpoint
 
 Step 2: Parse reset time from stderr (if available)
 ─────────────────────────────────────────────────────
+  [For HTTP 429 only]
+
   Capture stderr from the failed claude -p process.
   Extract "resets ..." string.
   Parse reset timestamp (see Section 4.3).
@@ -456,6 +578,8 @@ Step 2: Parse reset time from stderr (if available)
 
 Step 3: Fallback — no reset time available
 ──────────────────────────────────────────
+  [For HTTP 429 only]
+
   Count consecutive 429s:
   If this is the 1st–3rd consecutive 429:
     → CLASSIFY: five_hour_exhaustion (optimistic default)
@@ -667,9 +791,10 @@ The following questions remain open after this research:
    `-p` mode is [INFERRED] from the behavior of the interactive UI but not empirically verified.
    This is the most important empirical gap for the heuristic approach.
 
-2. **Does weekly cap exhaustion consistently return HTTP 402 vs. HTTP 429?** The single data point
-   from #30484 suggests 402 may appear for Max plan weekly exhaustion. If confirmed across multiple
-   accounts, the HTTP status code becomes the simplest discriminator.
+2. **[RESOLVED — Issue #64] Does weekly cap exhaustion consistently return HTTP 402 vs. HTTP 429?**
+   Research for issue #64 (2026-03-02) resolved this: HTTP 402 is a billing layer event (extra usage
+   billing authorization failure), NOT a weekly cap signal. Both 5-hour and weekly cap exhaustion
+   return HTTP 429. See Section 2.5 for full findings.
 
 3. **In headless mode, does `claude -p` automatically consume extra usage (overage) without
    prompting when the 5-hour window is exhausted?** If so, conductor may be incurring unexpected
@@ -703,19 +828,15 @@ fall back to consecutive-count inference.
 
 **Scope:** Empirical measurement — belongs inside an existing research doc, not a standalone issue.
 
-### 9.2 HTTP 402 as Weekly Cap Discriminator
+### 9.2 HTTP 402 as Weekly Cap Discriminator — RESOLVED by Issue #64
 
-**Question:** Is HTTP 402 consistently returned for weekly cap exhaustion on Max plans?
+**Status: Resolved. The original hypothesis is refuted.**
 
-**Why it matters:** If HTTP 402 reliably signals weekly exhaustion, conductor can use the HTTP
-status code as the primary discriminator — simpler and more reliable than the timestamp heuristic
-or OAuth endpoint polling.
+Issue #64 research (2026-03-02) determined that HTTP 402 is a billing layer event (extra usage
+billing authorization failure), not a weekly cap discriminator. See Section 2.5 for full findings.
 
-**Method:** Reproduce by exhausting the weekly cap on a Max account; observe the HTTP status code
-returned to the `-p` subprocess.
-
-**Scope:** Empirical measurement — belongs inside an existing research doc if confirmed; otherwise
-a new issue is warranted if the HTTP 402 behavior has architectural implications for error taxonomy.
+The remaining open empirical question is: what exactly does `claude -p --output-format stream-json`
+emit when the underlying API call receives HTTP 402? This is addressed in Section 10.1.
 
 ### 9.3 Headless Overage Consumption Without Prompt
 
@@ -743,6 +864,47 @@ the existing follow-up framework.
 
 ---
 
+## 10. Follow-Up Research Recommendations (Addendum from Issue #64)
+
+### 10.1 Empirical Capture of HTTP 402 JSON Body and `claude -p` Stream-JSON Output
+
+**Question:** What is the exact JSON body Anthropic returns with a HTTP 402 response, and what
+does `claude -p --output-format stream-json` emit when it receives a 402 from the internal API
+call?
+
+**Why it matters:** Section 2.5.4 documents these as the most critical remaining empirical gaps.
+The JSON body structure (specifically `error.type`) determines how conductor should classify and
+log 402 events. The stream-json output format determines whether conductor can detect 402 from the
+subprocess output alone, or whether it needs to observe the raw HTTP layer.
+
+**Method:**
+1. Set up a Max plan account with Extra Usage enabled
+2. Use network interception (e.g., mitmproxy, Charles Proxy, or Anthropic's own HAR export) to
+   capture the raw HTTP response body when a 402 fires
+3. Run `claude -p "..." --output-format stream-json 2>&1` during a session where 402 is expected
+   (high-traffic usage with Extra Usage configured); capture the full output including stderr
+4. Compare the stream-json `result` event text for 402 vs. 429 scenarios
+
+**Scope:** Empirical measurement — update Section 2.5.4 with findings when completed.
+
+**Related:** Issue #63 (headless overage consumption in `claude -p`) addresses the closely related
+question of whether `claude -p` auto-consumes extra usage without prompting.
+
+### 10.2 `RateLimitClass` Enum Extension for 402
+
+**Question:** Should the `extra_usage_billing_failure` classification be added to the
+`RateLimitClass` enum in Section 5.2?
+
+**Recommendation:** Yes. Add `EXTRA_USAGE_BILLING = "extra_usage_billing"` as a new variant. This
+classification should trigger a different handler path from the rate-limit window classifications
+(FIVE_HOUR, SEVEN_DAY, SEVEN_DAY_OPUS). The billing failure handler is the operator alert path;
+the rate-limit path is the scheduling backoff path. They must not be conflated.
+
+**Scope:** Implementation detail — defer to the error handling taxonomy doc (#3) for the formal
+type definition.
+
+---
+
 ## 10. Sources
 
 - [GitHub Issue #12829: Rate limit blocking ignores anthropic-ratelimit-unified-representative-claim header](https://github.com/anthropics/claude-code/issues/12829) — **Primary source** for confirmed header schema including `five_hour`/`seven_day` window naming and exact header key-value pairs from a live API response; documents the Claude Code bug that ignored the representative claim
@@ -756,7 +918,12 @@ the existing follow-up framework.
 - [GitHub Issue #28798: /usage reset times should include the date, not just the time](https://github.com/anthropics/claude-code/issues/28798) — Documents inconsistent date display in /usage; "Extra usage" line shows date; session/weekly reset lines show time only; confirms format ambiguity
 - [GitHub Issue #10165: /usage command shows only time without day for weekly reset](https://github.com/anthropics/claude-code/issues/10165) — Confirms older versions did not include date for weekly reset in /usage; context for format evolution
 - [GitHub Issue #29680: Weekly usage not reset during Feb 27 global reset + cycle date shifted](https://github.com/anthropics/claude-code/issues/29680) — Weekly reset cycle shifted to Friday for all accounts after global reset; display-backend mismatch in utilization after reset
-- [GitHub Issue #30484 (openclaw): Claude Max plan rate limits return HTTP 402 instead of 429](https://github.com/openclaw/openclaw/issues/30484) — Documents HTTP 402 as alternative status code for Max plan rate limit exhaustion; potential discriminator for weekly cap
+- [GitHub Issue #30484 (openclaw): Claude Max plan rate limits return HTTP 402 instead of 429](https://github.com/openclaw/openclaw/issues/30484) — **Primary source for Section 2.5.** Documents HTTP 402 as a billing-layer event on Max plan with Extra Usage enabled; user had $41.36 extra usage balance remaining when 402 fired; issue generated 5 PRs; PR #30780 implements provider-aware Anthropic 402 handling
+- [Anthropic SDK Python — `_client.py` `_make_status_error` method](https://github.com/anthropics/anthropic-sdk-python/blob/main/src/anthropic/_client.py) — Confirms HTTP 402 is NOT explicitly mapped to any exception class; falls through to generic `APIStatusError`; 402 does not trigger automatic retry
+- [Anthropic SDK Python — `_exceptions.py`](https://github.com/anthropics/anthropic-sdk-python/blob/main/src/anthropic/_exceptions.py) — Confirms no `PaymentRequiredError` or billing-specific exception class exists; `RateLimitError` is mapped only to 429
+- [GitHub Issue #26498 (anthropics/claude-code): MessageParseError on rate_limit_event message type](https://github.com/anthropics/claude-code/issues/26498) — Documents `rate_limit_event` as a message type emitted by Claude Code CLI SDK; parser bug; no payload structure for 402 specifically; open as of Feb 2026
+- [Claude Code Changelog — v2.1.30 SDKRateLimitInfo/SDKRateLimitEvent](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md) — `SDKRateLimitInfo` and `SDKRateLimitEvent` types added in v2.1.30; no changelog entry mentioning HTTP 402 handling
+- [Claude Help Center: Extra Usage for Paid Claude Plans (article 12429409)](https://support.claude.com/en/articles/12429409-extra-usage-for-paid-claude-plans) — Does not specify HTTP status codes for extra usage exhaustion scenarios
 - [GitHub Issue #29604 (statusLine feature request)](https://github.com/anthropics/claude-code/issues/29604) — Proposed `rate_limit_type` field in statusLine JSON with value `"rolling_5h"` for 5-hour window; confirms internal parsing of window type
 - [codelynx.dev: How to Show Claude Code Usage Limits in Your Statusline](https://codelynx.dev/posts/claude-code-usage-limits-statusline) — **Primary source** for `/api/oauth/usage` endpoint JSON schema including `five_hour`, `seven_day`, `seven_day_opus`, and `resets_at` fields
 - [lexfrei gist: Claude Code statusline with real usage limits](https://gist.github.com/lexfrei/b70aaee919bdd7164f2e3027dc8c98de) — Confirms endpoint authentication (`anthropic-beta: oauth-2025-04-20` header); shows 5h/7d distinction in response
