@@ -29,7 +29,8 @@
 17. [Empirical Verification (Issue #60)](#empirical-verification-issue-60)
 18. [Follow-Up Research Recommendations](#follow-up-research-recommendations)
 19. [Subagent Permission Inheritance (Issue #62)](#19-subagent-permission-inheritance-issue-62)
-20. [Sources](#sources)
+20. [Task Subagent Isolation Empirical Evidence (Issue #80)](#20-task-subagent-isolation-empirical-evidence-issue-80)
+21. [Sources](#sources)
 
 ---
 
@@ -722,13 +723,135 @@ If the policy MCP server process crashes or fails to respond, the permission dec
        response = {"behavior": "deny", "message": f"Policy server error: {e}"}
    ```
 
-### Bug 5: `--allowedTools` reliability under non-bypass mode
+### Bug 5: `--allowedTools` in Non-Bypass Mode (Issue #61)
 
-**Severity: UNKNOWN** [INFERRED; needs empirical verification]
+**Issue:** #61
+**Date:** 2026-03-02
+**Status:** Research complete (web-based; no live CLI execution performed)
 
-Issue #12232 confirms `--allowedTools` is broken under `bypassPermissions` mode. Whether it works correctly in the non-bypass mode used with `--permission-prompt-tool` is not confirmed by existing research. If it is also broken in non-bypass mode, then the static allow rules at Step 2 don't fire, and all allow decisions fall through to the MCP tool.
+---
 
-**Mitigation:** Until verified empirically, treat `--allowedTools` as unreliable and implement the full allowlist logic in the MCP policy server. Rely on `--disallowedTools` for the highest-risk denials (confirmed working under all modes per doc #19).
+#### 5.1 Background
+
+The original finding (above) was marked [INFERRED; needs empirical verification]. Issue #61 was opened to determine whether the `--allowedTools` breakage documented in Issue #12232 is specific to `bypassPermissions` mode, or whether it also affects non-bypass configurations — in particular, the `--permission-prompt-tool` headless deployment pattern.
+
+The design implication is significant: if `--allowedTools` works correctly in non-bypass mode, the combined `--allowedTools + --permission-prompt-tool` pattern enables a fast-path static allowlist (Step 2 auto-approves pre-cleared tools, Step 4 MCP server handles the rest). If it is also broken in non-bypass mode, the policy server must handle all allow decisions without any fast-path benefit from `--allowedTools`.
+
+---
+
+#### 5.2 Findings: Mode-Specificity of Issue #12232
+
+**Finding: The `--allowedTools` breakage documented in Issue #12232 is specific to `bypassPermissions` mode.** [INFERRED-HIGH from multiple converging sources]
+
+**Evidence:**
+
+1. **Issue #12232 test is bypassPermissions-only.** The reporter tested `--allowedTools Read` exclusively alongside `--permission-mode bypassPermissions`. The failing command was:
+   ```bash
+   claude --verbose -p "get my public ip from curl ifconfig.me" \
+     --allowedTools Read \
+     --permission-mode bypassPermissions
+   # Result: 1.2.3.4 (Bash executed despite Read-only allowlist)
+   ```
+   No test was run in default or non-bypass mode. The issue neither states nor implies mode-generality.
+
+2. **TypeScript SDK Issue #115 provides explicit clarification.** An Anthropic collaborator (ashwin-ant) clarified on this issue (closed as COMPLETED December 28, 2025): *"The issue here is that you're using `permissionMode: 'bypassPermissions'` which means all permission checks are skipped. If you're using that, `allowedTools` and `disallowedTools` do nothing."* This is the closest to an authoritative statement on the mode-specificity of the breakage.
+
+3. **Official headless mode documentation uses `--allowedTools` without bypass mode.** The official "Run Claude Code programmatically" page (`code.claude.com/docs/en/headless`) shows `--allowedTools` as the standard auto-approval mechanism in `-p` mode without `--dangerously-skip-permissions`:
+   ```bash
+   claude -p "Run the test suite and fix any failures" \
+     --allowedTools "Bash,Read,Edit"
+   ```
+   This usage is presented as working without any bypass mode caveat. If `--allowedTools` were also broken in non-bypass mode, this example would be useless for its stated purpose (auto-approving tools in headless mode). The documentation does not warn that this only works with `--dangerously-skip-permissions`.
+
+4. **Issue #563 (--allowedTools not working reliably) resolved as documentation error.** This March 2025 issue reported `--allowedTools` not working in `-p` mode (non-bypass). The root cause was incorrect flag format: the documentation showed space-separated arguments, but the correct format is comma-separated (`--allowedTools "Bash(dotnet:*),Edit"`). Once corrected, the reporter confirmed it worked. This strongly suggests `--allowedTools` functions correctly in non-bypass `-p` mode when the syntax is correct.
+
+5. **Community usage of `--allowedTools` in CI/CD without bypass mode.** Multiple community guides and tutorials (SFEIR Institute, Shipyard, Claude Code 101) show `--allowedTools` in CI/CD pipelines without `--dangerously-skip-permissions`. Production use would not be widespread if the flag were broken in default mode.
+
+**Confidence: INFERRED-HIGH.** No direct empirical test of the combined `--allowedTools + --permission-prompt-tool` invocation was found. However, the converging evidence strongly indicates the breakage is specific to `bypassPermissions` mode.
+
+---
+
+#### 5.3 Findings: `--allowedTools` in Non-Bypass Mode — Known Separate Issues
+
+**Finding: `--allowedTools` in non-bypass mode has its own independent reliability issues, distinct from the bypassPermissions bug.** [DOCUMENTED — multiple open GitHub issues]
+
+While the `--allowedTools` allowlist is **not completely ignored** in non-bypass mode (unlike bypassPermissions mode), there are separate, confirmed bugs that affect its reliability:
+
+| Issue | Mode | Finding | Status |
+|-------|------|---------|--------|
+| #581 — CLI non-interactive mode ignores `settings.json` permissions | Default (non-bypass) | Allow rules in `.claude/settings.json` not honored in `-p` mode; workaround: use `--allowedTools` CLI flag directly | Closed "COMPLETED" June 2025, but users reported recurrence for path patterns |
+| #18160 — Allow permission patterns not matching correctly | Default | `Bash(ls *)` pattern does not match `ls -la ~/.claude/`; tilde expansion, flag+path combos, multiple wildcards have edge-case failures | OPEN — 14 comments, multiple duplicates |
+| #14956 — Skill `allowed-tools` doesn't grant permission for Bash commands | Default (skill context) | `allowed-tools` in SKILL.md frontmatter correctly reports as active but does not prevent approval prompts for matching commands | OPEN — March 2026 |
+| #28682 — Model ignores explicit permission grants | Default (Windows) | `Bash(*)` in `settings.local.json` does not prevent Claude from prompting for tool approval | OPEN — Feb 2026 |
+| #25181 — Bash commands auto-approved despite not being in allowedTools | Default | Bash executes without prompts even when not in any allow list (opposite direction: too permissive, not too restrictive) | Closed as duplicate of #18160 |
+
+**Key distinction from bypassPermissions bug:** These non-bypass issues are **pattern-matching failures** and **settings-loading edge cases**, not a categorical bypass of the allowlist enforcement layer. The allowlist enforcement mechanism is present and active in default mode; it has bugs in specific syntax scenarios and settings-file loading order. This is qualitatively different from bypassPermissions mode, where `--allowedTools` is overridden wholesale.
+
+**Impact for the `--permission-prompt-tool` architecture:** With `--permission-prompt-tool` active (no bypass mode), `--allowedTools` should fire at Step 2 and prevent the MCP tool from being called for pre-approved tools. However, the pattern-matching edge cases above mean:
+- Simple tool-name allowlists (`--allowedTools "Read,Glob,Grep"`) are likely to work correctly.
+- Complex Bash pattern allowlists (`--allowedTools "Bash(git diff *),Bash(uv run *)"`) may have edge-case failures where the pattern does not match a slightly different command form.
+- The allowlist is a best-effort fast path, not a reliable security enforcement layer in non-bypass mode.
+
+---
+
+#### 5.4 Findings: `--disallowedTools` in Non-Bypass Mode
+
+**Finding: `--disallowedTools` is confirmed working in both bypass and non-bypass modes.** [DOCUMENTED from doc #19 + corroborating evidence]
+
+No community reports describe `--disallowedTools` failing in default or non-bypass mode. Doc #19 confirms it works under bypassPermissions. Community guides from multiple sources confirm it as the reliable complement to `--allowedTools`. The TypeScript SDK issue #115 clarification notes bypassPermissions skips `disallowedTools` too (since all checks are skipped), but this does not affect non-bypass configurations.
+
+For the `--permission-prompt-tool` architecture: `--disallowedTools` should be used for the highest-risk denials regardless, since it provides a reliable pre-MCP-call fast-path deny that is not subject to the pattern-matching edge cases affecting allow rules.
+
+---
+
+#### 5.5 Findings: `settings.json` Allow/Deny Rules in Non-Bypass Mode
+
+**Finding: `settings.json` allow/deny rules have pattern-matching reliability issues in non-bypass mode identical to those affecting `--allowedTools`.** [DOCUMENTED]
+
+The bugs in Section 5.3 above (primarily #18160 and its duplicates) affect both the `--allowedTools` CLI flag and the equivalent `permissions.allow` array in `settings.json`. The root cause appears to be in the pattern-matching engine rather than in how the CLI flag vs settings file is parsed.
+
+**Implication:** The fast-path advantage of `settings.json` allow rules in the `--permission-prompt-tool` architecture is the same as for `--allowedTools` CLI flag: it should work for simple tool-name rules and likely has edge cases for complex Bash patterns with path arguments.
+
+---
+
+#### 5.6 Updated Severity and Recommendation
+
+**Previous severity: UNKNOWN [INFERRED]**
+**Updated severity: LOW-MEDIUM [INFERRED-HIGH] — mode-specific breakage confirmed not to apply; separate pattern-matching bugs present**
+
+The original severity was elevated by uncertainty about whether the bypassPermissions bug generalized to all modes. This research finds strong evidence it does not generalize. The remaining risk is the independent pattern-matching reliability issues in non-bypass mode, which are less severe (selective edge-case failures vs. wholesale allowlist bypass).
+
+**Updated recommendation:**
+
+The `--allowedTools` fast path is a **valid performance optimization** (avoiding MCP calls for pre-cleared tools) in the `--permission-prompt-tool` architecture, but it should not be treated as a reliable security enforcement layer:
+
+1. **For simple tool-name allowlists** (`--allowedTools "Read,Glob,Grep"`): Use with confidence. These are unlikely to be affected by the pattern-matching edge cases.
+2. **For complex Bash pattern allowlists** (`--allowedTools "Bash(git diff *),Bash(uv run pytest *)"`): Use as a performance hint but do not rely on for security. The MCP policy server must independently enforce the same allowlist for Bash commands.
+3. **For security-critical denials**: Always use `--disallowedTools` rather than relying on the allowlist to implicitly deny unlisted tools. Pattern-matching failures mean the allowlist may not fire, causing unlisted tools to fall through to the MCP server rather than being blocked at Step 2.
+4. **MCP policy server as authoritative enforcer**: Implement the complete allow/deny logic in the MCP policy server. The `--allowedTools` fast path reduces MCP call volume for common pre-cleared tools but must not be the only enforcement point.
+
+---
+
+#### 5.7 Follow-Up Research Recommendations
+
+**R-61-A: Empirical test of `--allowedTools` with `--permission-prompt-tool` (direct confirmation)** [V1_RESEARCH]
+
+The most direct test: run `claude -p "curl ifconfig.me" --allowedTools Read --permission-prompt-tool mcp__test-policy__check_permission` with a policy server that allows everything but logs all calls. Verify:
+- Does Bash(curl) reach the policy server (suggesting `--allowedTools Read` did not block it at Step 2)?
+- Or does it fail before reaching the policy server (suggesting `--allowedTools Read` correctly enforces the allowlist at Step 2)?
+
+If Bash reaches the policy server despite `--allowedTools Read` specifying only Read, this would contradict the documented permission evaluation order and the INFERRED-HIGH finding above. This test should be incorporated into the R-31-A smoke test suite (Issue #60).
+
+**R-61-B: Pattern-matching edge cases for Bash allowlist patterns in non-bypass mode** [V2_RESEARCH]
+
+The open bugs (#18160 and related) describe pattern-matching failures for specific command forms. A focused test is needed to determine:
+- Which Bash pattern forms are affected (tilde paths, flag+path combos, multi-argument commands)?
+- Does the `--allowedTools` CLI flag have the same edge cases as `settings.json` `permissions.allow` rules?
+- Are the failures in the matching engine or in settings loading?
+
+This matters for the policy server's fast-path allowlist design: if common patterns like `Bash(git diff *)` are reliable, the performance optimization is worthwhile. If they are not, the MCP server must handle all Bash calls.
+
+**Existing coverage:** Issues #61 (this research), #60 (smoke test), #80 (empirical task subagent isolation). R-61-A should be bundled into Issue #60's test suite. R-61-B represents a new, narrow empirical measurement gap not covered by any existing issue.
 
 ### Limitation 1: Synchronous blocking
 
@@ -829,7 +952,7 @@ Doc #06 states: "Note: `--dangerously-skip-permissions` is used here only becaus
 
 This research confirms that `--allowedTools` is broken under `bypassPermissions` (Issue #12232, also documented in doc #19). The statement that `--allowedTools` provides an effective defense layer under bypass mode is **incorrect** based on the confirmed bug. Doc #06 should be updated to note that `--allowedTools` provides no protection under bypassPermissions and that the full security burden falls on `--disallowedTools` + PreToolUse hooks.
 
-The `--permission-prompt-tool` approach actually improves on this by operating outside of bypass mode, where `--allowedTools` may work correctly.
+The `--permission-prompt-tool` approach actually improves on this by operating outside of bypass mode. Issue #61 research (see Bug 5, Section 13) confirms with INFERRED-HIGH confidence that the `--allowedTools` bypass is specific to bypassPermissions mode. The `--permission-prompt-tool` architecture does not activate bypass mode, so `--allowedTools` should work correctly in the simple tool-name form. Complex Bash pattern matching has separate non-bypass bugs (#18160, #14956) but these are narrower pattern-matching edge cases, not a categorical bypass.
 
 ### Consistent with doc #14
 
@@ -837,7 +960,7 @@ Doc #14 (Section 8) correctly identified this as an open research gap and assess
 
 ### Consistent with doc #19
 
-Doc #19 confirmed `--allowedTools` is broken under bypass mode (Issue #12232). This research adds: the `--permission-prompt-tool` approach avoids bypass mode entirely and therefore the allowlist breakage may not apply. This is an additive finding, not a contradiction.
+Doc #19 confirmed `--allowedTools` is broken under bypass mode (Issue #12232). Issue #61 research (Bug 5) adds: the mode-specificity of Issue #12232 is confirmed with INFERRED-HIGH confidence — the categorical allowlist bypass is a bypassPermissions-specific behavior. In non-bypass mode, `--allowedTools` is not categorically ignored, though it has separate reliability edge cases for complex pattern matching. This strengthens the case for the `--permission-prompt-tool` architecture as an improvement over bypassPermissions mode.
 
 ---
 
@@ -950,9 +1073,16 @@ See Section 19 for the full analysis (Issue #62 research). Summary: `--permissio
 
 ### V9: `--allowedTools` Reliability in Non-Bypass Mode
 
-**Finding: UNKNOWN — not resolved by this research** [needs empirical test]
+**Finding: INFERRED-HIGH — Issue #12232 bug is bypassPermissions-specific; non-bypass mode has separate pattern-matching bugs** [Issue #61 research complete]
 
-No new evidence was found. Issue #12232 (broken under bypassPermissions) remains the only empirical data point. Issue #61 tracks this directly.
+See Bug 5 (Section 13) for the full analysis. Summary:
+
+- The `--allowedTools` breakage in Issue #12232 is specific to `bypassPermissions` mode. No evidence was found that the categorical bypass of the allowlist occurs in default/non-bypass mode. TypeScript SDK Issue #115 (closed COMPLETED Dec 2025) explicitly confirmed: the `bypassPermissions` mode skips all permission checks including `allowedTools`.
+- In non-bypass mode, `--allowedTools` is not categorically ignored, but has separate pattern-matching reliability bugs (#18160, #14956, #28682) affecting specific Bash command forms with path arguments and complex wildcards. Simple tool-name rules (`Read`, `Glob`, `Grep`) are unlikely to be affected.
+- `--disallowedTools` is confirmed working in both bypass and non-bypass modes.
+- No direct empirical test of `--allowedTools` specifically in combination with `--permission-prompt-tool` was found. R-61-A (in Bug 5, Section 5.7) recommends this test be incorporated into the R-31-A smoke test suite.
+
+**Upgraded from:** [UNKNOWN] to [INFERRED-HIGH — mode-specificity confirmed; separate non-bypass pattern-matching issues documented]
 
 ---
 
@@ -968,6 +1098,8 @@ No new evidence was found. Issue #12232 (broken under bypassPermissions) remains
 | No first-launch initialization bug for Mechanism A | [UNKNOWN] | [INFERRED-LOW RISK — no reports found; distinct from hook initialization bug] |
 | Mechanism B (stdio) broken in 2.1.6+ does not affect Mechanism A | [DOCUMENTED] | [CONFIRMED — mechanisms architecturally independent] |
 | `--permission-prompt-tool` not inherited by Task/Agent tool subagents | [INFERRED] | [DOCUMENTED + INFERRED-HIGH — issues #25000, #18950, #21460] |
+| Issue #12232 `--allowedTools` bypass is bypassPermissions-specific (not general) | [INFERRED] | [INFERRED-HIGH — Issue #61 research: SDK Issue #115 explicit clarification + official headless docs usage pattern + Issue #563 resolution] |
+| `--allowedTools` in non-bypass mode: no categorical bypass, has pattern-matching edge cases | [UNKNOWN] | [DOCUMENTED — Issues #18160, #14956, #28682: pattern-matching failures for complex Bash patterns; simple tool-name rules unaffected] |
 
 ---
 
@@ -1358,6 +1490,14 @@ This constraint is already satisfied by the current recommended worker configura
 - [GitHub Issue #28580: MCP tools prompt for permission even when already authorized — first-use lazy-loading coupling (OPEN)](https://github.com/anthropics/claude-code/issues/28580) [DOCUMENTED — first-launch issue for interactive MCP sessions; does not affect headless --mcp-config invocation]
 - [GitHub Issue #1175: --permission-prompt-tool needs minimal example (CLOSED COMPLETED, community-verified schema)](https://github.com/anthropics/claude-code/issues/1175) [UPDATED STATUS — closed as completed after community confirmed correct response schema]
 - [60-permission-prompt-tool-verification — breadmin-conductor (Issue #60: empirical research confirming Mechanism A behaviors)](docs/research/31-permission-prompt-tool.md#empirical-verification-issue-60) [internal cross-reference]
-- [61-allowedtools-non-bypass-mode — breadmin-conductor (Issue #61: tracks --allowedTools reliability in non-bypass mode)](https://github.com/bread-wood/breadmin-composer/issues/61) [OPEN]
+- [61-allowedtools-non-bypass-mode — breadmin-conductor (Issue #61: tracks --allowedTools reliability in non-bypass mode)](https://github.com/bread-wood/breadmin-composer/issues/61) [RESEARCHED — see Bug 5, Section 13]
 - [62-permission-prompt-tool-subagent-inheritance — breadmin-conductor (Issue #62: tracks subagent inheritance of --permission-prompt-tool)](https://github.com/bread-wood/breadmin-composer/issues/62) [OPEN]
+- [Run Claude Code programmatically — Claude Code Docs (headless mode, --allowedTools usage without dangerously-skip-permissions)](https://code.claude.com/docs/en/headless) [DOCUMENTED — official headless docs use --allowedTools without bypass mode, confirming non-bypass usage pattern]
+- [GitHub Issue #563: --allowedTools not working reliably (closed COMPLETED March 2025)](https://github.com/anthropics/claude-code/issues/563) [DOCUMENTED — resolved as documentation format error: comma-separated not space-separated; confirms --allowedTools works in non-bypass -p mode with correct syntax]
+- [GitHub Issue #581: Claude CLI non-interactive mode doesn't respect configured tool permissions (closed COMPLETED June 2025)](https://github.com/anthropics/claude-code/issues/581) [DOCUMENTED — settings.json permissions not honored in -p mode; workaround: use --allowedTools CLI flag directly]
+- [GitHub Issue #14956: Skill allowed-tools doesn't grant permission for Bash commands (OPEN as of March 2026)](https://github.com/anthropics/claude-code/issues/14956) [DOCUMENTED — allowed-tools in SKILL.md frontmatter correctly reported but does not prevent approval prompts for matching Bash commands; non-bypass mode]
+- [GitHub Issue #18160: Claude is ignoring allow permissions in global settings.json (OPEN as of March 2026)](https://github.com/anthropics/claude-code/issues/18160) [DOCUMENTED — allow pattern matching failures for Bash commands with path arguments and complex wildcards; non-bypass mode]
+- [GitHub Issue #28682: Model ignores explicit permission grants and continues prompting user for approval (OPEN, Feb 2026)](https://github.com/anthropics/claude-code/issues/28682) [DOCUMENTED — Bash(*) in settings.local.json does not prevent permission prompts; Windows, default mode]
+- [GitHub Issue #25181: Bash commands auto-approved despite not being in allowedTools (closed as duplicate)](https://github.com/anthropics/claude-code/issues/25181) [DOCUMENTED — opposite problem: Bash executes without prompts even when not in allowlist; duplicate of #18160]
+- [GitHub Issue #115 (claude-agent-sdk-typescript): allowedTools does not restrict built-in tools (closed COMPLETED Dec 2025)](https://github.com/anthropics/claude-agent-sdk-typescript/issues/115) [DOCUMENTED — explicit Anthropic clarification: bypassPermissions skips all permission checks including allowedTools and disallowedTools; confirms mode-specificity of Issue #12232]
 
