@@ -98,7 +98,14 @@ When the pipeline is fully drained (no active agents, no remaining dispatchable 
    - Issues failed/abandoned (with reasons)
    - Newly unblocked issues available for the next run
 
-2. **Post a Notion report** under "CC Autonomous Coding Sessions"
+2. **File the next pipeline stage issue** — kick off planning for the next version:
+   ```bash
+   gh issue create \
+     --title "Run plan-milestones for <next version>" \
+     --label "pipeline"
+   ```
+
+3. **Post a Notion report** under "CC Autonomous Coding Sessions"
    (parent page ID: `317bb275-6a02-803d-a59f-dc56c3527942`) using
    `mcp__notion__API-post-page` with:
    - **Title**: `Session Report — {YYYY-MM-DD} — {repo name}`

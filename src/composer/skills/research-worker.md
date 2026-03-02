@@ -230,7 +230,12 @@ When the pipeline drains for the active milestone:
    - Remaining open research issues in active milestone
    - **Milestone completion status**: X of Y issues resolved
 
-2. **Post a Notion report** under "CC Autonomous Coding Sessions"
+2. **File the next pipeline stage issue** (only if research is declared complete):
+   ```bash
+   gh issue create --title "Run design-worker for <milestone>" --label "pipeline" --milestone "<milestone>"
+   ```
+
+3. **Post a Notion report** under "CC Autonomous Coding Sessions"
    (parent page ID: `317bb275-6a02-803d-a59f-dc56c3527942`) using
    `mcp__notion__API-post-page` with:
    - **Title**: `Research Session — {YYYY-MM-DD} — {repo name}`

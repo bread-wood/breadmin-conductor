@@ -93,6 +93,44 @@ uv add --dev <package>    # add dev dependency
 
 `main`
 
+## Pipeline Stage Tracking
+
+Each pipeline stage transition must be tracked as a GitHub issue so the current project
+phase is always visible from the issue tracker.
+
+### Issue format
+
+Title: `Run <worker> for <milestone or version>`
+
+Examples:
+- `Run research-worker for MVP Research`
+- `Run design-worker for MVP Research`
+- `Run impl-worker for MVP Implementation`
+- `Run plan-milestones for v2`
+
+### Lifecycle
+
+1. **Filed** — when the previous stage completes, the worker files the next stage's issue
+2. **`in-progress`** — added when the stage begins (same as any other issue)
+3. **Closed** — when the stage completes; the closing comment links to the Notion session report
+
+### Who files what
+
+| Stage completes | Files next issue |
+|----------------|-----------------|
+| `plan-milestones` | `Run research-worker for <milestone>` |
+| `research-worker` | `Run design-worker for <milestone>` |
+| `design-worker` | `Run impl-worker for <milestone>` |
+| `impl-worker` | `Run plan-milestones for <next version>` |
+
+```bash
+gh issue create \
+  --repo <owner>/<repo> \
+  --title "Run <worker> for <milestone>" \
+  --label "pipeline" \
+  --milestone "<relevant milestone>"
+```
+
 ## Research Issue Triage
 
 Every research issue — including follow-ups created by agents — **must pass the triage rubric
@@ -209,3 +247,4 @@ gh milestone list --repo <owner>/<repo>
 | `in-progress` | Currently being worked on (managed by orchestrator) |
 | `triage` | Follow-up issues pending triage decision (applied by research agents) |
 | `wont-research` | Closed by triage gate — below threshold for standalone research |
+| `pipeline` | Pipeline stage transition tracking issues |

@@ -113,6 +113,11 @@ Print:
 - Explicit scope boundaries (what's in, what's out, what's next)
 - Suggested order of operations: which research issues to dispatch first
 
+File the next pipeline stage issue:
+```bash
+gh issue create --title "Run research-worker for <research milestone>" --label "pipeline" --milestone "<research milestone>"
+```
+
 Post a Notion report under "CC Autonomous Coding Sessions"
 (parent page ID: `317bb275-6a02-803d-a59f-dc56c3527942`) with:
 - **Title**: `Milestone Plan — {YYYY-MM-DD} — {repo name} — {version name}`

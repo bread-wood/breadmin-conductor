@@ -123,6 +123,11 @@ Print a summary:
 - Any research gaps that prevented full spec (flag as follow-up issues in the research milestone)
 - **Verdict**: "Ready for impl-worker — N issues filed, dependency graph complete."
 
+File the next pipeline stage issue:
+```bash
+gh issue create --title "Run impl-worker for <impl milestone>" --label "pipeline" --milestone "<impl milestone>"
+```
+
 Post a Notion report under "CC Autonomous Coding Sessions"
 (parent page ID: `317bb275-6a02-803d-a59f-dc56c3527942`) with:
 - **Title**: `Design Session — {YYYY-MM-DD} — {repo name}`
