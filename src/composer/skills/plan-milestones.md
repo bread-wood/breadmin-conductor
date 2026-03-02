@@ -33,6 +33,33 @@ git -C <local_path> checkout $DEFAULT_BRANCH && git -C <local_path> pull origin 
 
 Read the project CLAUDE.md to understand the domain and constraints.
 
+### Spec Seeding (`--spec`)
+
+When `--spec <path>` is passed to `composer plan-milestones`, the CLI resolves and copies the
+spec file into the target repo **before** this skill runs. By the time this skill executes,
+`docs/specs/<version>.md` is already committed in the target repo — proceed directly to Step 0.
+
+**How it works:**
+- `--spec` accepts a relative path (resolved from cwd) or an absolute path to a `.md` file.
+- The version name is inferred from the spec filename stem (e.g. `calculator.md` → `calculator`)
+  unless `--version` is explicitly provided.
+- If `docs/specs/<version>.md` already exists in the target repo, the copy is skipped and a
+  warning is printed; the skill proceeds with the existing file.
+- The spec file is copied to `docs/specs/<version>.md`, then `git add`ed and committed with
+  the message `docs: seed spec from <source path>`.
+
+**Example invocations:**
+```bash
+# Relative path (resolved from cwd)
+composer plan-milestones --repo calculator-cli --spec docs/specs/calculator.md
+
+# Absolute path
+composer plan-milestones --repo calculator-cli --spec /Users/me/specs/calculator.md
+
+# Override version name
+composer plan-milestones --repo calculator-cli --spec docs/specs/calculator.md --version MVP
+```
+
 ## Execution
 
 ### Step 0 — Read the Spec

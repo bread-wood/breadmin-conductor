@@ -467,3 +467,31 @@ class TestStartupSequence:
             )
 
         assert chk.run_id == "existing-run-id"
+
+
+# ---------------------------------------------------------------------------
+# composer --help lists all subcommands
+# ---------------------------------------------------------------------------
+
+
+class TestComposerHelp:
+    def test_composer_help_lists_all_subcommands(self) -> None:
+        """composer --help must list all pipeline subcommands with descriptions."""
+        from click.testing import CliRunner
+
+        from composer.cli import composer
+
+        runner = CliRunner()
+        result = runner.invoke(composer, ["--help"])
+
+        assert result.exit_code == 0
+        output = result.output
+
+        # All seven subcommands must appear in the help output
+        assert "plan-milestones" in output
+        assert "research-worker" in output
+        assert "design-worker" in output
+        assert "plan-issues" in output
+        assert "impl-worker" in output
+        assert "health" in output
+        assert "cost" in output

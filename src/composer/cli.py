@@ -1,11 +1,16 @@
 """CLI entry points for breadmin-composer.
 
-Entry points:
-  impl-worker      → impl_worker()
-  research-worker  → research_worker()
-  design-worker    → design_worker()
-  plan-issues      → plan_issues()
+Entry point:
   composer         → composer()
+
+All pipeline stages are subcommands of the ``composer`` group:
+  composer plan-milestones
+  composer research-worker
+  composer design-worker
+  composer plan-issues
+  composer impl-worker
+  composer health
+  composer cost
 """
 
 from __future__ import annotations
@@ -2875,6 +2880,84 @@ def _run_plan_issues(
 # ---------------------------------------------------------------------------
 
 
+def _validate_spec_path(spec: str) -> Path:
+    """Resolve and validate the ``--spec`` argument.
+
+    Accepts a relative path (resolved from cwd) or an absolute path.  Fails
+    with a :exc:`click.ClickException` if the path does not exist or does not
+    end in ``.md``.
+
+    Args:
+        spec: Raw value of the ``--spec`` CLI option.
+
+    Returns:
+        Resolved absolute :class:`~pathlib.Path`.
+
+    Raises:
+        click.ClickException: If the path does not exist or is not a ``.md`` file.
+    """
+    resolved = Path(spec).expanduser().resolve()
+    if not resolved.exists():
+        raise click.ClickException(f"Spec file not found: {resolved}")
+    if resolved.suffix.lower() != ".md":
+        raise click.ClickException(f"Spec file must be a .md file, got: {resolved.name!r}")
+    return resolved
+
+
+def _seed_spec(
+    spec_path: Path,
+    version: str,
+    local_path: str,
+) -> None:
+    """Copy *spec_path* into the target repo at ``docs/specs/<version>.md``.
+
+    If the destination already exists, print a warning and skip the copy.
+    Otherwise, create the directory, copy the file, ``git add``, and
+    ``git commit`` with a deterministic message.
+
+    Args:
+        spec_path:  Resolved absolute path to the source spec file.
+        version:    Version name used to build the destination filename.
+        local_path: Absolute path to the root of the target git repository.
+
+    Side effects:
+        May create ``docs/specs/`` inside *local_path*, copy the spec file,
+        and create a git commit.
+    """
+    dest_dir = Path(local_path) / "docs" / "specs"
+    dest_file = dest_dir / f"{version}.md"
+
+    if dest_file.exists():
+        click.echo(f"Warning: {dest_file} already exists in target repo. Skipping spec copy.")
+        return
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    import shutil
+
+    shutil.copy2(spec_path, dest_file)
+
+    subprocess.run(
+        ["git", "-C", local_path, "add", str(dest_file)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            local_path,
+            "commit",
+            "-m",
+            f"docs: seed spec from {spec_path}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    click.echo(f"Seeded spec into {dest_file} and committed.")
+
+
 def _run_plan_milestones(
     repo: str,
     version: str,
@@ -2968,7 +3051,12 @@ def _run_plan_milestones(
 # ---------------------------------------------------------------------------
 
 
-@click.command("impl-worker")
+@click.group()
+def composer() -> None:
+    """Composer orchestrator — run pipeline workers and admin commands."""
+
+
+@composer.command("impl-worker")
 @click.option(
     "--repo",
     default=None,
@@ -3023,7 +3111,7 @@ def impl_worker(
     )
 
 
-@click.command("research-worker")
+@composer.command("research-worker")
 @click.option(
     "--repo",
     default=None,
@@ -3078,7 +3166,7 @@ def research_worker(
     )
 
 
-@click.command("design-worker")
+@composer.command("design-worker")
 @click.option(
     "--repo",
     default=None,
@@ -3124,7 +3212,7 @@ def design_worker(
     )
 
 
-@click.command("plan-issues")
+@composer.command("plan-issues")
 @click.option(
     "--repo",
     default=None,
@@ -3170,7 +3258,7 @@ def plan_issues(
     )
 
 
-@click.command("plan-milestones")
+@composer.command("plan-milestones")
 @click.option(
     "--repo",
     default=None,
@@ -3180,17 +3268,46 @@ def plan_issues(
         "or omit to operate on the current working directory."
     ),
 )
-@click.option("--version", required=True, help="Version name (e.g. 'MVP', 'v2')")
+@click.option(
+    "--version",
+    default=None,
+    help=(
+        "Version name (e.g. 'MVP', 'v2'). "
+        "Required unless --spec is given, in which case it defaults to the spec filename stem."
+    ),
+)
 @click.option("--model", default=None, help="Override Claude model")
 @click.option("--dry-run", is_flag=True, help="Print planned milestones without creating them")
+@click.option(
+    "--spec",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help=(
+        "Path to a .md spec file to seed into the target repo before running plan-milestones. "
+        "Accepts relative (resolved from cwd) or absolute paths."
+    ),
+)
 def plan_milestones(
     repo: str | None,
-    version: str,
+    version: str | None,
     model: str | None,
     dry_run: bool,
+    spec: str | None,
 ) -> None:
     """Create a milestone pair and seed research issues from a spec via claude -p."""
-    repo_ref, _local_path = _resolve_repo(repo)
+    # Resolve and validate the spec path if provided
+    resolved_spec: Path | None = None
+    if spec is not None:
+        resolved_spec = _validate_spec_path(spec)
+
+    # Determine the version name: explicit flag > inferred from spec filename > error
+    if version is None:
+        if resolved_spec is not None:
+            version = resolved_spec.stem
+        else:
+            raise click.UsageError("--version is required when --spec is not provided.")
+
+    repo_ref, local_path = _resolve_repo(repo)
     overrides: dict = {"github_repo": repo_ref or None, "target_repo": repo_ref or None}
     if model:
         overrides["model"] = model
@@ -3205,6 +3322,15 @@ def plan_milestones(
         stage="plan-milestones",
     )
 
+    # Seed the spec into the target repo before running plan-milestones
+    if resolved_spec is not None:
+        if local_path is None:
+            raise click.ClickException(
+                "--spec requires a local repository path. "
+                "Pass --repo path/to/local/dir or omit --repo to operate on cwd."
+            )
+        _seed_spec(resolved_spec, version, local_path)
+
     _run_plan_milestones(
         repo=repo_ref,
         version=version,
@@ -3212,11 +3338,6 @@ def plan_milestones(
         checkpoint=_checkpoint,
         dry_run=dry_run,
     )
-
-
-@click.group()
-def composer() -> None:
-    """Composer admin commands."""
 
 
 @composer.command("health")

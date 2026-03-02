@@ -125,6 +125,22 @@ class Config(BaseSettings):
         ),
     )
 
+    # --- Plan-milestones spec seeding ---
+    spec_path: Path | None = Field(
+        default=None,
+        description=(
+            "Absolute path to a .md spec file to seed into the target repo before "
+            "running plan-milestones. Resolved and validated by the CLI before being stored here."
+        ),
+    )
+    version: str | None = Field(
+        default=None,
+        description=(
+            "Version name override for plan-milestones spec seeding. "
+            "When None, the version is inferred from the spec filename stem."
+        ),
+    )
+
     # --- Health checks ---
     max_orphaned_issues: int = Field(
         default=5,

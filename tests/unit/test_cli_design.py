@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
 
-from composer.cli import _run_design_worker, _run_plan_issues, design_worker, plan_issues
+from composer.cli import _run_design_worker, _run_plan_issues, composer
 from composer.config import Config
 from composer.runner import RunResult
 from composer.session import Checkpoint
@@ -412,13 +412,13 @@ class TestDesignWorkerCommand:
         """design-worker without --repo fails when cwd is not a git repo."""
         runner = CliRunner()
         with runner.isolated_filesystem(temp_dir=tmp_path):
-            result = runner.invoke(design_worker, ["--research-milestone", "v1"])
+            result = runner.invoke(composer, ["design-worker", "--research-milestone", "v1"])
         assert result.exit_code != 0
         assert "not a git repository" in result.output or "Error" in result.output
 
     def test_missing_research_milestone_fails(self) -> None:
         runner = CliRunner()
-        result = runner.invoke(design_worker, ["--repo", "owner/repo"])
+        result = runner.invoke(composer, ["design-worker", "--repo", "owner/repo"])
         assert result.exit_code != 0
         assert "Missing option" in result.output or "research-milestone" in result.output
 
@@ -437,8 +437,15 @@ class TestDesignWorkerCommand:
             mock_run.return_value = None
 
             result = runner.invoke(
-                design_worker,
-                ["--repo", "owner/repo", "--research-milestone", "v1", "--dry-run"],
+                composer,
+                [
+                    "design-worker",
+                    "--repo",
+                    "owner/repo",
+                    "--research-milestone",
+                    "v1",
+                    "--dry-run",
+                ],
             )
 
         assert result.exit_code == 0
@@ -459,13 +466,13 @@ class TestPlanIssuesCommand:
         """plan-issues without --repo fails when cwd is not a git repo."""
         runner = CliRunner()
         with runner.isolated_filesystem(temp_dir=tmp_path):
-            result = runner.invoke(plan_issues, ["--impl-milestone", "v1"])
+            result = runner.invoke(composer, ["plan-issues", "--impl-milestone", "v1"])
         assert result.exit_code != 0
         assert "not a git repository" in result.output or "Error" in result.output
 
     def test_missing_impl_milestone_fails(self) -> None:
         runner = CliRunner()
-        result = runner.invoke(plan_issues, ["--repo", "owner/repo"])
+        result = runner.invoke(composer, ["plan-issues", "--repo", "owner/repo"])
         assert result.exit_code != 0
         assert "Missing option" in result.output or "impl-milestone" in result.output
 
@@ -484,8 +491,9 @@ class TestPlanIssuesCommand:
             mock_run.return_value = None
 
             result = runner.invoke(
-                plan_issues,
+                composer,
                 [
+                    "plan-issues",
                     "--repo",
                     "owner/repo",
                     "--impl-milestone",
