@@ -57,6 +57,43 @@ uv add --dev <package>    # add dev dependency
 
 `main`
 
+## Research Issue Triage
+
+Every research issue — including follow-ups created by agents — **must pass the triage rubric
+before being dispatched**. Apply it immediately after an agent creates follow-up issues (Step 3
+of the research-worker loop), not at dispatch time.
+
+### Rubric
+
+Score 1 point for each "yes":
+
+1. **Decision impact** — Would not knowing this change an implementation decision in the current milestone?
+2. **Novelty** — Is this genuinely new, not already covered by an existing open or closed issue or doc?
+3. **Risk** — Would not knowing this create a correctness or security risk?
+
+**Score ≥ 2 → keep.** Assign to the active milestone if missing.
+
+**Score < 2 → close with `wont-research` label:**
+```bash
+gh issue close <N> --reason "not planned" \
+  --comment "Closing: score X/3 on research triage rubric. <brief reason>"
+gh issue edit <N> --add-label "wont-research"
+```
+
+### Label Workflow
+
+- Research agents tag their own follow-up issues with `triage` at creation time.
+- The orchestrator reads all `triage`-labelled issues after each merge and scores them.
+- Issues that pass become candidates for the next dispatch batch.
+- Issues that fail are closed immediately — do not leave them open.
+
+### Anti-patterns to reject (score 0 automatically)
+
+- Empirical measurements that belong *inside* an existing research doc
+- Implementation tasks or data collection scripts
+- Topics already answered in a merged research doc
+- Narrow edge cases that don't alter the core design
+
 ## Issue Labels
 
 | Label | Purpose |
@@ -69,3 +106,5 @@ uv add --dev <package>    # add dev dependency
 | `feat:logging` | JSONL logging + cost ledger |
 | `feat:cli` | CLI wiring + skill files |
 | `in-progress` | Currently being worked on (managed by orchestrator) |
+| `triage` | Follow-up issues pending triage decision (applied by research agents) |
+| `wont-research` | Closed by triage gate — below threshold for standalone research |

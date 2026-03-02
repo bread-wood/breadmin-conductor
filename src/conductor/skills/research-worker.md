@@ -67,6 +67,11 @@ by a doc. They do NOT exist to track:
 - Be assigned the **same milestone** as the parent issue
 - Represent a topic that warrants a standalone research document
 - Not duplicate an existing open or closed issue
+- Include `triage` in their label list so the orchestrator can find and score them quickly
+
+**All follow-ups are subject to the triage rubric** (see CLAUDE.md "Research Issue Triage").
+The orchestrator applies the rubric immediately after each merge — do not assume follow-ups
+will be dispatched. Issues scoring < 2/3 are closed with `wont-research`.
 
 ### Research Agent Instructions
 
@@ -130,9 +135,10 @@ Launch sub-agents in parallel using `Agent(isolation: "worktree")`.
 >    - Represents a genuinely new architectural/research question
 >    - Is NOT already covered by an existing issue (check: `gh issue list --state all --label research --limit 300 --json number,title`)
 >    - Would require a standalone research document to answer
->    - Use: `gh issue create --title "Research: <topic>" --label research --milestone "<milestone name>" --body "..."`
+>    - Use: `gh issue create --title "Research: <topic>" --label "research,triage" --milestone "<milestone name>" --body "..."`
 >    - Body MUST include: `## Spawned From`, `## Research Areas`, `## Deliverable`, `## Dependencies`
 >    - DO NOT create issues for: implementation tasks, data collection scripts, narrow empirical measurements, things already covered in existing docs
+>    - Add `triage` label to ALL follow-up issues — the orchestrator will score them; don't pre-filter, but be conservative
 > 8. Commit with message referencing the issue: `git commit -m "docs: add <topic> research (Closes #<N>)"`
 > 9. `git push -u origin <branch-name>`
 > 10. Create PR with a full description:
@@ -166,8 +172,17 @@ As **each agent completes** (do not wait for the entire batch):
 2. **Merge the PR**: `gh pr merge <PR-number> --squash --delete-branch`
 3. **Pull**: `git pull origin $DEFAULT_BRANCH`
 4. **Verify follow-ups were created**: check PR body for "Follow-Up Issues Spawned" section
-   - If the agent created follow-ups, review them for quality (not too granular, right milestone)
-   - If the agent created zero follow-ups, read the doc's "Follow-Up Recommendations" section yourself and decide if any warrant issues
+   - If the agent created follow-ups, apply the **triage rubric** to each one immediately:
+     ```bash
+     gh issue list --state open --label triage --limit 50
+     ```
+     For each `triage`-labelled follow-up, score it (3 questions, need ≥2 yes):
+     1. Changes a current-milestone impl decision?
+     2. Genuinely new, not covered by an existing doc or issue?
+     3. Correctness or security risk if skipped?
+     - **Score < 2**: `gh issue close <N> --reason "not planned" --comment "score X/3"` + add `wont-research`
+     - **Score ≥ 2**: `gh issue edit <N> --remove-label triage` (keep, leave in queue)
+   - If the agent created zero follow-ups, read the doc's "Follow-Up Recommendations" section yourself and decide if any warrant issues — if so, create them with `triage` label and score them
 5. **Comment on the closed parent issue**: `gh issue comment <N> --body "Research doc merged in PR #<PR>. Follow-up issues: <list or 'none'>"`
 6. **Re-survey**: check for newly unblocked issues in the active milestone
 7. **Dispatch next batch** (up to 5 agents total active)
@@ -203,5 +218,6 @@ When the pipeline drains for the active milestone:
 - **Agents create their own follow-ups** — orchestrator reviews quality, doesn't recreate from scratch
 - **PRs must have full descriptions** — title, summary, key findings, follow-ups spawned
 - **No infinite loops** — stop when the milestone queue is empty
+- **Triage every follow-up before dispatch** — apply rubric immediately after each merge; close failing issues with `wont-research`; remove `triage` label from passing issues
 - **Post session report to Notion** when done
 - Report progress: log each completion/merge/follow-up creation as it happens
