@@ -2139,15 +2139,18 @@ def _run_impl_worker(
         unblocked = _filter_unblocked(open_issues, open_issue_numbers)
         ranked = _sort_issues(unblocked)
 
-        # Apply module isolation: skip issues whose module is already active
+        # Apply module isolation: skip issues whose module is already active.
+        # Use the governor's concurrency limit to bound the batch size.
+        limits: dict[str, int] = {"pro": 2, "max": 3, "max20x": 5}
+        concurrency_limit = config.max_concurrency or limits.get(config.subscription_tier, 3)
         dispatchable = []
         for issue in ranked:
             mod = _extract_module(issue)
             if mod == "none" or mod not in active_modules:
                 if gov.can_dispatch(1):
                     dispatchable.append(issue)
-                    # Don't exceed concurrency — stop selecting once we have a batch
-                    if len(dispatchable) >= 3:  # reasonable batch size
+                    # Don't exceed concurrency limit
+                    if len(dispatchable) >= concurrency_limit:
                         break
 
         if not dispatchable:
