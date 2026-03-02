@@ -1713,3 +1713,237 @@ No changes to the conductor's architectural decisions are warranted by this rese
 - [GitHub Issue #25181: Bash commands auto-approved despite not being in allowedTools (closed as duplicate)](https://github.com/anthropics/claude-code/issues/25181) [DOCUMENTED — opposite problem: Bash executes without prompts even when not in allowlist; duplicate of #18160]
 - [GitHub Issue #115 (claude-agent-sdk-typescript): allowedTools does not restrict built-in tools (closed COMPLETED Dec 2025)](https://github.com/anthropics/claude-agent-sdk-typescript/issues/115) [DOCUMENTED — explicit Anthropic clarification: bypassPermissions skips all permission checks including allowedTools and disallowedTools; confirms mode-specificity of Issue #12232]
 
+
+---
+
+## 21. Task→Agent Rename and CLI Flag Compatibility (Issue #93)
+
+**Issue:** #93
+**Spawned From:** Section 20.5 (R-80-C) and Section 20.7
+**Date:** 2026-03-02
+
+---
+
+### 21.1 Research Question
+
+In Claude Code v2.1.63+, the Task tool was renamed to Agent. The official sub-agents documentation states: "Existing `Task(...)` references in settings and agent definitions still work as aliases." Section 20.5 identified that whether this alias guarantee extends specifically to the CLI flags `--allowedTools` and `--disallowedTools` was unverified (R-80-C).
+
+The four research questions from Issue #93:
+
+1. Does `--disallowedTools "Task"` (old name) correctly block in-process subagent spawning when the CLI internally uses the renamed Agent tool?
+2. Does `--disallowedTools "Agent"` (new name) also work?
+3. Does an allowlist omitting both names (the current conductor recommendation) correctly prevent subagent spawning?
+4. Are there edge cases where alias translation fails at the CLI flag level?
+
+---
+
+### 21.2 Documented State of the Rename
+
+#### 21.2.1 The v2.1.63 Rename
+
+The Task→Agent rename was introduced in Claude Code v2.1.63. The official sub-agents documentation captures the scope of the alias guarantee:
+
+> "In version 2.1.63, the Task tool was renamed to Agent. Existing Task(...) references in settings and agent definitions still work as aliases."
+
+The phrase "settings and agent definitions" maps to two specific configuration surfaces:
+- `settings.json` `permissions.allow`, `permissions.ask`, and `permissions.deny` arrays
+- Agent frontmatter `tools` and `disallowedTools` fields
+
+The official changelog entry for v2.1.63 does not mention the rename. The rename was surfaced via third-party changelog tracking (ClaudeCodeLog on X) and community-filed bug reports, not official release notes.
+
+#### 21.2.2 Hook Payload Change: A Confirmed Breaking Change
+
+GitHub Issue #29677 ("Task→Agent tool rename in v2.1.63 breaks hook payloads — undocumented breaking change") documents the rename's only confirmed breaking change:
+
+The `tool_name` field in `PreToolUse` and `PostToolUse` hook JSON payloads changed from `"Task"` to `"Agent"` without announcement. Before v2.1.63:
+
+```json
+{
+  "tool_name": "Task",
+  "tool_input": { "prompt": "...", "description": "..." }
+}
+```
+
+After v2.1.63:
+```json
+{
+  "tool_name": "Agent",
+  "tool_input": { "prompt": "...", "description": "..." }
+}
+```
+
+Issue #29677 explicitly states the two-tier outcome of the rename:
+
+- **`tools` filter in `settings.json` IS backwards-compatible**: `"Task"` still matches the Agent tool in `permissions.allow`, `permissions.ask`, and `permissions.deny` entries.
+- **Hook payload `tool_name` is NOT backwards-compatible**: hook scripts checking `tool_name == "Task"` silently stop matching; all hook validation logic is bypassed for Agent tool calls.
+
+This is the key factual split. The alias guarantee applies at the *static filter/matching* layer (settings.json parser, frontmatter parser) but was applied inconsistently at the *dynamic payload* layer (hook execution context `tool_name` field).
+
+**Confidence level:** [DOCUMENTED] — from GitHub Issue #29677 with specific before/after payload examples and explicit per-surface analysis.
+
+---
+
+### 21.3 CLI Flag Alias Behavior Analysis
+
+#### 21.3.1 Flag Semantics: `--tools`, `--allowedTools`, and `--disallowedTools`
+
+The CLI reference (v2.x) distinguishes three tool-restriction flags:
+
+| Flag | Semantic | Effect |
+|------|----------|--------|
+| `--tools` | Hard availability restriction | Removes tools from the model's tool list entirely |
+| `--allowedTools` | Auto-approval | Specifies which tools execute without permission prompts |
+| `--disallowedTools` | Auto-denial | Removes tools from the model's context; cannot be used |
+
+The permissions documentation describes `--disallowedTools` as: "Tools that are removed from the model's context and cannot be used." This maps directly to the `permissions.deny` array in `settings.json`.
+
+The official permissions documentation example for disabling subagents now uses `Agent(AgentName)` syntax:
+
+```json
+{
+  "permissions": {
+    "deny": ["Agent(Explore)", "Agent(my-custom-agent)"]
+  }
+}
+```
+
+And the CLI flag equivalent in the official docs uses the same `Agent(...)` form:
+
+```bash
+claude --disallowedTools "Agent(Explore)"
+```
+
+This is the current documented canonical form. All official documentation examples have been updated to use `Agent` rather than `Task`.
+
+#### 21.3.2 Alias Coverage at the CLI Flag Layer
+
+The scope of the alias guarantee ("settings and agent definitions") most naturally includes the `permissions.deny` path, which backs `--disallowedTools`. Issue #29677 explicitly confirms that `settings.json` filter entries accept `"Task"` as an alias. Whether `--disallowedTools` at the CLI flag parsing level goes through the same code path as the `settings.json` parser is not confirmed in the accessible literature.
+
+**Evidence supporting `--disallowedTools "Task"` working via alias:**
+- The alias guarantee explicitly covers "settings," which backs the CLI flag
+- Issue #29677 confirms the `settings.json` filter layer is backwards-compatible
+- Third-party documentation (ClaudeLog) still references `Task(AgentName)` syntax as the canonical form for `--disallowedTools` without correction notices, suggesting the alias was working at time of authorship
+
+**Evidence that `Agent` is the only current correct form:**
+- All official documentation examples use `Agent(AgentName)` for `permissions.deny` and `--disallowedTools`
+- The sub-agents documentation uses `Agent(agent_type)` exclusively throughout
+- No official source explicitly documents `Task(AgentName)` as a valid `--disallowedTools` argument post-v2.1.63
+
+**Confidence level for `--disallowedTools "Task"` working as alias:** [INFERRED-HIGH] — the settings.json alias guarantee likely extends to the CLI flag path that maps to `permissions.deny`, but no direct test of the CLI flag itself has been reported.
+
+**Confidence level for `--disallowedTools "Agent"` working:** [DOCUMENTED] — the official permissions documentation uses this exact form in its example.
+
+#### 21.3.3 The Allowlist Strategy: Confirmed Safe Independent of Alias Resolution
+
+The conductor's current recommended pattern — an allowlist that excludes both "Task" and "Agent" — bypasses the alias question entirely:
+
+```bash
+--allowedTools "Read,Edit,Write,Bash,Glob,Grep"
+# Agent/Task absent -> subagent spawning blocked regardless of alias resolution
+```
+
+The sub-agents documentation explicitly states: "If `Agent` is omitted from the `tools` list entirely, the agent cannot spawn any subagents." This applies to omission from an `--allowedTools` list in bypassPermissions mode (where the list controls tool availability) and to the `--tools` flag (which always controls availability).
+
+The `--tools` flag is a semantically cleaner alternative:
+
+```bash
+--tools "Read,Edit,Write,Bash,Glob,Grep"
+# Removes Agent from the model's tool list (hard availability block vs. approval gate)
+```
+
+Both approaches achieve the same outcome for conductor workers. The allowlist approach is [DOCUMENTED] safe without dependency on alias resolution at any layer.
+
+---
+
+### 21.4 Security Gap Assessment for `--disallowedTools "Task"`
+
+The original concern in Issue #93: if `--disallowedTools "Task"` silently fails to block the renamed Agent tool, conductor configurations relying on name-based explicit denial would fail open.
+
+**Assessment:**
+
+The specific failure scenario is unlikely. The settings.json filter alias is confirmed backwards-compatible (Issue #29677), and `--disallowedTools` maps to the same filter layer. The hook payload breaking change established that the rename was not uniformly backwards-compatible across all interfaces; however, the hook payload is a *dynamic output* channel (JSON fields emitted at runtime), while CLI flag argument parsing is a *static input* channel (string matching at startup). The alias failure documented in Issue #29677 occurred at the output/payload layer. The input/filter layer was explicitly confirmed backwards-compatible.
+
+This is directionally positive evidence that `--disallowedTools "Task"` continues to work. The confidence level remains [INFERRED-HIGH] pending direct empirical test.
+
+**Bottom line for conductor:** The allowlist approach makes this question moot. The only scenario where this matters is a hypothetical deny-by-name pattern, which is not the conductor worker configuration.
+
+---
+
+### 21.5 Hook Payload Breaking Change: Concrete Action Required
+
+Any `PreToolUse` or `PostToolUse` hook that matches on `tool_name == "Task"` silently stopped working in v2.1.63. Example of a silently broken hook:
+
+```bash
+# BROKEN in v2.1.63+
+TOOL_NAME=$(echo "$CLAUDE_TOOL_USE_INPUT" | jq -r '.tool_name')
+if [ "$TOOL_NAME" != "Task" ]; then
+  exit 0  # Not a Task call -- allows it through; Agent calls silently bypass this guard
+fi
+# Validation below is NEVER reached for Agent tool calls
+```
+
+The correct form for both pre- and post-rename CLI versions:
+
+```bash
+# Safe in both pre- and post-v2.1.63 versions
+if [[ "$TOOL_NAME" != "Task" && "$TOOL_NAME" != "Agent" ]]; then
+  exit 0
+fi
+```
+
+Or for v2.1.63+ exclusively:
+
+```bash
+if [ "$TOOL_NAME" != "Agent" ]; then
+  exit 0
+fi
+```
+
+**This is a confirmed breaking change at [DOCUMENTED] confidence.** Any conductor PreToolUse or PostToolUse hook that checks `tool_name == "Task"` is silently broken and must be updated.
+
+---
+
+### 21.6 Confidence Level Summary
+
+| Question | Finding | Confidence |
+|----------|---------|------------|
+| `--disallowedTools "Task"` blocks Agent tool via alias | Likely works -- settings.json filter path confirmed backwards-compatible; CLI flag maps to same path | [INFERRED-HIGH] |
+| `--disallowedTools "Agent"` blocks Agent tool | Works -- official docs use this exact form | [DOCUMENTED] |
+| Allowlist omitting both names blocks subagent spawning | Works -- sub-agents docs explicitly state Agent omission prevents spawning | [DOCUMENTED] |
+| Hook `tool_name` payload changed from "Task" to "Agent" | Confirmed breaking change | [DOCUMENTED] |
+| Alias covers `settings.json` `permissions.deny` entries | Confirmed per Issue #29677 | [DOCUMENTED] |
+| `--disallowedTools` CLI flag uses same code path as `settings.json` `permissions.deny` | Plausible by architecture; not independently confirmed | [INFERRED-MEDIUM] |
+
+---
+
+### 21.7 Impact on Conductor Architecture
+
+1. **No change to the conductor worker allowlist pattern.** The allowlist approach is confirmed at [DOCUMENTED] confidence. Workers should continue using `--allowedTools "Read,Edit,Write,Bash,Glob,Grep"`. The `--tools` flag is an equivalent and semantically cleaner alternative; migration is not required.
+
+2. **Audit hooks for `"Task"` guard clauses.** The hook payload breaking change is confirmed. Any PreToolUse or PostToolUse hook in conductor or breadmin-platform packages that checks `tool_name == "Task"` is silently broken in v2.1.63+ and must be updated to `"Agent"` or to check both names during transition.
+
+3. **Use `"Agent"` as the canonical name in all new code.** Write new settings.json entries, `--disallowedTools` arguments, and hook matchers using `Agent` and `Agent(subagent-name)` syntax. The `Task` alias likely still works for static filter entries but its continued support is not guaranteed in future versions.
+
+4. **The `--disallowedTools "Task"` question is low priority for conductor.** The only scenario where its resolution matters is a name-based deny pattern, which is not the recommended conductor approach. Upgrade to [EMPIRICAL] confidence via R-93-A only if the conductor security model is revised to deny-by-name rather than allowlist-by-omission.
+
+---
+
+### 21.8 Remaining Gaps
+
+| Gap | ID | Priority | Note |
+|-----|----|----------|------|
+| Empirical test: `--disallowedTools "Task"` blocks Agent tool in v2.1.63+ | R-93-A | LOW | Not blocking; resolves INFERRED-HIGH to EMPIRICAL |
+| Audit: hooks checking `tool_name == "Task"` | -- | IMMEDIATE if hooks in use | Confirmed breaking change; any such hook is silently non-functional |
+| `--tools` flag behavior verification for subagent blocking vs `--allowedTools` | R-93-B | LOW | Confirmatory only; both approaches produce the same outcome |
+
+---
+
+### 21.9 Sources (Issue #93 Addendum)
+
+- [Create custom subagents -- Claude Code Docs (alias guarantee: "Existing Task(...) references in settings and agent definitions still work as aliases"; Agent(agent_type) syntax for tools field; "If Agent is omitted from the tools list entirely, the agent cannot spawn any subagents")](https://code.claude.com/docs/en/sub-agents) [DOCUMENTED -- canonical reference for alias guarantee scope and allowlist blocking confirmation]
+- [Configure permissions -- Claude Code Docs (Agent(AgentName) syntax in permissions.deny and --disallowedTools; current official canonical form; no Task(AgentName) examples present)](https://code.claude.com/docs/en/permissions) [DOCUMENTED -- confirms Agent is the current form in all official permission rule examples]
+- [CLI reference -- Claude Code Docs (--tools flag distinct from --allowedTools; --disallowedTools defined as "tools removed from model's context"; --tools described as restricting which built-in tools Claude can use)](https://code.claude.com/docs/en/cli-reference) [DOCUMENTED -- CLI flag semantics; --tools vs --allowedTools distinction]
+- [GitHub Issue #29677: Task to Agent tool rename in v2.1.63 breaks hook payloads (undocumented breaking change)](https://github.com/anthropics/claude-code/issues/29677) [DOCUMENTED -- definitive evidence that: (1) hook tool_name payload changed from Task to Agent; (2) settings.json tools filter alias IS backwards-compatible; (3) the alias was not uniformly applied across all surfaces -- the output/payload layer broke while the input/filter layer did not]
+- [ClaudeCodeLog on X: Claude Code 2.1.63 system prompt -- Task tool replaced by Agent tool](https://x.com/ClaudeCodeLog/status/2027594456237527237/photo/1) [DOCUMENTED -- third-party changelog tracking confirming v2.1.63 as the version of the rename; absent from official release notes]
+- [What is --allowedTools in Claude Code -- ClaudeLog (still references Task(AgentName) syntax for --disallowedTools)](https://claudelog.com/faqs/what-is-allowed-tools-in-claude-code/) [DOCUMENTED -- third-party source using old Task syntax without a correction notice; weak supporting evidence the alias still resolves in CLI flag parsing]
+- [GitHub Issue #23506: Custom agents cannot spawn subagents into teams -- Task tool unavailable (closed as duplicate of #13533)](https://github.com/anthropics/claude-code/issues/23506) [DOCUMENTED -- Task/Agent tool injection bug in --agent flag sessions; predates rename; provides context on tool availability mechanism]
