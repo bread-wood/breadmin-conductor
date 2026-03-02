@@ -6,31 +6,51 @@ The rules below are repo-specific additions and overrides.
 ## Repo Context
 
 `breadmin-composer` is a Python CLI package. Source lives in `src/composer/`.
-Tests live in `tests/`. The package provides four entry points:
-- `impl-worker` — headless implementation issue processing loop
+Tests live in `tests/`. The package provides five entry points:
 - `research-worker` — headless research processing loop
-- `design-worker` — translates research docs into scoped impl issues
+- `design-worker` — reads research docs, produces HLD and LLD design documents
+- `plan-issues` — reads design docs (HLD/LLD), breaks them into scoped impl issues
+- `impl-worker` — headless implementation issue processing loop
 - `composer` — admin commands (health, cost)
 
 ## Worker Pipeline
 
-Each product version follows this four-stage pipeline:
+Each product version follows this six-stage pipeline:
 
 ```
-plan-milestones   ← human + orchestrator: define version scope, create milestones,
-     |              file seed research issues
+spec              ← human: write a product spec (docs/specs/<version>.md) defining
+     |              scope, success criteria, and key constraints for this version
+     ↓
+plan-milestones   ← human + orchestrator: read the spec, create milestone pair
+     |              (Research + Implementation), file seed research issues
      ↓
 research-worker   ← dispatches research agents, fires completion gate when done,
      |              migrates non-blocking issues to the next research milestone
      ↓
-design-worker     ← reads merged research docs, produces fully-specified impl issues
+design-worker     ← reads merged research docs, produces HLD (docs/design/HLD.md)
+     |              and per-module LLD docs (docs/design/lld/<module>.md)
+     ↓
+plan-issues       ← reads HLD + LLD docs, produces fully-specified impl issues
      |              with acceptance criteria, file scope, test requirements, dep graph
      ↓
 impl-worker       ← claims impl issues, dispatches sub-agents, monitors CI, merges PRs
 ```
 
-**No stage is skipped.** impl-worker must not run before design-worker has filed issues.
-design-worker must not run before research-worker declares the milestone complete.
+**No stage is skipped.**
+- `research-worker` must complete before `design-worker` begins
+- `design-worker` must produce and merge all design docs before `plan-issues` begins
+- `plan-issues` must file all impl issues before `impl-worker` begins
+
+### Stage responsibilities
+
+| Stage | Produces | Does NOT produce |
+|-------|----------|-----------------|
+| `spec` | `docs/specs/<version>.md` | milestones, issues |
+| `plan-milestones` | GitHub milestone pair, seed research issues | design docs, impl issues |
+| `research-worker` | `docs/research/<N>-<slug>.md` per issue | design docs, impl issues |
+| `design-worker` | `docs/design/HLD.md`, `docs/design/lld/<module>.md` | impl issues, code |
+| `plan-issues` | GitHub impl issues with acceptance criteria and dep graph | design docs, code |
+| `impl-worker` | merged PRs, working code | anything in prior stages |
 
 ## Milestone Model
 
@@ -120,7 +140,8 @@ Examples:
 |----------------|-----------------|
 | `plan-milestones` | `Run research-worker for <milestone>` |
 | `research-worker` | `Run design-worker for <milestone>` |
-| `design-worker` | `Run impl-worker for <milestone>` |
+| `design-worker` | `Run plan-issues for <milestone>` |
+| `plan-issues` | `Run impl-worker for <milestone>` |
 | `impl-worker` | `Run plan-milestones for <next version>` |
 
 ```bash
@@ -238,6 +259,7 @@ gh milestone list --repo <owner>/<repo>
 | Label | Purpose |
 |-------|---------|
 | `research` | Research/investigation tasks |
+| `build` | Design and build planning tasks (HLD, LLD, impl issue decomposition) |
 | `infra` | Repo scaffolding, CI, pyproject |
 | `feat:config` | Config dataclass + env resolution |
 | `feat:runner` | Headless claude -p runner |
