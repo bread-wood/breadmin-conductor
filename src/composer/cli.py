@@ -2417,6 +2417,203 @@ def _run_impl_worker(
 
 
 # ---------------------------------------------------------------------------
+# Design-worker helpers
+# ---------------------------------------------------------------------------
+
+
+def _run_design_worker(
+    repo: str,
+    research_milestone: str,
+    config: Config,
+    checkpoint: Checkpoint,
+    dry_run: bool = False,
+) -> None:
+    """Dispatch a single design-worker agent to produce HLD and LLD docs.
+
+    Builds a prompt by injecting the ``design-worker`` skill file and
+    invoking ``runner.run()`` once. The agent is responsible for reading
+    research docs, producing design documents, filing the next pipeline
+    issue, and posting a Notion report.
+
+    Args:
+        repo:               GitHub repository in ``owner/repo`` format.
+        research_milestone: Name of the completed research milestone.
+        config:             Validated Config instance.
+        checkpoint:         Active Checkpoint instance.
+        dry_run:            If True, print the prompt length without executing.
+    """
+    checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
+    today = date.today().isoformat()
+
+    base_prompt = (
+        f"## Session Parameters\n"
+        f"- Repository: {repo}\n"
+        f"- Research Milestone: {research_milestone}\n"
+        f"- Session Date: {today}\n\n"
+        f"You are the design-worker for the `{repo}` repository.\n"
+        f"Translate the completed research docs for milestone `{research_milestone}` "
+        f"into HLD and LLD design documents following the skill instructions below."
+    )
+    prompt = inject_skill("design-worker", base_prompt)
+
+    if dry_run:
+        click.echo(
+            f"[dry-run] Would dispatch design-worker agent for milestone "
+            f"{research_milestone!r} in repo {repo!r}"
+        )
+        click.echo(f"[dry-run] Prompt length: {len(prompt)} chars")
+        return
+
+    logger.log_conductor_event(
+        run_id=checkpoint.run_id,
+        phase="dispatch",
+        event_type="design_worker_start",
+        payload={"repo": repo, "research_milestone": research_milestone},
+        log_dir=config.log_dir.expanduser(),
+    )
+
+    env = build_subprocess_env(config)
+    result = runner.run(
+        prompt=prompt,
+        allowed_tools=[
+            "Bash",
+            "Read",
+            "Edit",
+            "Write",
+            "Glob",
+            "Grep",
+            "mcp__notion__API-post-page",
+        ],
+        env=env,
+        max_turns=200,
+    )
+
+    logger.log_conductor_event(
+        run_id=checkpoint.run_id,
+        phase="dispatch",
+        event_type="design_worker_complete",
+        payload={
+            "repo": repo,
+            "research_milestone": research_milestone,
+            "subtype": result.subtype,
+            "is_error": result.is_error,
+            "error_code": result.error_code,
+        },
+        log_dir=config.log_dir.expanduser(),
+    )
+    session.save(checkpoint, checkpoint_path)
+
+    if result.is_error:
+        click.echo(
+            f"Design-worker completed with error: {result.subtype} / {result.error_code}",
+            err=True,
+        )
+    else:
+        click.echo(f"Design-worker complete for research milestone '{research_milestone}'.")
+
+
+# ---------------------------------------------------------------------------
+# Plan-issues helpers
+# ---------------------------------------------------------------------------
+
+
+def _run_plan_issues(
+    repo: str,
+    impl_milestone: str,
+    config: Config,
+    checkpoint: Checkpoint,
+    dry_run: bool = False,
+) -> None:
+    """Dispatch a single plan-issues agent to file stage/impl GitHub issues.
+
+    Builds a prompt by injecting the ``plan-issues`` skill file and
+    invoking ``runner.run()`` once. The agent is responsible for reading
+    HLD and LLD design docs, filing impl issues with acceptance criteria
+    and a dependency graph, and posting a Notion report.
+
+    Args:
+        repo:           GitHub repository in ``owner/repo`` format.
+        impl_milestone: Name of the implementation milestone to file issues against.
+        config:         Validated Config instance.
+        checkpoint:     Active Checkpoint instance.
+        dry_run:        If True, print the prompt length without executing.
+    """
+    checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
+    today = date.today().isoformat()
+
+    base_prompt = (
+        f"## Session Parameters\n"
+        f"- Repository: {repo}\n"
+        f"- Implementation Milestone: {impl_milestone}\n"
+        f"- Session Date: {today}\n"
+        f"- Dry Run: {dry_run}\n\n"
+        f"You are the plan-issues orchestrator for the `{repo}` repository.\n"
+        f"Read the HLD and LLD design docs and file fully-specified `stage/impl` issues "
+        f"against milestone `{impl_milestone}` following the skill instructions below.\n"
+        + (
+            "\nThe `--dry-run` flag is set: print all planned issues but do NOT call "
+            "`gh issue create`.\n"
+            if dry_run
+            else ""
+        )
+    )
+    prompt = inject_skill("plan-issues", base_prompt)
+
+    if dry_run:
+        click.echo(
+            f"[dry-run] Would dispatch plan-issues agent for milestone "
+            f"{impl_milestone!r} in repo {repo!r}"
+        )
+        click.echo(f"[dry-run] Prompt length: {len(prompt)} chars")
+        return
+
+    logger.log_conductor_event(
+        run_id=checkpoint.run_id,
+        phase="dispatch",
+        event_type="plan_issues_start",
+        payload={"repo": repo, "impl_milestone": impl_milestone},
+        log_dir=config.log_dir.expanduser(),
+    )
+
+    env = build_subprocess_env(config)
+    result = runner.run(
+        prompt=prompt,
+        allowed_tools=[
+            "Bash",
+            "Read",
+            "Glob",
+            "Grep",
+            "mcp__notion__API-post-page",
+        ],
+        env=env,
+        max_turns=200,
+    )
+
+    logger.log_conductor_event(
+        run_id=checkpoint.run_id,
+        phase="dispatch",
+        event_type="plan_issues_complete",
+        payload={
+            "repo": repo,
+            "impl_milestone": impl_milestone,
+            "subtype": result.subtype,
+            "is_error": result.is_error,
+            "error_code": result.error_code,
+        },
+        log_dir=config.log_dir.expanduser(),
+    )
+    session.save(checkpoint, checkpoint_path)
+
+    if result.is_error:
+        click.echo(
+            f"Plan-issues completed with error: {result.subtype} / {result.error_code}",
+            err=True,
+        )
+    else:
+        click.echo(f"Plan-issues complete for implementation milestone '{impl_milestone}'.")
+
+
+# ---------------------------------------------------------------------------
 # Entry points
 # ---------------------------------------------------------------------------
 
@@ -2526,7 +2723,7 @@ def design_worker(
     model: str | None,
     dry_run: bool,
 ) -> None:
-    """Translate research docs into scoped implementation issues."""
+    """Translate research docs into HLD and LLD design documents via claude -p."""
     overrides: dict = {"github_repo": repo}
     if model:
         overrides["model"] = model
@@ -2540,19 +2737,30 @@ def design_worker(
         milestone=research_milestone,
         stage="design",
     )
-    click.echo("Not yet implemented")
+
+    _run_design_worker(
+        repo=repo,
+        research_milestone=research_milestone,
+        config=_config,
+        checkpoint=_checkpoint,
+        dry_run=dry_run,
+    )
 
 
 @click.command("plan-issues")
 @click.option("--repo", required=True, help="Target repo in OWNER/REPO format")
+@click.option(
+    "--impl-milestone", required=True, help="Implementation milestone to file issues against"
+)
 @click.option("--model", default=None, help="Override Claude model")
 @click.option("--dry-run", is_flag=True, help="Print planned milestones without creating them")
 def plan_issues(
     repo: str,
+    impl_milestone: str,
     model: str | None,
     dry_run: bool,
 ) -> None:
-    """Plan milestones and seed research issues for the next version."""
+    """File stage/impl issues from HLD and LLD design docs via claude -p."""
     overrides: dict = {"github_repo": repo}
     if model:
         overrides["model"] = model
@@ -2563,10 +2771,17 @@ def plan_issues(
     _config, _checkpoint = startup_sequence(
         config=config,
         checkpoint_path=checkpoint_path,
-        milestone="",
+        milestone=impl_milestone,
         stage="plan-issues",
     )
-    click.echo("Not yet implemented")
+
+    _run_plan_issues(
+        repo=repo,
+        impl_milestone=impl_milestone,
+        config=_config,
+        checkpoint=_checkpoint,
+        dry_run=dry_run,
+    )
 
 
 @click.group()
