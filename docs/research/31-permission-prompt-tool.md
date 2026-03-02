@@ -31,7 +31,8 @@
 19. [Subagent Permission Inheritance (Issue #62)](#19-subagent-permission-inheritance-issue-62)
 20. [Task Subagent Isolation Empirical Evidence (Issue #80)](#20-task-subagent-isolation-empirical-evidence-issue-80)
 21. [Built-in Subagent (Explore/Plan) Policy Server Isolation (Issue #91)](#21-built-in-subagent-exploreplan-policy-server-isolation-issue-91)
-22. [Sources](#sources)
+22. [Task→Agent Rename and CLI Flag Compatibility (Issue #93)](#22-taskagent-rename-and-cli-flag-compatibility-issue-93)
+23. [Sources](#sources)
 
 ---
 
@@ -1671,6 +1672,78 @@ No changes to the conductor's architectural decisions are warranted by this rese
 - [GitHub Issue #29333: Task tool should respect `ask` permission rules (OPEN, Feb 2026)](https://github.com/anthropics/claude-code/issues/29333) [DOCUMENTED — Task tool has "Permission Required: No" internal config; ask rules silently ignored; policy server gap further confirmed]
 - [GitHub Issue #18950: Skills/subagents do not inherit user-level permissions from settings.json (OPEN, has repro)](https://github.com/anthropics/claude-code/issues/18950) [DOCUMENTED — allow-rule non-inheritance confirmed; corroborates breadth of permission isolation]
 - [GitHub Issue #5465: Task subagents fail to inherit permissions in MCP server mode (closed not planned)](https://github.com/anthropics/claude-code/issues/5465) [DOCUMENTED — MCP server mode permission non-inheritance; aligns with CLI headless policy server isolation finding]
+
+---
+
+## 22. Task→Agent Rename and CLI Flag Compatibility (Issue #93)
+
+### 22.1 Research Question
+
+CLI v2.1.63 renamed the `Task` tool to `Agent`. This section documents the compatibility
+implications for `--allowedTools`, `--disallowedTools`, and `settings.json` allow/deny rules,
+and for hook payloads that inspect `tool_name`.
+
+### 22.2 Core Finding: Two-Tier Compatibility Split
+
+The rename creates a **backwards-compatible static filter layer** but a **breaking change in
+hook payloads**.
+
+| Layer | Compatibility | Notes |
+|-------|--------------|-------|
+| `--allowedTools "Task"` / `settings.json` allow | **Backwards-compatible** | CLI normalizes both `Task` and `Agent` at evaluation time |
+| `--disallowedTools "Task"` / `settings.json` deny | **Backwards-compatible** | Same normalization applies to deny rules |
+| `--allowedTools "Task(Explore)"` subtype filter | **Backwards-compatible** | Subtype qualifier syntax normalized consistently |
+| Hook `tool_name` payload | **Breaking** | v2.1.63+ emits `"Agent"` not `"Task"`; hooks must handle both |
+
+### 22.3 Static Filter Layer (--allowedTools / settings.json)
+
+The CLI's tool filter evaluation normalizes both `Task` and `Agent` at rule-match time.
+Existing `--allowedTools "Task"` or `settings.json` allow entries remain effective in v2.1.63+
+without modification. The same backwards-compatibility applies to `--disallowedTools` and
+`settings.json` deny rules.
+
+**Confidence**: [DOCUMENTED] — Anthropic explicitly documented the rename as backwards-compatible
+for the static filter layer in the v2.1.63 release notes and official CLI docs.
+
+### 22.4 Hook Payload Breaking Change
+
+`PreToolUse` and `PostToolUse` hooks that inspect `tool_name` to detect subagent spawning
+**must be updated** to handle both `"Task"` (pre-v2.1.63) and `"Agent"` (v2.1.63+).
+
+Example hook guard pattern (Python):
+
+```python
+def is_subagent_spawn(tool_name: str) -> bool:
+    return tool_name in ("Task", "Agent")
+```
+
+**Confidence**: [DOCUMENTED] — The CLI release notes for v2.1.63 explicitly flagged `tool_name`
+in hook payloads as a breaking change.
+
+### 22.5 Conductor Implications
+
+Conductor's current architecture excludes `Task`/`Agent` entirely from worker `--allowedTools`
+lists. This approach is **unaffected by the rename** — excluding either name blocks subagent
+spawning via both the old and new tool name. No conductor configuration changes are needed
+for the static filter layer.
+
+If conductor adds `PreToolUse`/`PostToolUse` hooks for subagent detection, those hooks must
+be updated to match both `"Task"` and `"Agent"` for cross-version compatibility.
+
+### 22.6 Follow-Up Research Recommendations
+
+- `[V2_RESEARCH]` Empirical verification that `--allowedTools "Task"` and `--allowedTools "Agent"`
+  are indeed interchangeable on v2.1.63+ (the backwards-compat claim is documented but not yet
+  empirically confirmed in conductor's specific headless `-p` execution context).
+- `[V2_RESEARCH]` Hook payload format verification — does `tool_name` for Agent subtype calls
+  (e.g., `Agent(Explore)`) emit `"Agent"` with a separate `subtype` field, or a compound
+  string like `"Agent(Explore)"`?
+
+### 22.7 Sources (Issue #93 Addendum)
+
+- [Claude Code v2.1.63 release notes — Task tool renamed to Agent (official)](https://github.com/anthropics/claude-code/releases/tag/v2.1.63) [DOCUMENTED — primary source for rename; explicit backwards-compat statement for static filter layer; explicit breaking-change statement for hook payloads]
+- [Sub-agents documentation — allowedTools and Task/Agent tool (official)](https://code.claude.com/docs/en/sub-agents) [DOCUMENTED — confirms Task/Agent tool as unified invocation path for all subagents; allowedTools gating]
+- [GitHub Issue #93 — Task→Agent rename: allowedTools and settings.json compatibility research](https://github.com/bread-wood/breadmin-composer/issues/93) [context issue]
 
 ---
 
