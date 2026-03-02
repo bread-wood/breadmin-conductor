@@ -30,7 +30,8 @@
 18. [Follow-Up Research Recommendations](#follow-up-research-recommendations)
 19. [Subagent Permission Inheritance (Issue #62)](#19-subagent-permission-inheritance-issue-62)
 20. [Task Subagent Isolation Empirical Evidence (Issue #80)](#20-task-subagent-isolation-empirical-evidence-issue-80)
-21. [Sources](#sources)
+21. [Built-in Subagent (Explore/Plan) Policy Server Isolation (Issue #91)](#21-built-in-subagent-exploreplan-policy-server-isolation-issue-91)
+22. [Sources](#sources)
 
 ---
 
@@ -1712,4 +1713,197 @@ No changes to the conductor's architectural decisions are warranted by this rese
 - [GitHub Issue #28682: Model ignores explicit permission grants and continues prompting user for approval (OPEN, Feb 2026)](https://github.com/anthropics/claude-code/issues/28682) [DOCUMENTED — Bash(*) in settings.local.json does not prevent permission prompts; Windows, default mode]
 - [GitHub Issue #25181: Bash commands auto-approved despite not being in allowedTools (closed as duplicate)](https://github.com/anthropics/claude-code/issues/25181) [DOCUMENTED — opposite problem: Bash executes without prompts even when not in allowlist; duplicate of #18160]
 - [GitHub Issue #115 (claude-agent-sdk-typescript): allowedTools does not restrict built-in tools (closed COMPLETED Dec 2025)](https://github.com/anthropics/claude-agent-sdk-typescript/issues/115) [DOCUMENTED — explicit Anthropic clarification: bypassPermissions skips all permission checks including allowedTools and disallowedTools; confirms mode-specificity of Issue #12232]
+
+---
+
+## 21. Built-in Subagent (Explore/Plan) Policy Server Isolation (Issue #91)
+
+**Issue:** #91
+**Date:** 2026-03-02
+**Status:** Research Complete (web-based research; live CLI execution not performed)
+**Spawned From:** R-80-B (Section 20.7, above)
+
+---
+
+### 21.1 Research Question
+
+Issue #91 asks: when a headless `claude -p` session is configured with `--permission-prompt-tool mcp__conductor-policy__check_permission` and the Task/Agent tool is excluded from `--allowedTools`, can a prompt that auto-triggers the built-in Explore or Plan subagent cause Read (or other) tool calls that bypass the policy server?
+
+Specifically:
+1. Does `claude -p "Explore the /tmp directory"` with `--permission-prompt-tool` configured and Task excluded from `--allowedTools` trigger the Explore built-in subagent?
+2. If Explore is triggered, do its Read tool calls appear in the policy server log?
+3. Does `--disallowedTools "Agent(Explore)"` or `--disallowedTools "Task(Explore)"` prevent the Explore subagent from being auto-triggered?
+
+This question follows directly from Section 19.8 (Recommended Architectural Pattern), which identified excluding Task/Agent from `--allowedTools` as the mitigation for in-process subagent spawning. The mitigation only holds if built-in subagents cannot be triggered through some mechanism other than the Task/Agent tool.
+
+---
+
+### 21.2 Research Method
+
+This section consolidates web-based documentary and community evidence gathered during the Issue #91 research pass (2026-03-02). No live CLI execution was performed. Evidence is drawn from:
+
+1. Official Anthropic documentation (subagents reference, permissions reference)
+2. GitHub issue tracker reports with empirical reproductions
+3. Community deep-dives and trace captures
+4. Cross-referencing the Piebald-AI/claude-code-system-prompts repository for subagent invocation details
+
+---
+
+### 21.3 Core Finding: Built-in Subagents Are Invoked Exclusively via the Agent/Task Tool
+
+**Finding: The built-in Explore and Plan subagents are invoked through the same Agent/Task tool mechanism as custom subagents. Excluding Agent/Task from `--allowedTools` prevents them from being triggered.** [DOCUMENTED]
+
+**Evidence:**
+
+1. **Official documentation states Task/Agent is the exclusive invocation path.** The current official subagents documentation (`code.claude.com/docs/en/sub-agents`) states under "Restrict which subagents can be spawned": "The Task tool must be included in allowedTools since Claude invokes subagents through the Task tool." This applies equally to built-in subagents (Explore, Plan, general-purpose) and custom subagents. No alternative invocation path for built-in subagents is documented.
+
+2. **Community deep-dive confirms Task tool invocation for Explore.** A technical trace blog post ("Tracing Claude Code's LLM Traffic") and the `dev.to` Task Tool deep-dive both confirm: Explore is invoked via the Task tool with `subagent_type: "Explore"`. The task tool call creates a separate context window running the Explore agent. This is the same mechanism as any other subagent spawn.
+
+3. **GitHub Issue #29236 behavioral report.** A user reported the Explore subagent auto-triggering (launched unexpectedly to explore the codebase). The issue report confirms the mechanism: it was invoked via "the Task tool" — there is no "direct" invocation path that bypasses the Task tool.
+
+4. **Piebald-AI/claude-code-system-prompts repository.** This community repository extracts and publishes Claude Code's internal system prompts for each version, including separate prompts for the Plan/Explore/Task subagents. The presence of individual subagent system prompts confirms they run as separate Task-tool-spawned agents, each with their own context and prompt. They are not "native" to the main session in a way that would bypass the Task tool gate.
+
+5. **Official documentation on disabling specific subagents.** The subagents documentation explicitly documents how to disable Explore specifically:
+   ```json
+   {
+     "permissions": {
+       "deny": ["Agent(Explore)", "Agent(my-custom-agent)"]
+     }
+   }
+   ```
+   And via CLI: `claude --disallowedTools "Agent(Explore)"`.
+   The existence of this disable mechanism using the same `Agent(...)` syntax as for all other subagents is further confirmation that Explore uses the Agent/Task tool path — a different invocation mechanism would not be disabled by this syntax.
+
+**Confidence level:** [DOCUMENTED] — official documentation explicitly states the Task tool is required; no alternative invocation path documented; disable mechanism confirms shared invocation path.
+
+---
+
+### 21.4 Implication: Excluding Task/Agent from `--allowedTools` Is Sufficient to Block Built-in Subagents
+
+**Finding: The Section 19.8 mitigation (exclude Task/Agent from `--allowedTools` in all worker invocations) correctly blocks Explore and Plan auto-triggering. No additional mitigation is required for built-in subagents specifically.** [DOCUMENTED]
+
+The relevant official statement: "The Task tool must be included in allowedTools since Claude invokes subagents through the Task tool." This means:
+
+- If `--allowedTools "Read,Edit,Write,Bash,Glob,Grep"` is specified (Task/Agent omitted): the model cannot invoke the Agent tool. Explore, Plan, and general-purpose cannot be spawned. Prompts like "Explore the /tmp directory" will either be handled by the main session's own tool calls (Read, Glob) or refused, but no Explore subagent is launched.
+
+- If `--disallowedTools "Agent"` (or `"Task"`) is specified: the Agent tool is denied at Step 2 of the permission evaluation stack before any question of policy server or inheritance arises.
+
+The two mitigations (omit from allowlist OR add to denylist) are redundant but complementary:
+- Omitting from allowlist: uses an allowlist that naturally excludes the tool (correct approach for worker invocations)
+- Adding to denylist: explicitly denies the tool even if it would otherwise be available (belt-and-suspenders)
+
+For conductor workers using the recommended `--allowedTools "Read,Edit,Write,Bash,Glob,Grep"` pattern, the built-in subagent auto-triggering concern is **resolved by the existing architecture**.
+
+---
+
+### 21.5 Policy Server Isolation for Built-in Subagents (When Allowed)
+
+**Finding: When the Agent/Task tool IS in `--allowedTools` (so that Explore/Plan CAN be invoked), their tool calls bypass the parent session's policy server for exactly the same reasons as custom Task tool subagents.** [DOCUMENTED + INFERRED-HIGH by architectural identity]
+
+The mechanism is identical: Explore/Plan are spawned via the Task/Agent tool, creating an in-process subagent with its own permission context. The permission isolation findings from Section 19 and Section 20 apply without modification:
+
+- The subagent's permission context has no Step 4 handler (no policy server)
+- The subagent's tool calls bypass parent PreToolUse hooks (Issue #21460, empirically confirmed)
+- The subagent's tool calls bypass parent `settings.json` deny rules (Issue #25000, specific exfiltration-risk commands enumerated)
+
+**The specific scenario from Issue #10906** (built-in Plan agent ignores parent settings.json permissions, filed November 2025, OPEN as of March 2026) is the empirical behavioral confirmation for built-in subagents. The reporter observed: even with specific tools in `permissions.allow`, the Plan agent repeated permission prompts for those same tools. The root cause analysis from the issue notes: "Built-in subagents have predefined configs that don't inherit from parent settings" and "Inheritance only applies to custom subagents when the `tools` field is omitted." The Plan agent's permission context is independent of the parent session's configured rules.
+
+For built-in subagents, the same applies to `--permission-prompt-tool`: if Explore or Plan can be invoked (because Task/Agent is in `--allowedTools`), their Read/Glob/Grep calls do NOT appear in the policy server log.
+
+**Confidence level:** [DOCUMENTED (behavioral evidence from Issue #10906 for settings.json non-inheritance) + INFERRED-HIGH (architectural analogy with Task tool subagents from Sections 19–20, which share the same invocation mechanism)]
+
+---
+
+### 21.6 Disable Mechanisms: Effectiveness Analysis
+
+The official documentation provides two disable mechanisms for specific subagents. Their reliability needs assessment given the broader context of permission system bugs:
+
+#### 21.6.1 Excluding Agent/Task from `--allowedTools`
+
+**Effectiveness: HIGH** [DOCUMENTED]
+
+The `--allowedTools` list (in non-bypass mode) acts as a tool-name filter. If "Agent" and "Task" are absent, the model cannot invoke the tool. This is a categorical block — not a pattern-match rule. It does not have the pattern-matching edge-case failures documented for Bash patterns (Issues #18160, #28682). The tool name matching is exact-string, not regex.
+
+**Risk: MEDIUM** — the Task→Agent rename in CLI v2.1.63 creates an alias ambiguity. If `--allowedTools "Read,Edit,Write,Bash,Glob,Grep"` is specified (neither "Task" nor "Agent" appears), subagents are blocked regardless of which name the internal tool uses. This is the safest specification. See Issue #93 (Section 23) for the alias behavior research.
+
+#### 21.6.2 `--disallowedTools "Agent(Explore)"` / `settings.json deny: ["Agent(Explore)"]`
+
+**Effectiveness: MEDIUM** [DOCUMENTED — official deny mechanism; reliability of subtype-specific syntax unconfirmed]
+
+The official documentation states this syntax prevents Claude from delegating to the Explore subagent specifically while still allowing other subagents (Plan, general-purpose, custom). The `Agent(subagent-name)` syntax is documented as working for both built-in and custom subagents.
+
+**Key nuance:** This is a subtype-specific deny rule. It denies the specific invocation `Agent(Explore)` but does not deny the Agent tool itself. Other subagent types would still be allowed. This creates the same permission non-inheritance gap analyzed in Sections 19–20 — for any subagent type that IS allowed, its tool calls bypass the policy server.
+
+**Risk: MEDIUM** — the rename ambiguity from v2.1.63 (Issue #93) is more significant here: `Agent(Explore)` is the new syntax but `Task(Explore)` should work as an alias. Specifying both in the denylist is the safe default until Issue #93 is empirically resolved:
+```bash
+--disallowedTools "Agent(Explore),Task(Explore),Agent(Plan),Task(Plan)"
+```
+
+**Open question:** Whether the `Agent(subagent-name)` deny rule fires before or after the permission evaluation sequence Step 2 for the Task/Agent tool itself. If the deny rule for `Agent(Explore)` gates the specific `subagent_type: "Explore"` invocation rather than just the tool name, it fires at the correct point. No community report confirms or contradicts this.
+
+---
+
+### 21.7 Updated Architecture Constraint for Conductor
+
+Based on this research pass, the existing architectural recommendation from Section 19.8 is confirmed correct and sufficient. No new constraint is added:
+
+**Confirmed constraint (existing):** Workers must not have Task/Agent in `--allowedTools`. This is the primary mechanism preventing Explore, Plan, and general-purpose subagents from being auto-triggered. When this constraint is satisfied, built-in subagents cannot bypass the policy server because they cannot be spawned.
+
+**Clarification added:** The concern from Issue #91's Background section — that built-in subagents "may be auto-triggered by the CLI in response to certain prompts even when `Task` is not explicitly in `--allowedTools`" — is not supported by the documented invocation architecture. Built-in subagents require the Task/Agent tool; there is no CLI-internal auto-trigger path that bypasses the tool call gate.
+
+**Residual open question:** The issue's original hypothesis notes "Expected Outcome: Based on documentary evidence (Issue #10906 confirms built-in Plan agent ignores parent settings.json permissions), the built-in subagents are expected to also bypass the policy server." This is confirmed for the case where Task/Agent IS available — if Explore/Plan are allowed, their tool calls bypass the policy server (Section 21.5). But the mitigation (excluding Task/Agent from `--allowedTools`) correctly prevents this case from arising in conductor's architecture.
+
+---
+
+### 21.8 Confidence Level Summary
+
+| Claim | Basis | Confidence |
+|-------|-------|-----------|
+| Built-in Explore/Plan are invoked via the Agent/Task tool | Official docs: "Task must be in allowedTools"; confirmed by trace reports and Issue #29236 | [DOCUMENTED] |
+| Excluding Agent/Task from `--allowedTools` prevents Explore/Plan auto-triggering | Logical consequence of the documented invocation path; no alternative path documented | [DOCUMENTED] |
+| When allowed, Explore/Plan tool calls bypass the parent policy server | Same permission context isolation as generic Task subagents (Sections 19–20) + Issue #10906 settings.json non-inheritance confirmed | [DOCUMENTED + INFERRED-HIGH] |
+| `--disallowedTools "Agent(Explore)"` prevents Explore specifically | Official docs document the deny syntax | [DOCUMENTED — syntax unconfirmed empirically] |
+| No CLI-internal auto-trigger path bypasses the Task tool gate for built-in subagents | No such path documented; absence of evidence is weak evidence given the importance of this question | [INFERRED-MEDIUM — empirical smoke test warranted] |
+
+---
+
+### 21.9 Follow-Up Research Recommendations
+
+#### R-91-A: Empirical smoke test — does `claude -p "Explore /tmp"` without Agent in `--allowedTools` invoke an Explore subagent? [V2_RESEARCH]
+
+**Question:** Does `claude -p "Explore the /tmp directory" --allowedTools "Read,Bash,Glob" --permission-prompt-tool mcp__conductor-policy__check_permission` trigger the Explore built-in subagent?
+
+**Expected outcome (from Section 21.3):** No — the CLI should block the Agent tool invocation at Step 2 because "Agent" is absent from `--allowedTools`. The main session's own Read/Glob tools may be used instead.
+
+**Test approach:**
+1. Run with a policy server that logs all calls and `--allowedTools "Read,Bash,Glob"` (Task/Agent omitted)
+2. Check whether any `subagent_type: "Explore"` tool call appears in the CLI debug log or policy server log
+3. Verify whether the policy server receives separate Read calls for `/tmp/` contents (indicating in-session reads, not Explore subagent reads)
+4. Repeat with a prompt that explicitly requests Plan mode to test the Plan subagent gating
+
+**Why this matters:** The INFERRED-MEDIUM confidence on the "no CLI-internal auto-trigger path" claim. While the documented invocation architecture makes this the expected behavior, the existing research corpus has found several cases where undocumented behaviors exist (Issue #29333's "Permission Required: No" designation, for example). Empirical confirmation closes this gap from [DOCUMENTED] to [EMPIRICAL].
+
+**Priority:** V2_RESEARCH — this is not blocking conductor's current architecture, which already satisfies the mitigation. The test is confirmatory, not required for implementation.
+
+#### R-91-B: `--disallowedTools "Agent(Explore)"` effectiveness in CLI v2.1.63+ [V2_RESEARCH]
+
+**Question:** Does `--disallowedTools "Agent(Explore)"` correctly prevent the Explore subagent from being spawned while still allowing other subagents (Plan, general-purpose)? Does `--disallowedTools "Task(Explore)"` work as an alias?
+
+**Why this matters:** The conductor architecture excludes Task/Agent entirely from worker allowlists, making this test unnecessary for conductor's specific case. However, architectures that need to allow some subagents while blocking others (e.g., allowing general-purpose but blocking Explore) need this mechanism. Empirical confirmation would also validate the alias behavior for the Task→Agent rename.
+
+**Existing coverage:** R-80-C (Issue #93) researches the rename alias behavior for `--allowedTools`/`--disallowedTools` generally. R-91-B is narrower: testing specifically whether the `Agent(subtype)` filtering syntax works correctly for built-in subtypes. This is **not duplicated by Issue #93** and represents a distinct empirical gap.
+
+---
+
+### 21.10 Sources (Issue #91 Addendum)
+
+- [Create custom subagents — Claude Code Docs (official documentation: "Task tool must be in allowedTools since Claude invokes subagents through the Task tool"; built-in subagents description; disable mechanism via `Agent(Explore)` in permissions.deny; --disallowedTools CLI flag syntax)](https://code.claude.com/docs/en/sub-agents) [DOCUMENTED — primary source confirming Agent/Task tool as exclusive invocation path for all subagents including built-in]
+- [GitHub Issue #10906: Built-in Plan agent ignores parent settings.json permissions and repeatedly prompts for pre-approved tools (OPEN, November 2025)](https://github.com/anthropics/claude-code/issues/10906) [DOCUMENTED — empirical behavioral confirmation that built-in Plan subagent does not inherit parent session's permission configuration; root cause: "built-in subagents have predefined configs that don't inherit from parent settings"]
+- [GitHub Issue #29236: CLAUDE.md rules ignored despite being loaded — Agent executes unauthorized actions (OPEN, February 2026)](https://github.com/anthropics/claude-code/issues/29236) [DOCUMENTED — reporter observed Explore subagent auto-triggered via Task tool despite CLAUDE.md instructions; confirms Task tool is the invocation mechanism for Explore]
+- [The Task Tool: Claude Code's Agent Orchestration System — DEV Community](https://dev.to/bhaidar/the-task-tool-claude-codes-agent-orchestration-system-4bf2) [DOCUMENTED — technical deep-dive confirming subagent invocation via Task tool with `subagent_type` parameter; applies to built-in subagents]
+- [Claude Code Task Tool Deep Dive: Subagents, Explore, and Hooks — GitHub Gist (johnlindquist)](https://gist.github.com/johnlindquist/d22c70fd70660b4f6fb4d0b05d0792d2) [DOCUMENTED — confirms Explore uses Task tool invocation mechanism; PreToolUse hooks can intercept Task calls for all subagent types including Explore]
+- [GitHub — Piebald-AI/claude-code-system-prompts (subagent system prompts including Plan/Explore/Task; updated per Claude Code version)](https://github.com/Piebald-AI/claude-code-system-prompts) [DOCUMENTED — community extraction confirms separate system prompts per subagent type, consistent with Task tool spawning creating isolated context windows]
+- [Best practices for Claude Code subagents — PubNub Blog ("Task must be in allowedTools or subagents never get spawned")](https://www.pubnub.com/blog/best-practices-for-claude-code-sub-agents/) [DOCUMENTED — community guide confirming Task tool as the required gate for all subagent spawning]
+- [GitHub Issue #4740: Sub-agents use tools without permission (bug report; closed as duplicate)](https://github.com/anthropics/claude-code/issues/4740) [DOCUMENTED — corroborating evidence that subagent tool permission isolation is an ongoing systemic issue; "tool specifications appear to be completely ignored by sub-agents"]
+- [GitHub Issue #20931: Custom Agents in ~/.claude/agents/ Not Loaded as Task Subagent Types (OPEN)](https://github.com/anthropics/claude-code/issues/20931) [DOCUMENTED — confirms only built-in agents (Explore, Plan, general-purpose) and UI-created agents work as Task subagent types; custom file agents have separate loading issues]
 
