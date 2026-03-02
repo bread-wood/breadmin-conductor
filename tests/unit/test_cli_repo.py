@@ -11,6 +11,7 @@ import click
 import pytest
 
 from composer.cli import (
+    _ensure_remote,
     _is_git_repo,
     _parse_github_owner_name,
     _resolve_repo,
@@ -251,8 +252,8 @@ class TestScaffoldNewRepo:
 
         assert result == repo_dir
 
-    def test_raises_if_directory_already_exists(self, tmp_path: Path) -> None:
-        """_scaffold_new_repo raises ClickException if the target dir already exists."""
+    def test_raises_if_directory_exists_and_is_not_git_repo(self, tmp_path: Path) -> None:
+        """_scaffold_new_repo raises ClickException when the dir exists but is not a git repo."""
         existing_dir = tmp_path / "existing"
         existing_dir.mkdir()
 
@@ -266,7 +267,7 @@ class TestScaffoldNewRepo:
         with patch("os.path.abspath", side_effect=fake_abspath):
             with pytest.raises(click.ClickException) as exc_info:
                 _scaffold_new_repo("existing")
-        assert "already exists" in str(exc_info.value.format_message())
+        assert "not a git repository" in str(exc_info.value.format_message())
 
     def test_raises_if_gh_repo_create_fails(self, tmp_path: Path) -> None:
         """_scaffold_new_repo raises ClickException if gh repo create fails."""
@@ -294,3 +295,136 @@ class TestScaffoldNewRepo:
             with pytest.raises(click.ClickException) as exc_info:
                 _scaffold_new_repo("failproject")
         assert "gh repo create failed" in str(exc_info.value.format_message())
+
+    def test_directory_exists_as_git_repo_returns_path(self, tmp_path: Path) -> None:
+        """If the dir already exists as a git repo, _scaffold_new_repo returns the path."""
+        existing_dir = tmp_path / "myrepo"
+        existing_dir.mkdir()
+        subprocess.run(["git", "init"], cwd=str(existing_dir), check=True, capture_output=True)
+
+        original_abspath = os.path.abspath
+
+        def fake_abspath(p: str) -> str:
+            if p == "myrepo":
+                return str(existing_dir)
+            return original_abspath(p)
+
+        with (
+            patch("os.path.abspath", side_effect=fake_abspath),
+            patch("composer.cli._ensure_remote") as mock_ensure,
+        ):
+            result = _scaffold_new_repo("myrepo")
+
+        assert result == str(existing_dir)
+        mock_ensure.assert_called_once_with(str(existing_dir), "myrepo")
+
+    def test_directory_exists_as_git_repo_no_remote_calls_ensure_remote(
+        self, tmp_path: Path
+    ) -> None:
+        """If the dir exists as a git repo with no remote, _ensure_remote is called."""
+        existing_dir = tmp_path / "myrepo"
+        existing_dir.mkdir()
+        subprocess.run(["git", "init"], cwd=str(existing_dir), check=True, capture_output=True)
+
+        original_abspath = os.path.abspath
+
+        def fake_abspath(p: str) -> str:
+            if p == "myrepo":
+                return str(existing_dir)
+            return original_abspath(p)
+
+        with (
+            patch("os.path.abspath", side_effect=fake_abspath),
+            patch("composer.cli._ensure_remote") as mock_ensure,
+        ):
+            _scaffold_new_repo("myrepo")
+
+        mock_ensure.assert_called_once_with(str(existing_dir), "myrepo")
+
+    def test_gh_repo_create_name_already_exists_no_exception(self, tmp_path: Path) -> None:
+        """If gh repo create returns 'Name already exists', no exception is raised."""
+        repo_dir = str(tmp_path / "alreadyrepo")
+        original_abspath = os.path.abspath
+
+        def fake_abspath(p: str) -> str:
+            if p == "alreadyrepo":
+                return repo_dir
+            return original_abspath(p)
+
+        def mock_run(cmd: list, **kwargs):  # type: ignore[no-untyped-def]
+            if cmd[0] == "gh" and "repo" in cmd and "create" in cmd:
+                return MagicMock(
+                    returncode=1,
+                    stderr="GraphQL: Name already exists on this account (createRepository)",
+                    stdout="",
+                )
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        with (
+            patch("os.path.abspath", side_effect=fake_abspath),
+            patch("subprocess.run", side_effect=mock_run),
+            patch("composer.cli._ensure_remote") as mock_ensure,
+        ):
+            result = _scaffold_new_repo("alreadyrepo")
+
+        assert result == repo_dir
+        mock_ensure.assert_called_once_with(repo_dir, "alreadyrepo")
+
+
+# ---------------------------------------------------------------------------
+# _ensure_remote
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureRemote:
+    def test_no_op_when_remote_already_configured(self, tmp_path: Path) -> None:
+        """_ensure_remote does nothing when a remote already exists."""
+        subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin", "git@github.com:owner/repo.git"],
+            cwd=str(tmp_path),
+            check=True,
+            capture_output=True,
+        )
+
+        # Only git remote -v should be called; no gh or git remote add calls.
+        original_run = subprocess.run
+        calls: list[list[str]] = []
+
+        def tracking_run(cmd: list, **kwargs):  # type: ignore[no-untyped-def]
+            calls.append(list(cmd))
+            return original_run(cmd, **kwargs)
+
+        with patch("subprocess.run", side_effect=tracking_run):
+            _ensure_remote(str(tmp_path), "repo")
+
+        # gh and git remote add should NOT have been called.
+        assert not any(c[0] == "gh" for c in calls)
+        assert not any("add" in c for c in calls)
+
+    def test_adds_remote_when_none_configured(self, tmp_path: Path) -> None:
+        """_ensure_remote adds the origin remote when none is configured."""
+        subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+
+        def mock_run(cmd: list, **kwargs):  # type: ignore[no-untyped-def]
+            if cmd[0] == "git" and "remote" in cmd and "-v" in cmd:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            if cmd[0] == "gh":
+                return MagicMock(
+                    returncode=0, stdout="git@github.com:owner/myrepo.git\n", stderr=""
+                )
+            if cmd[0] == "git" and "add" in cmd:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("subprocess.run", side_effect=mock_run) as mock_sp:
+            _ensure_remote(str(tmp_path), "myrepo")
+
+        # Verify that git remote add was called with the SSH URL.
+        add_calls = [
+            call
+            for call in mock_sp.call_args_list
+            if call.args[0][0] == "git" and "add" in call.args[0]
+        ]
+        assert len(add_calls) == 1
+        assert "git@github.com:owner/myrepo.git" in add_calls[0].args[0]
