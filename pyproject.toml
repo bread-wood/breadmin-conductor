@@ -15,8 +15,9 @@ dependencies = [
 ]
 
 [project.scripts]
-issue-worker = "conductor.cli:issue_worker"
+impl-worker = "conductor.cli:impl_worker"
 research-worker = "conductor.cli:research_worker"
+design-worker = "conductor.cli:design_worker"
 conductor = "conductor.cli:conductor"
 
 [tool.hatch.build.targets.wheel]

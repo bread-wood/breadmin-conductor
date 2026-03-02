@@ -6,10 +6,46 @@ The rules below are repo-specific additions and overrides.
 ## Repo Context
 
 `breadmin-conductor` is a Python CLI package. Source lives in `src/conductor/`.
-Tests live in `tests/`. The package provides three entry points:
-- `issue-worker` — headless issue processing loop
+Tests live in `tests/`. The package provides four entry points:
+- `impl-worker` — headless implementation issue processing loop
 - `research-worker` — headless research processing loop
+- `design-worker` — translates research docs into scoped impl issues
 - `conductor` — admin commands (health, cost)
+
+## Worker Pipeline
+
+Each product version follows this four-stage pipeline:
+
+```
+plan-milestones   ← human + orchestrator: define version scope, create milestones,
+     |              file seed research issues
+     ↓
+research-worker   ← dispatches research agents, fires completion gate when done,
+     |              migrates non-blocking issues to the next research milestone
+     ↓
+design-worker     ← reads merged research docs, produces fully-specified impl issues
+     |              with acceptance criteria, file scope, test requirements, dep graph
+     ↓
+impl-worker       ← claims impl issues, dispatches sub-agents, monitors CI, merges PRs
+```
+
+**No stage is skipped.** impl-worker must not run before design-worker has filed issues.
+design-worker must not run before research-worker declares the milestone complete.
+
+## Milestone Model
+
+Milestones come in ordered pairs — Research and Implementation — one pair per version.
+The system always plans **at most one version ahead** of the current active pair.
+
+**Naming convention**: `<Version> Research` and `<Version> Implementation` (or `Impl`).
+Use meaningful version identifiers (MVP, v1.1, v2 …) rather than opaque numbers.
+Workers identify milestone type by looking for the word "Research" or "Impl" in the title.
+
+**Always-one-ahead rule**: when the implementation phase of version N begins,
+run `plan-milestones` to create the research phase for version N+1.
+
+**Never plan more than two versions out.** Research findings change scope; over-planning
+is waste.
 
 ## Module Isolation
 
@@ -21,7 +57,7 @@ Agents are scoped to these modules. One agent per module at a time:
 | `runner` | `src/conductor/runner.py`, `src/conductor/session.py` |
 | `health` | `src/conductor/health.py` |
 | `logging` | `src/conductor/logger.py` |
-| `cli` | `src/conductor/cli.py`, `src/conductor/skills/` |
+| `cli` | `src/conductor/cli.py`, `src/conductor/skills/` (all skill files) |
 | `infra` | `pyproject.toml`, `.github/`, `CLAUDE.md`, `README.md` |
 | `docs` | `docs/` |
 
@@ -125,15 +161,6 @@ If **zero blocking issues remain**, declare research complete for this milestone
 1. Migrate all remaining non-blocking open research issues to the next research milestone
 2. Post the session report (Step 5)
 3. STOP — do not create more research issues just to fill the queue
-
-### Milestone labels
-
-| Milestone | Purpose |
-|-----------|---------|
-| `M1: Foundation` | Research that must complete before M2 implementation begins |
-| `M2: Implementation` | Core v1 CLI implementation issues |
-| `M3: v2 Research` | Research for future versions — non-blocking for v1 |
-| `M4: v2 Implementation` | Future implementation (not yet scheduled) |
 
 ## Follow-Up Milestone Assignment
 

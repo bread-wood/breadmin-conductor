@@ -1,14 +1,21 @@
 # breadmin-conductor
 
-Headless Claude Code orchestrator CLI. Packages the `issue-worker` and `research-worker`
-loops as standalone CLI commands that invoke `claude -p` without a human at the terminal.
+Headless Claude Code orchestrator CLI. Runs the full research → design → implementation
+pipeline as standalone CLI commands that invoke `claude -p` without a human at the terminal.
 
-## What it does
+## Worker Pipeline
 
-- `issue-worker` — claims GitHub issues, dispatches sub-agents via `claude -p`, monitors
-  CI, and squash-merges passing PRs
-- `research-worker` — processes research issues for a milestone, writes `docs/research/`
-  documents, and creates follow-up issues
+```
+plan-milestones → research-worker → design-worker → impl-worker
+```
+
+Each product version flows through all four stages. See `CLAUDE.md` for the full protocol.
+
+## Commands
+
+- `research-worker` — processes research issues for a milestone, writes `docs/research/` docs
+- `design-worker` — translates completed research into scoped implementation issues
+- `impl-worker` — claims impl issues, dispatches sub-agents, monitors CI, merges PRs
 - `conductor health` — preflight check (claude, gh, git, ANTHROPIC_API_KEY)
 - `conductor cost` — cost ledger summary from all sessions
 
@@ -16,15 +23,17 @@ loops as standalone CLI commands that invoke `claude -p` without a human at the 
 
 ```
 src/conductor/
-├── cli.py        ← click group, issue-worker + research-worker commands
-├── config.py     ← Config pydantic model, env/flag resolution
-├── runner.py     ← claude -p subprocess invocation, stream-json capture
-├── session.py    ← session ID persistence and --resume logic
-├── logger.py     ← per-session JSONL logging + cost ledger
-├── health.py     ← preflight checks
+├── cli.py          ← click commands: impl-worker, research-worker, design-worker, conductor
+├── config.py       ← Config pydantic model, env/flag resolution
+├── runner.py       ← claude -p subprocess invocation, stream-json capture
+├── session.py      ← session ID persistence and --resume logic
+├── logger.py       ← per-session JSONL logging + cost ledger
+├── health.py       ← preflight checks
 └── skills/
-    ├── issue-worker.md     ← bundled skill prompt
-    └── research-worker.md  ← bundled skill prompt
+    ├── impl-worker.md      ← bundled skill prompt
+    ├── research-worker.md  ← bundled skill prompt
+    ├── design-worker.md    ← bundled skill prompt
+    └── plan-milestones.md  ← bundled skill prompt
 ```
 
 ## Usage
@@ -33,17 +42,17 @@ src/conductor/
 # Preflight check
 conductor health
 
-# Run issue worker (processes all open non-research issues in the repo)
-issue-worker --repo OWNER/REPO
+# Plan milestones for a new version
+plan-milestones --repo OWNER/REPO  # interactive, run in a Claude Code session
 
-# Run research worker for a specific milestone
-research-worker --repo OWNER/REPO --milestone "M1: Foundation"
+# Research phase
+research-worker --repo OWNER/REPO --milestone "MVP Research"
 
-# Dry run (prints claude invocation without executing)
-issue-worker --repo OWNER/REPO --dry-run
+# Design phase (after research declares complete)
+design-worker --repo OWNER/REPO --research-milestone "MVP Research"
 
-# Resume a previous session
-issue-worker --repo OWNER/REPO --resume SESSION_ID
+# Implementation phase
+impl-worker --repo OWNER/REPO --milestone "MVP Implementation"
 
 # Show cost ledger
 conductor cost
