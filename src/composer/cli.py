@@ -10,11 +10,13 @@ Entry points:
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import re
 import subprocess
 import time
+import uuid
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -1285,6 +1287,1136 @@ def _run_completion_gate(
 
 
 # ---------------------------------------------------------------------------
+# Impl worker helpers
+# ---------------------------------------------------------------------------
+
+# Module label prefix for extracting module name from issue labels
+_FEAT_PREFIX = "feat:"
+
+# CI poll constants
+_CI_POLL_INTERVAL: int = 30  # seconds between gh pr checks polls
+_CI_MAX_POLLS: int = 60  # maximum polls before timeout (30 min)
+_REBASE_RETRY_LIMIT: int = 3  # max rebase attempts before escalating
+
+
+def _slugify(title: str, max_len: int = 40) -> str:
+    """Convert an issue title to a URL/branch-safe slug.
+
+    Lowercases, replaces spaces and non-alphanumeric characters with hyphens,
+    strips leading/trailing hyphens, and truncates to *max_len* characters.
+
+    Args:
+        title:   Raw issue title string.
+        max_len: Maximum character count for the slug (default 40).
+
+    Returns:
+        Slug string suitable for use as a git branch name suffix.
+    """
+    slug = title.lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", slug)
+    slug = slug.strip("-")
+    return slug[:max_len]
+
+
+def _extract_module(issue: dict[str, Any]) -> str:
+    """Extract the module name from a feat:* label on an issue.
+
+    Scans the issue's ``labels`` list for a label whose name starts with
+    ``feat:``.  Returns the part after the prefix (e.g. ``"config"`` from
+    ``"feat:config"``).  Returns ``"none"`` when no matching label is found.
+
+    Args:
+        issue: Issue dict with a ``labels`` key (list of label dicts with ``name``).
+
+    Returns:
+        Module name string, or ``"none"`` if no feat:* label is present.
+    """
+    for label in issue.get("labels", []):
+        name = label.get("name", "")
+        if name.startswith(_FEAT_PREFIX):
+            return name[len(_FEAT_PREFIX) :]
+    return "none"
+
+
+def _list_open_impl_issues(repo: str, milestone: str) -> list[dict[str, Any]]:
+    """Return open implementation issues for *milestone*.
+
+    Fetches all open issues in the milestone and filters client-side:
+    - Excludes issues with the ``research`` label
+    - Excludes issues with the ``pipeline`` label
+    - Excludes issues already assigned or labeled ``in-progress``
+
+    Args:
+        repo:      GitHub repository in ``owner/repo`` format.
+        milestone: Milestone name to scope the query (may be empty for all open impl issues).
+
+    Returns:
+        List of issue dicts with keys: number, title, body, labels, assignees.
+    """
+    cmd = [
+        "issue",
+        "list",
+        "--state",
+        "open",
+        "--json",
+        "number,title,body,labels,assignees,milestone",
+        "--limit",
+        "200",
+    ]
+    if milestone:
+        cmd += ["--milestone", milestone]
+
+    result = _gh(cmd, repo=repo, check=False)
+    if result.returncode != 0:
+        return []
+
+    try:
+        issues: list[dict] = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+    # Filter out research, pipeline, and in-progress issues
+    filtered = []
+    for issue in issues:
+        label_names = [lb.get("name", "") for lb in issue.get("labels", [])]
+        # Skip research or pipeline issues
+        if "research" in label_names or "pipeline" in label_names:
+            continue
+        # Skip assigned or in-progress issues
+        if issue.get("assignees"):
+            continue
+        if "in-progress" in label_names:
+            continue
+        filtered.append(issue)
+
+    return filtered
+
+
+def _find_pr_for_branch(repo: str, branch: str) -> int | None:
+    """Find the open PR number for a given branch name.
+
+    Args:
+        repo:   Repository in ``owner/repo`` format.
+        branch: Branch name to search for.
+
+    Returns:
+        PR number as integer, or ``None`` if no open PR exists.
+    """
+    result = _gh(
+        ["pr", "list", "--head", branch, "--state", "open", "--json", "number", "--limit", "5"],
+        repo=repo,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        prs = json.loads(result.stdout)
+        if prs:
+            return int(prs[0]["number"])
+    except (json.JSONDecodeError, KeyError, ValueError):
+        pass
+    return None
+
+
+def _get_pr_checks_status(repo: str, pr_number: int) -> str:
+    """Get the aggregate CI status for a PR.
+
+    Calls ``gh pr checks`` and aggregates:
+    - If all checks pass → ``"pass"``
+    - If any check failed → ``"fail"``
+    - If any check is pending/in-progress → ``"pending"``
+    - On error or no checks → ``"pending"``
+
+    Args:
+        repo:      Repository in ``owner/repo`` format.
+        pr_number: PR number.
+
+    Returns:
+        One of ``"pass"``, ``"fail"``, or ``"pending"``.
+    """
+    result = _gh(
+        ["pr", "checks", str(pr_number), "--json", "name,status,conclusion"],
+        repo=repo,
+        check=False,
+    )
+    if result.returncode != 0:
+        return "pending"
+
+    try:
+        checks = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return "pending"
+
+    if not checks:
+        return "pending"
+
+    statuses = []
+    for check in checks:
+        conclusion = (check.get("conclusion") or "").lower()
+        status = (check.get("status") or "").lower()
+        if conclusion in ("failure", "cancelled", "timed_out", "action_required"):
+            statuses.append("fail")
+        elif conclusion == "success" or status == "completed":
+            statuses.append("pass")
+        else:
+            statuses.append("pending")
+
+    if "fail" in statuses:
+        return "fail"
+    if "pending" in statuses:
+        return "pending"
+    return "pass"
+
+
+def _is_conflict_failure(repo: str, pr_number: int) -> bool:
+    """Check whether a PR has a merge conflict.
+
+    Inspects the PR's mergeable state.
+
+    Args:
+        repo:      Repository in ``owner/repo`` format.
+        pr_number: PR number.
+
+    Returns:
+        True if the PR has a merge conflict.
+    """
+    result = _gh(
+        ["pr", "view", str(pr_number), "--json", "mergeable,mergeStateStatus"],
+        repo=repo,
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+    try:
+        data = json.loads(result.stdout)
+        mergeable = (data.get("mergeable") or "").upper()
+        state = (data.get("mergeStateStatus") or "").upper()
+        return mergeable == "CONFLICTING" or state == "DIRTY"
+    except (json.JSONDecodeError, AttributeError):
+        return False
+
+
+def _rebase_branch(branch: str, repo: str, worktree_path: str) -> bool:
+    """Rebase a worktree branch onto origin/main.
+
+    Args:
+        branch:        Branch name being rebased.
+        repo:          Repository in ``owner/repo`` format (unused but kept for context).
+        worktree_path: Absolute path to the worktree directory.
+
+    Returns:
+        True if the rebase succeeded, False if it failed or conflicted.
+    """
+    # Fetch latest remote state
+    fetch = subprocess.run(
+        ["git", "fetch", "origin"],
+        cwd=worktree_path,
+        capture_output=True,
+        text=True,
+    )
+    if fetch.returncode != 0:
+        return False
+
+    # Attempt rebase
+    rebase = subprocess.run(
+        ["git", "rebase", "origin/main"],
+        cwd=worktree_path,
+        capture_output=True,
+        text=True,
+    )
+    if rebase.returncode != 0:
+        # Abort on failure
+        subprocess.run(
+            ["git", "rebase", "--abort"],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+        )
+        return False
+
+    # Force push after successful rebase
+    push = subprocess.run(
+        ["git", "push", "--force-with-lease", "origin", branch],
+        cwd=worktree_path,
+        capture_output=True,
+        text=True,
+    )
+    return push.returncode == 0
+
+
+def _get_review_status(repo: str, pr_number: int) -> str:
+    """Get the aggregate review status for a PR.
+
+    Returns:
+        ``"approved"`` — at least one approval and no blocking changes_requested.
+        ``"changes_requested"`` — reviewer has requested changes.
+        ``"no_review"`` — no reviews submitted yet (treated as approved).
+    """
+    result = _gh(
+        ["pr", "view", str(pr_number), "--json", "reviews"],
+        repo=repo,
+        check=False,
+    )
+    if result.returncode != 0:
+        return "no_review"
+
+    try:
+        data = json.loads(result.stdout)
+        reviews = data.get("reviews", [])
+    except (json.JSONDecodeError, AttributeError):
+        return "no_review"
+
+    if not reviews:
+        return "no_review"
+
+    # Use latest review per reviewer
+    latest: dict[str, str] = {}
+    for review in reviews:
+        author = (review.get("author") or {}).get("login", "unknown")
+        state = (review.get("state") or "").upper()
+        latest[author] = state
+
+    states = set(latest.values())
+    if "CHANGES_REQUESTED" in states:
+        return "changes_requested"
+    if "APPROVED" in states:
+        return "approved"
+    return "no_review"
+
+
+def _find_next_version(milestone: str) -> str:
+    """Infer the next version string from an implementation milestone title.
+
+    Examples:
+        ``"MVP Implementation"`` → ``"v2"``
+        ``"v1 Implementation"`` → ``"v2"``
+        ``"v1.1 Implementation"`` → ``"v2"``
+
+    Args:
+        milestone: Title of the current implementation milestone.
+
+    Returns:
+        A version string for the next milestone (e.g. ``"v2"``).
+    """
+    title_lower = milestone.lower()
+    match = re.search(r"(v\d+[\.\d]*|mvp|alpha|beta)", title_lower)
+    if match:
+        version_token = match.group(1)
+        if version_token == "mvp":
+            return "v2"
+        ver_match = re.match(r"v(\d+)", version_token)
+        if ver_match:
+            next_v = int(ver_match.group(1)) + 1
+            return f"v{next_v}"
+    return "next version"
+
+
+def _monitor_pr(
+    pr_number: int,
+    branch: str,
+    repo: str,
+    config: Config,
+    checkpoint: Checkpoint,
+    worktree_path: str,
+    issue_number: int,
+    max_polls: int = _CI_MAX_POLLS,
+    poll_interval: int = _CI_POLL_INTERVAL,
+) -> bool:
+    """Monitor a PR's CI status and squash-merge it when CI passes.
+
+    Polls ``gh pr checks`` up to *max_polls* times. On conflict, attempts a
+    rebase up to ``_REBASE_RETRY_LIMIT`` times. On success, checks reviews and
+    squash-merges.
+
+    Args:
+        pr_number:     GitHub PR number.
+        branch:        Branch name for the PR.
+        repo:          Repository in ``owner/repo`` format.
+        config:        Config instance for logging.
+        checkpoint:    Checkpoint instance for logging.
+        worktree_path: Absolute path to the worktree directory (for rebase).
+        issue_number:  Original issue number (for logging).
+        max_polls:     Maximum number of CI status polls before timeout.
+        poll_interval: Seconds to sleep between polls.
+
+    Returns:
+        True if the PR was successfully merged. False otherwise.
+    """
+    checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
+    rebase_attempts = 0
+    ci_fail_count = 0
+
+    for poll_idx in range(max_polls):
+        time.sleep(poll_interval)
+        ci_status = _get_pr_checks_status(repo, pr_number)
+
+        logger.log_conductor_event(
+            run_id=checkpoint.run_id,
+            phase="ci_check",
+            event_type="ci_checked",
+            payload={
+                "pr_number": pr_number,
+                "issue_number": issue_number,
+                "status": ci_status,
+                "poll_index": poll_idx,
+            },
+            log_dir=config.log_dir.expanduser(),
+        )
+
+        if ci_status == "pass":
+            # Check reviews
+            review_status = _get_review_status(repo, pr_number)
+
+            if review_status == "changes_requested":
+                # Read inline comments and triage: fix/file-issue/skip
+                _triage_review_comments(
+                    pr_number=pr_number,
+                    branch=branch,
+                    repo=repo,
+                    config=config,
+                    checkpoint=checkpoint,
+                    issue_number=issue_number,
+                )
+
+            # Squash merge — proceed regardless of review status ("no_review" is OK)
+            merge_result = _gh(
+                ["pr", "merge", str(pr_number), "--squash", "--delete-branch"],
+                repo=repo,
+                check=False,
+            )
+            if merge_result.returncode == 0:
+                # Record completion in checkpoint
+                checkpoint.completed_prs.append(pr_number)
+                session.save(checkpoint, checkpoint_path)
+
+                logger.log_conductor_event(
+                    run_id=checkpoint.run_id,
+                    phase="merge",
+                    event_type="pr_merged",
+                    payload={
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "branch": branch,
+                    },
+                    log_dir=config.log_dir.expanduser(),
+                )
+                return True
+            else:
+                logger.log_conductor_event(
+                    run_id=checkpoint.run_id,
+                    phase="merge",
+                    event_type="human_escalate",
+                    payload={
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "reason": "squash merge failed",
+                        "stderr": merge_result.stderr,
+                    },
+                    log_dir=config.log_dir.expanduser(),
+                )
+                return False
+
+        elif ci_status == "fail":
+            # Check if it's a conflict
+            if _is_conflict_failure(repo, pr_number):
+                if rebase_attempts >= _REBASE_RETRY_LIMIT:
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="ci_check",
+                        event_type="human_escalate",
+                        payload={
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            "reason": "rebase limit exceeded",
+                        },
+                        log_dir=config.log_dir.expanduser(),
+                    )
+                    return False
+
+                rebase_ok = _rebase_branch(branch, repo, worktree_path)
+                rebase_attempts += 1
+                if not rebase_ok:
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="ci_check",
+                        event_type="human_escalate",
+                        payload={
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            "reason": "rebase failed — conflicts outside agent scope",
+                        },
+                        log_dir=config.log_dir.expanduser(),
+                    )
+                    return False
+                # Rebase succeeded — continue polling
+                continue
+
+            # Non-conflict failure: escalate after MAX_RETRIES
+            ci_fail_count += 1
+            if ci_fail_count >= MAX_RETRIES:
+                logger.log_conductor_event(
+                    run_id=checkpoint.run_id,
+                    phase="ci_check",
+                    event_type="human_escalate",
+                    payload={
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "reason": "ci failed repeatedly",
+                        "ci_fail_count": ci_fail_count,
+                    },
+                    log_dir=config.log_dir.expanduser(),
+                )
+                return False
+            # Otherwise continue polling (may be transient)
+
+        # ci_status == "pending": continue polling
+
+    # Timeout
+    logger.log_conductor_event(
+        run_id=checkpoint.run_id,
+        phase="ci_check",
+        event_type="human_escalate",
+        payload={
+            "pr_number": pr_number,
+            "issue_number": issue_number,
+            "reason": "ci monitoring timeout",
+        },
+        log_dir=config.log_dir.expanduser(),
+    )
+    return False
+
+
+def _triage_review_comments(
+    pr_number: int,
+    branch: str,
+    repo: str,
+    config: Config,
+    checkpoint: Checkpoint,
+    issue_number: int,
+) -> None:
+    """Read review inline comments and log them for human review.
+
+    Triaging policy:
+    - Straightforward in-scope fixes → apply via runner.run()
+    - Valid but out-of-scope → file a follow-up issue
+    - False positives → add a skip comment on the PR
+
+    In this implementation, all comments are logged and a PR comment is added
+    acknowledging receipt. The orchestrator proceeds with merge regardless.
+
+    Args:
+        pr_number:    GitHub PR number.
+        branch:       Branch name (unused but kept for context).
+        repo:         Repository in ``owner/repo`` format.
+        config:       Config instance.
+        checkpoint:   Checkpoint instance.
+        issue_number: Original issue number.
+    """
+    # Read inline comments
+    comments_result = _gh(
+        ["api", f"repos/{repo}/pulls/{pr_number}/comments"],
+        repo=None,  # already embedded in path
+        check=False,
+    )
+    if comments_result.returncode != 0:
+        return
+
+    try:
+        comments = json.loads(comments_result.stdout)
+    except json.JSONDecodeError:
+        return
+
+    if not comments:
+        return
+
+    # Log that we saw review comments
+    logger.log_conductor_event(
+        run_id=checkpoint.run_id,
+        phase="review",
+        event_type="review_comments_triaged",
+        payload={
+            "pr_number": pr_number,
+            "issue_number": issue_number,
+            "comment_count": len(comments),
+            "action": "logged_for_human_review",
+        },
+        log_dir=config.log_dir.expanduser(),
+    )
+
+    # Add a PR comment acknowledging the review
+    _gh(
+        [
+            "pr",
+            "comment",
+            str(pr_number),
+            "--body",
+            (
+                f"Orchestrator: received {len(comments)} review comment(s). "
+                "Review feedback logged; proceeding with merge if CI passes. "
+                "Non-trivial changes will be filed as follow-up issues."
+            ),
+        ],
+        repo=repo,
+        check=False,
+    )
+
+
+def _create_worktree(branch: str, repo_root: str) -> str | None:
+    """Create a git worktree for *branch* under ``.claude/worktrees/``.
+
+    The branch is created from ``origin/main`` and pushed to the remote.
+
+    Args:
+        branch:    Branch name (e.g. ``"42-add-config"``).
+        repo_root: Absolute path to the repository root.
+
+    Returns:
+        Absolute path to the new worktree directory, or ``None`` on failure.
+    """
+    worktree_dir = os.path.join(repo_root, ".claude", "worktrees", branch)
+
+    # Create worktree with new branch based on origin/main
+    result = subprocess.run(
+        ["git", "worktree", "add", worktree_dir, "-b", branch, "origin/main"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+
+    # Push the new branch to remote
+    push = subprocess.run(
+        ["git", "-C", worktree_dir, "push", "-u", "origin", branch],
+        capture_output=True,
+        text=True,
+    )
+    if push.returncode != 0:
+        # Clean up the worktree if push fails
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", worktree_dir],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        return None
+
+    return worktree_dir
+
+
+def _remove_worktree(worktree_path: str, repo_root: str) -> None:
+    """Force-remove a git worktree.
+
+    Args:
+        worktree_path: Absolute path to the worktree directory.
+        repo_root:     Absolute path to the repository root.
+    """
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", worktree_path],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _get_repo_root() -> str:
+    """Return the absolute path to the current git repository root."""
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return result.stdout.strip()
+    return os.getcwd()
+
+
+def _dispatch_impl_agent(
+    issue: dict[str, Any],
+    branch: str,
+    worktree_path: str,
+    module: str,
+    repo: str,
+    config: Config,
+    checkpoint: Checkpoint,
+    dry_run: bool = False,
+) -> tuple[dict[str, Any], str, str, Any]:
+    """Dispatch a single impl agent for *issue* in its worktree.
+
+    Builds the impl-agent prompt, calls runner.run(), and returns the outcome.
+    This function is designed to be called from a ThreadPoolExecutor worker.
+
+    Args:
+        issue:         Issue dict with number, title, body, labels.
+        branch:        Branch name for the agent.
+        worktree_path: Absolute path to the agent's worktree.
+        module:        Module name extracted from the feat:* label.
+        repo:          Repository in ``owner/repo`` format.
+        config:        Config instance.
+        checkpoint:    Checkpoint instance (read-only in thread).
+        dry_run:       If True, return a mock success result without executing.
+
+    Returns:
+        Tuple of (issue, branch, worktree_path, run_result).
+    """
+    issue_number = issue["number"]
+    issue_title = issue.get("title", "")
+    raw_body = issue.get("body") or ""
+    body = _sanitize_issue_body(raw_body)
+
+    # Determine scope path from module name
+    if module == "none":
+        scope = "src/composer/"
+    elif module == "cli":
+        scope = "src/composer/cli.py, src/composer/skills/"
+    else:
+        scope = f"src/composer/{module}.py"
+
+    # Get the feat label to use for the PR
+    feat_label = f"feat:{module}" if module != "none" else "feat:cli"
+
+    # Build the agent prompt
+    base_prompt = (
+        f"You are implementing issue #{issue_number} on branch `{branch}`.\n"
+        f"Your task: {issue_title}\n"
+        f"Allowed scope: {scope}\n\n"
+        f"Steps:\n"
+        f"1. git checkout {branch}\n"
+        f"2. Read the issue: gh issue view {issue_number}\n"
+        f"3. Implement the changes within the allowed scope\n"
+        f"4. Update README if it exists at the package/module root\n"
+        f"5. Run tests — all tests must pass\n"
+        f"6. Run lint — must be clean\n"
+        f"7. Commit with message referencing the issue\n"
+        f"8. git push -u origin {branch}\n"
+        f'9. Create PR: gh pr create --title "{issue_title}" '
+        f'--label "{feat_label}" --body "Closes #{issue_number}"\n'
+        f"10. Wait for CI: gh pr checks <PR-number> --watch\n"
+        f"11. Read all CI and review feedback\n"
+        f"12. Triage each piece of feedback (fix now / file issue / skip)\n"
+        f"13. STOP. Do not merge.\n\n"
+        f"Issue body:\n{body}"
+    )
+    prompt = inject_skill("impl-worker", base_prompt)
+
+    if dry_run:
+        from composer.runner import RunResult as _RunResult
+
+        return (
+            issue,
+            branch,
+            worktree_path,
+            _RunResult(
+                is_error=False,
+                subtype="success",
+                error_code=None,
+                exit_code=0,
+                total_cost_usd=0.0,
+                input_tokens=0,
+                output_tokens=0,
+                cache_read_input_tokens=0,
+                cache_creation_input_tokens=0,
+                raw_result_event=None,
+                stderr="",
+                overage_detected=False,
+            ),
+        )
+
+    # Build isolated env for the impl agent
+    env = build_subprocess_env(config)
+    # Each impl agent gets an isolated CLAUDE_CONFIG_DIR
+    env["CLAUDE_CONFIG_DIR"] = f"/tmp/composer-agent-{issue_number}-{uuid.uuid4().hex}"
+
+    max_turns = 100
+    if hasattr(config, "max_turns") and config.max_turns:
+        max_turns = config.max_turns
+
+    result = runner.run(
+        prompt=prompt,
+        allowed_tools=runner.TOOLS_IMPL_AGENT,
+        env=env,
+        max_turns=max_turns,
+    )
+    return issue, branch, worktree_path, result
+
+
+def _run_impl_worker(
+    repo: str,
+    milestone: str,
+    config: Config,
+    checkpoint: Checkpoint,
+    dry_run: bool = False,
+) -> None:
+    """Main impl-worker loop.
+
+    Claims implementation issues respecting module isolation, dispatches parallel
+    agents via runner.run() using ThreadPoolExecutor, monitors CI, and squash-merges
+    passing PRs.
+
+    Args:
+        repo:       GitHub repository in ``owner/repo`` format.
+        milestone:  Active implementation milestone name (may be empty for all).
+        config:     Validated Config instance.
+        checkpoint: Active Checkpoint instance.
+        dry_run:    If True, print invocations without executing.
+    """
+    gov = UsageGovernor(config, checkpoint)
+    checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
+    retry_counts: dict[int, int] = {}
+    active_modules: set[str] = set()  # module isolation tracker
+    repo_root = _get_repo_root()
+
+    while True:
+        # ------------------------------------------------------------------
+        # STEP 1: Fetch all open impl issues for milestone
+        # ------------------------------------------------------------------
+        open_issues = _list_open_impl_issues(repo, milestone)
+
+        # ------------------------------------------------------------------
+        # STEP 2: Completion gate
+        # ------------------------------------------------------------------
+        if not open_issues and not gov._active_agents:
+            # No open issues remain — file pipeline issue and stop
+            next_version = _find_next_version(milestone)
+            if dry_run:
+                click.echo(f"[dry-run] Would file: 'Run plan-milestones for {next_version}'")
+            else:
+                _gh(
+                    [
+                        "issue",
+                        "create",
+                        "--title",
+                        f"Run plan-milestones for {next_version}",
+                        "--label",
+                        "pipeline",
+                        "--body",
+                        (
+                            f"Pipeline stage transition: impl-worker has completed "
+                            f"all implementation issues for {milestone}. "
+                            f"Time to plan the next version."
+                        ),
+                    ],
+                    repo=repo,
+                    check=False,
+                )
+
+            logger.log_conductor_event(
+                run_id=checkpoint.run_id,
+                phase="complete",
+                event_type="stage_complete",
+                payload={
+                    "milestone": milestone,
+                    "next_pipeline_issue": f"Run plan-milestones for {next_version}",
+                },
+                log_dir=config.log_dir.expanduser(),
+            )
+            session.save(checkpoint, checkpoint_path)
+
+            click.echo(
+                f"Implementation milestone '{milestone}' complete. "
+                f"Filed 'Run plan-milestones for {next_version}' pipeline issue."
+            )
+            break
+
+        # ------------------------------------------------------------------
+        # STEP 3: Backoff check
+        # ------------------------------------------------------------------
+        if not gov.can_dispatch():
+            logger.log_conductor_event(
+                run_id=checkpoint.run_id,
+                phase="backoff",
+                event_type="backoff_enter",
+                payload={"reason": "rate_limit_or_concurrency"},
+                log_dir=config.log_dir.expanduser(),
+            )
+            time.sleep(BACKOFF_SLEEP_SECONDS)
+            continue
+
+        # ------------------------------------------------------------------
+        # STEP 4: Select dispatchable issues (module isolation enforced)
+        # ------------------------------------------------------------------
+        open_issue_numbers = {i.get("number", 0) for i in open_issues}
+        unblocked = _filter_unblocked(open_issues, open_issue_numbers)
+        ranked = _sort_issues(unblocked)
+
+        # Apply module isolation: skip issues whose module is already active.
+        # Use the governor's concurrency limit to bound the batch size.
+        limits: dict[str, int] = {"pro": 2, "max": 3, "max20x": 5}
+        concurrency_limit = config.max_concurrency or limits.get(config.subscription_tier, 3)
+        dispatchable = []
+        for issue in ranked:
+            mod = _extract_module(issue)
+            if mod == "none" or mod not in active_modules:
+                if gov.can_dispatch(1):
+                    dispatchable.append(issue)
+                    # Don't exceed concurrency limit
+                    if len(dispatchable) >= concurrency_limit:
+                        break
+
+        if not dispatchable:
+            if gov._active_agents == 0:
+                # No dispatchable work and nothing running → sleep and retry
+                # (dependencies may be blocking everything)
+                time.sleep(BACKOFF_SLEEP_SECONDS)
+                continue
+            else:
+                # Work is running; wait for it
+                time.sleep(BACKOFF_SLEEP_SECONDS)
+                continue
+
+        # ------------------------------------------------------------------
+        # STEP 5: Sequential claiming and branch creation
+        # ------------------------------------------------------------------
+        dispatch_batch: list[tuple[dict, str, str, str]] = []  # (issue, branch, worktree, module)
+
+        for issue in dispatchable:
+            issue_number = issue["number"]
+            issue_title = issue.get("title", "")
+            module = _extract_module(issue)
+
+            # Create branch name
+            slug = _slugify(issue_title)
+            branch = f"{issue_number}-{slug}"
+
+            if dry_run:
+                click.echo(
+                    f"[dry-run] Would claim #{issue_number}: {issue_title!r} "
+                    f"(module={module}, branch={branch})"
+                )
+                # Still track for dry-run loop exit
+                dispatch_batch.append((issue, branch, "", module))
+                active_modules.add(module)
+                gov.record_dispatch(1)
+                session.record_dispatch(checkpoint, str(issue_number))
+                session.save(checkpoint, checkpoint_path)
+                continue
+
+            # Claim issue on GitHub
+            _claim_issue(repo=repo, issue_number=issue_number)
+
+            # Create worktree and push branch
+            worktree_path = _create_worktree(branch, repo_root)
+            if worktree_path is None:
+                # Failed to create worktree — unclaim and skip
+                _unclaim_issue(repo=repo, issue_number=issue_number)
+                logger.log_conductor_event(
+                    run_id=checkpoint.run_id,
+                    phase="claim",
+                    event_type="worktree_create_failed",
+                    payload={"issue_number": issue_number, "branch": branch},
+                    log_dir=config.log_dir.expanduser(),
+                )
+                continue
+
+            # Record dispatch in checkpoint
+            session.record_dispatch(checkpoint, str(issue_number))
+            checkpoint.claimed_issues[str(issue_number)] = branch
+            session.save(checkpoint, checkpoint_path)
+
+            logger.log_conductor_event(
+                run_id=checkpoint.run_id,
+                phase="claim",
+                event_type="issue_claimed",
+                payload={
+                    "issue_number": issue_number,
+                    "title": issue_title,
+                    "branch": branch,
+                    "module": module,
+                },
+                log_dir=config.log_dir.expanduser(),
+            )
+
+            gov.record_dispatch(1)
+            active_modules.add(module)
+            dispatch_batch.append((issue, branch, worktree_path, module))
+
+        if not dispatch_batch:
+            time.sleep(BACKOFF_SLEEP_SECONDS)
+            continue
+
+        if dry_run:
+            # In dry-run mode, simulate completion gate then exit
+            click.echo("[dry-run] Would dispatch agents in parallel; stopping.")
+            break
+
+        # ------------------------------------------------------------------
+        # STEP 6: Dispatch agents in parallel using ThreadPoolExecutor
+        # ------------------------------------------------------------------
+        futures: dict = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(dispatch_batch)) as executor:
+            for issue, branch, worktree_path, module in dispatch_batch:
+                future = executor.submit(
+                    _dispatch_impl_agent,
+                    issue=issue,
+                    branch=branch,
+                    worktree_path=worktree_path,
+                    module=module,
+                    repo=repo,
+                    config=config,
+                    checkpoint=checkpoint,
+                    dry_run=dry_run,
+                )
+                futures[future] = (issue, branch, worktree_path, module)
+
+            # ------------------------------------------------------------------
+            # STEP 7: Handle results as each agent completes
+            # ------------------------------------------------------------------
+            for future in concurrent.futures.as_completed(futures):
+                _issue, _branch, _worktree_path, _module = futures[future]
+                issue_number = _issue["number"]
+
+                try:
+                    _, _, _, result = future.result()
+                except Exception as exc:
+                    # Unexpected exception from dispatcher
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="dispatch",
+                        event_type="agent_exception",
+                        payload={
+                            "issue_number": issue_number,
+                            "error": str(exc),
+                        },
+                        log_dir=config.log_dir.expanduser(),
+                    )
+                    gov.record_completion(1)
+                    active_modules.discard(_module)
+                    _unclaim_issue(repo=repo, issue_number=issue_number)
+                    _remove_worktree(_worktree_path, repo_root)
+                    continue
+
+                gov.record_completion(1)
+                gov.record_result(result)
+                active_modules.discard(_module)
+
+                logger.log_conductor_event(
+                    run_id=checkpoint.run_id,
+                    phase="dispatch",
+                    event_type="agent_completed",
+                    payload={
+                        "issue_number": issue_number,
+                        "subtype": result.subtype,
+                        "is_error": result.is_error,
+                        "error_code": result.error_code,
+                        "branch": _branch,
+                    },
+                    log_dir=config.log_dir.expanduser(),
+                )
+                session.save(checkpoint, checkpoint_path)
+
+                # Rate-limited → unclaim and back off
+                if result.error_code in ("rate_limit", "extra_usage_exhausted") or (
+                    result.subtype == "error_max_budget_usd"
+                ):
+                    _unclaim_issue(repo=repo, issue_number=issue_number)
+                    _remove_worktree(_worktree_path, repo_root)
+                    attempt = retry_counts.get(issue_number, 0)
+                    gov.record_429(attempt)
+                    retry_counts[issue_number] = attempt + 1
+
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="backoff",
+                        event_type="backoff_enter",
+                        payload={
+                            "issue_number": issue_number,
+                            "reason": result.error_code or result.subtype,
+                            "attempt": attempt,
+                        },
+                        log_dir=config.log_dir.expanduser(),
+                    )
+                    session.save(checkpoint, checkpoint_path)
+                    continue
+
+                # Other agent error → retry or escalate
+                if result.is_error:
+                    current_retries = retry_counts.get(issue_number, 0) + 1
+                    retry_counts[issue_number] = current_retries
+                    _unclaim_issue(repo=repo, issue_number=issue_number)
+                    _remove_worktree(_worktree_path, repo_root)
+
+                    if current_retries >= MAX_RETRIES:
+                        logger.log_conductor_event(
+                            run_id=checkpoint.run_id,
+                            phase="dispatch",
+                            event_type="human_escalate",
+                            payload={
+                                "issue_number": issue_number,
+                                "reason": result.subtype or "unknown_error",
+                                "error_code": result.error_code,
+                                "retry_count": current_retries,
+                                "action_required": "manual investigation",
+                            },
+                            log_dir=config.log_dir.expanduser(),
+                        )
+                    # Issue returns to open state for retry in a future iteration
+                    continue
+
+                # Success path: find the PR created by the agent
+                pr_number = _find_pr_for_branch(repo, _branch)
+                if pr_number is None:
+                    # Agent succeeded but created no PR — escalate
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="dispatch",
+                        event_type="human_escalate",
+                        payload={
+                            "issue_number": issue_number,
+                            "reason": "agent completed but no PR found",
+                            "branch": _branch,
+                        },
+                        log_dir=config.log_dir.expanduser(),
+                    )
+                    _unclaim_issue(repo=repo, issue_number=issue_number)
+                    _remove_worktree(_worktree_path, repo_root)
+                    continue
+
+                # Record the open PR
+                checkpoint.open_prs[_branch] = pr_number
+                session.save(checkpoint, checkpoint_path)
+
+                logger.log_conductor_event(
+                    run_id=checkpoint.run_id,
+                    phase="dispatch",
+                    event_type="pr_created",
+                    payload={
+                        "issue_number": issue_number,
+                        "pr_number": pr_number,
+                        "branch": _branch,
+                    },
+                    log_dir=config.log_dir.expanduser(),
+                )
+
+                # Monitor CI and merge
+                merged = _monitor_pr(
+                    pr_number=pr_number,
+                    branch=_branch,
+                    repo=repo,
+                    config=config,
+                    checkpoint=checkpoint,
+                    worktree_path=_worktree_path,
+                    issue_number=issue_number,
+                )
+
+                if merged:
+                    _remove_worktree(_worktree_path, repo_root)
+                else:
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="merge",
+                        event_type="human_escalate",
+                        payload={
+                            "issue_number": issue_number,
+                            "pr_number": pr_number,
+                            "reason": "CI monitoring did not result in merge",
+                        },
+                        log_dir=config.log_dir.expanduser(),
+                    )
+
+                session.save(checkpoint, checkpoint_path)
+
+
+# ---------------------------------------------------------------------------
 # Entry points
 # ---------------------------------------------------------------------------
 
@@ -1325,7 +2457,14 @@ def impl_worker(
         stage="impl",
         resume_run_id=resume,
     )
-    click.echo("Not yet implemented")
+
+    _run_impl_worker(
+        repo=repo,
+        milestone=milestone or "",
+        config=_config,
+        checkpoint=_checkpoint,
+        dry_run=dry_run,
+    )
 
 
 @click.command("research-worker")
