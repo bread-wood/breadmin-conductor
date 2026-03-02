@@ -58,7 +58,9 @@ def research_worker(
 
 @click.command("design-worker")
 @click.option("--repo", required=True, help="Target repo in OWNER/REPO format")
-@click.option("--research-milestone", required=True, help="Completed research milestone to translate")
+@click.option(
+    "--research-milestone", required=True, help="Completed research milestone to translate"
+)
 @click.option("--model", default=None, help="Override Claude model")
 @click.option("--dry-run", is_flag=True, help="Print planned issues without creating them")
 def design_worker(
