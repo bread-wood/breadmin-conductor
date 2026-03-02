@@ -3385,3 +3385,269 @@ def cost() -> None:
         stage="cost",
     )
     click.echo("Not yet implemented")
+
+
+# ---------------------------------------------------------------------------
+# run — full pipeline orchestration
+# ---------------------------------------------------------------------------
+
+# Valid stage names in pipeline order
+_PIPELINE_STAGES: list[str] = [
+    "plan-milestones",
+    "research-worker",
+    "design-worker",
+    "plan-issues",
+    "impl-worker",
+]
+
+
+def _run_pipeline_stage(
+    stage: str,
+    repo_ref: str,
+    local_path: str | None,
+    version: str,
+    spec: str | None,
+    dry_run: bool,
+) -> None:
+    """Execute a single pipeline stage by calling the underlying _run_* helper.
+
+    Builds a minimal Config and Checkpoint for the stage, then delegates to the
+    appropriate internal helper function.  Each stage is self-contained: it loads
+    its own config and checkpoint so that stages remain independent.
+
+    Args:
+        stage:      One of the valid _PIPELINE_STAGES names.
+        repo_ref:   Resolved ``owner/name`` repository reference.
+        local_path: Absolute path to the local repo clone (or None for remote-only).
+        version:    Version identifier (e.g. ``"MVP"``).
+        spec:       Absolute path to a spec file to seed (plan-milestones only, or None).
+        dry_run:    If True, print intent without executing.
+
+    Raises:
+        click.ClickException: On configuration or stage-level failures.
+    """
+    overrides: dict = {
+        "github_repo": repo_ref or None,
+        "target_repo": repo_ref or None,
+    }
+    config = load_config(**overrides)
+    checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
+
+    research_milestone = f"{version} Research"
+    impl_milestone = f"{version} Implementation"
+
+    if stage == "plan-milestones":
+        _config, _checkpoint = startup_sequence(
+            config=config,
+            checkpoint_path=checkpoint_path,
+            milestone=version,
+            stage="plan-milestones",
+        )
+        # Seed spec if provided
+        if spec is not None:
+            resolved_spec = Path(spec)
+            if local_path is None:
+                raise click.ClickException(
+                    "--spec requires a local repository path. "
+                    "Pass --repo path/to/local/dir or omit --repo to operate on cwd."
+                )
+            _seed_spec(resolved_spec, version, local_path)
+        _run_plan_milestones(
+            repo=repo_ref,
+            version=version,
+            config=_config,
+            checkpoint=_checkpoint,
+            dry_run=dry_run,
+        )
+
+    elif stage == "research-worker":
+        _config, _checkpoint = startup_sequence(
+            config=config,
+            checkpoint_path=checkpoint_path,
+            milestone=research_milestone,
+            stage="research",
+        )
+        _run_research_worker(
+            repo=repo_ref,
+            milestone=research_milestone,
+            config=_config,
+            checkpoint=_checkpoint,
+            dry_run=dry_run,
+        )
+
+    elif stage == "design-worker":
+        _config, _checkpoint = startup_sequence(
+            config=config,
+            checkpoint_path=checkpoint_path,
+            milestone=research_milestone,
+            stage="design",
+        )
+        _run_design_worker(
+            repo=repo_ref,
+            research_milestone=research_milestone,
+            config=_config,
+            checkpoint=_checkpoint,
+            dry_run=dry_run,
+        )
+
+    elif stage == "plan-issues":
+        _config, _checkpoint = startup_sequence(
+            config=config,
+            checkpoint_path=checkpoint_path,
+            milestone=impl_milestone,
+            stage="plan-issues",
+        )
+        _run_plan_issues(
+            repo=repo_ref,
+            impl_milestone=impl_milestone,
+            config=_config,
+            checkpoint=_checkpoint,
+            dry_run=dry_run,
+        )
+
+    elif stage == "impl-worker":
+        _config, _checkpoint = startup_sequence(
+            config=config,
+            checkpoint_path=checkpoint_path,
+            milestone=impl_milestone,
+            stage="impl",
+        )
+        _run_impl_worker(
+            repo=repo_ref,
+            milestone=impl_milestone,
+            config=_config,
+            checkpoint=_checkpoint,
+            dry_run=dry_run,
+        )
+
+    else:
+        raise click.ClickException(f"Unknown pipeline stage: {stage!r}")
+
+
+@composer.command("run")
+@click.option(
+    "--repo",
+    default=None,
+    help=(
+        "Target repository. Accepts: 'owner/name' (existing remote), "
+        "'name' (new private repo to scaffold), 'path/to/local/dir' (local git repo), "
+        "or omit to operate on the current working directory."
+    ),
+)
+@click.option(
+    "--spec",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help=(
+        "Path to a .md spec file to seed into the target repo before running plan-milestones. "
+        "Accepts relative (resolved from cwd) or absolute paths."
+    ),
+)
+@click.option(
+    "--version",
+    default=None,
+    help=(
+        "Version name override (e.g. 'MVP', 'v2'). "
+        "Defaults to the spec filename stem when --spec is given."
+    ),
+)
+@click.option(
+    "--from",
+    "from_stage",
+    default=None,
+    help=(
+        "Resume from a specific stage, skipping earlier ones. "
+        f"Valid values: {', '.join(_PIPELINE_STAGES)}"
+    ),
+)
+@click.option("--dry-run", is_flag=True, help="Print what each stage would do without executing")
+def run(
+    repo: str | None,
+    spec: str | None,
+    version: str | None,
+    from_stage: str | None,
+    dry_run: bool,
+) -> None:
+    """Run the full pipeline end-to-end.
+
+    Stages: plan-milestones → research-worker → design-worker → plan-issues → impl-worker.
+    """
+    # -----------------------------------------------------------------------
+    # Validate --from
+    # -----------------------------------------------------------------------
+    if from_stage is not None and from_stage not in _PIPELINE_STAGES:
+        raise click.UsageError(
+            f"Invalid --from value: {from_stage!r}. Valid values: {', '.join(_PIPELINE_STAGES)}"
+        )
+
+    # -----------------------------------------------------------------------
+    # Validate --spec and derive --version
+    # -----------------------------------------------------------------------
+    resolved_spec: Path | None = None
+    if spec is not None:
+        resolved_spec = _validate_spec_path(spec)
+
+    if version is None:
+        if resolved_spec is not None:
+            version = resolved_spec.stem
+        else:
+            raise click.UsageError(
+                "--version is required when --spec is not provided. "
+                "Pass --version MVP (or another version name) to identify the milestone pair."
+            )
+
+    # -----------------------------------------------------------------------
+    # Resolve repo
+    # -----------------------------------------------------------------------
+    repo_ref, local_path = _resolve_repo(repo)
+
+    # -----------------------------------------------------------------------
+    # Determine which stages to skip based on --from
+    # -----------------------------------------------------------------------
+    start_index = 0
+    if from_stage is not None:
+        start_index = _PIPELINE_STAGES.index(from_stage)
+
+    # -----------------------------------------------------------------------
+    # Run each stage in order
+    # -----------------------------------------------------------------------
+    for idx, stage in enumerate(_PIPELINE_STAGES):
+        click.echo(f"\n── Stage: {stage} ──")
+
+        if idx < start_index:
+            click.echo(f"[skip] {stage}")
+            continue
+
+        if dry_run:
+            click.echo(f"[dry-run] would invoke {stage}")
+            continue
+
+        try:
+            _run_pipeline_stage(
+                stage=stage,
+                repo_ref=repo_ref,
+                local_path=local_path,
+                version=version,
+                spec=str(resolved_spec) if resolved_spec is not None else None,
+                dry_run=dry_run,
+            )
+        except SystemExit as exc:
+            exit_code = exc.code if exc.code is not None else 1
+            if exit_code != 0:
+                resume_cmd = f"composer run --from {stage}"
+                if repo:
+                    resume_cmd += f" --repo {repo}"
+                click.echo(
+                    f"Error: {stage} failed. To resume: {resume_cmd}",
+                    err=True,
+                )
+                raise SystemExit(1) from exc
+        except Exception as exc:
+            resume_cmd = f"composer run --from {stage}"
+            if repo:
+                resume_cmd += f" --repo {repo}"
+            click.echo(
+                f"Error: {stage} failed. To resume: {resume_cmd}",
+                err=True,
+            )
+            raise SystemExit(1) from exc
