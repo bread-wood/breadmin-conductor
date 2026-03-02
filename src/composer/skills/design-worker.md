@@ -1,8 +1,8 @@
 Start the design worker for this repository in autonomous mode.
 
-The design worker translates completed research into fully-specified implementation issues.
+The design worker translates completed research into HLD and LLD design documents.
 It runs **after** research is declared complete (research-worker Step 4 verdict) and **before**
-impl-worker begins. It produces no code — only well-specified GitHub issues.
+plan-issues begins. It produces no code and no GitHub issues — only design documents.
 
 ## Setup
 
@@ -14,25 +14,13 @@ impl-worker begins. It produces no code — only well-specified GitHub issues.
 
 2. Run startup checks per the Orchestrator-Dispatch Protocol in ~/.claude/CLAUDE.md.
 
-3. Read the project-level CLAUDE.md to understand module scope and labels.
+3. Read the project-level CLAUDE.md to understand module scope and pipeline model.
 
 ## Inputs
 
 The design worker requires:
 - `--research-milestone` — the research milestone whose docs to translate
 - `--repo` — the target repository
-
-Identify the corresponding implementation milestone:
-```bash
-gh milestone list --repo <owner>/<repo>
-```
-Look for a milestone whose title contains "Impl" or "Implementation" for the same version.
-If it doesn't exist, create it:
-```bash
-gh api repos/<owner>/<repo>/milestones \
-  -f title="<Version> Implementation" \
-  -f description="Implementation phase for <version>"
-```
 
 ## Execution
 
@@ -53,91 +41,121 @@ Read every doc that corresponds to the research milestone. Build a mental model 
 - What was explicitly deferred or marked `[V2_RESEARCH]`
 - Any blocking contradictions or unresolved `[INFERRED]` claims that affect design
 
-### Step 2 — Audit Existing Impl Issues
+### Step 2 — Audit Existing Design Docs
 
-Check what implementation issues already exist for the impl milestone to avoid duplication:
+Check what design docs already exist to avoid recreating docs that are already up-to-date:
 ```bash
-gh issue list --state open --milestone "<impl-milestone>" --limit 200 \
-  --json number,title,labels,body
+ls docs/design/
+ls docs/design/lld/
 ```
 
-### Step 3 — Design Implementation Issues
+### Step 3 — Write HLD (if not present or outdated)
 
-For each logical unit of work needed to implement the findings:
+If `docs/design/HLD.md` doesn't exist or is outdated relative to the research findings:
 
-1. **Define scope** — which source files does it touch? (reference CLAUDE.md module isolation)
-2. **Write acceptance criteria** — concrete, testable conditions for "done"
-3. **Write test requirements** — what unit/integration tests must pass
-4. **Identify dependencies** — which other impl issues must complete first?
-5. **Assign label** — use the appropriate `feat:*` label from CLAUDE.md
+1. Create `docs/design/HLD.md` with:
+   - **System overview** — one-paragraph description and pipeline stage table
+   - **Component map** — ASCII diagram and module responsibility table with dependency edges
+   - **Execution model** — stateless subprocess chaining, agent isolation via git worktrees, end-to-end sequence diagrams
+   - **Error taxonomy** — `result` event schema, error classification table, retry policy
+   - **Security architecture** — four-layer defense-in-depth (input sanitization, env isolation, tool permission policy, OS process isolation)
+   - **Observability model** — three log streams, cost accounting schema, conductor log event list
+   - **Constraints** — hard constraints (non-negotiable), rate limit constraints, soft constraints
 
-File the issue:
-```bash
-gh issue create \
-  --repo <owner>/<repo> \
-  --title "<imperative verb phrase>" \
-  --label "<feat:*>,<infra if applicable>" \
-  --milestone "<impl-milestone>" \
-  --body "$(cat <<'EOF'
-## Context
-<1-2 sentences: what research finding this implements and why it's needed>
+2. Commit:
+   ```bash
+   git add docs/design/HLD.md
+   git commit -m "docs: add HLD for <research-milestone>"
+   ```
 
-## Acceptance Criteria
-- [ ] <concrete, testable criterion 1>
-- [ ] <concrete, testable criterion 2>
-- [ ] ...
+3. Push and open PR:
+   ```bash
+   git push -u origin <branch-name>
+   gh pr create \
+     --title "docs: HLD for <research-milestone>" \
+     --label "build" \
+     --milestone "<research-milestone>"
+   ```
 
-## Scope
-Files to create or modify:
-- `<path>` — <what changes>
+4. Wait for CI to pass; merge:
+   ```bash
+   gh pr checks <pr-number> --watch
+   gh pr merge <pr-number> --squash --delete-branch
+   git checkout $DEFAULT_BRANCH && git pull origin $DEFAULT_BRANCH
+   ```
 
-## Test Requirements
-- <what must be unit-tested>
-- <what must be integration-tested (if any)>
+5. Continue to LLDs.
 
-## Dependencies
-<Depends on: #N, or "None">
+### Step 4 — Write LLD Per Module
 
-## Key Design Decisions
-<Bullet list of non-obvious decisions made by research, so the impl agent doesn't re-litigate them>
-EOF
-)"
-```
+For each module in the CLAUDE.md module isolation table that needs a design doc:
 
-### Step 4 — Set Dependency Order
+1. Read the module's scope from CLAUDE.md (which source files it covers).
 
-After all issues are filed, review their dependencies and verify the order is correct.
-If any dependency is missing or circular, fix it before finishing.
+2. Create a new branch for this LLD:
+   ```bash
+   git checkout -b lld-<module>-<research-milestone-slug> origin/$DEFAULT_BRANCH
+   ```
 
-Print the planned execution order:
-```
-#N1 (no deps) → #N2 (depends on N1) → #N3 (depends on N1, N2) → ...
-```
+3. Write `docs/design/lld/<module>.md` with:
+   - **Module overview** — one paragraph; what problem it solves; which entry points or workers use it
+   - **File paths and exports** — table of source files, their kinds (Python module, skill prompt, etc.), and what each exports or provides
+   - **Public interface** — function signatures with type hints, dataclass schemas, class definitions; no implementation detail
+   - **Data flows and sequence diagrams** — ASCII text-based diagrams showing how data moves through the module; include subprocess invocation patterns where relevant
+   - **Error handling** — which errors this module classifies, what it raises, what callers must handle
+   - **Test requirements** — what unit tests must exist, what integration tests are needed, what must be mocked
+   - **Constraints and non-goals** — what this module explicitly does not do; hard constraints from research findings
+
+4. Commit:
+   ```bash
+   git add docs/design/lld/<module>.md
+   git commit -m "docs: add LLD for <module> (<research-milestone>)"
+   ```
+
+5. Push and open PR:
+   ```bash
+   git push -u origin lld-<module>-<research-milestone-slug>
+   gh pr create \
+     --title "docs: LLD for <module> (<research-milestone>)" \
+     --label "build" \
+     --milestone "<research-milestone>"
+   ```
+
+6. Wait for CI to pass; merge before writing the next LLD:
+   ```bash
+   gh pr checks <pr-number> --watch
+   gh pr merge <pr-number> --squash --delete-branch
+   git checkout $DEFAULT_BRANCH && git pull origin $DEFAULT_BRANCH
+   ```
+
+Repeat for each module that requires a design doc.
 
 ### Step 5 — Report
 
 Print a summary:
-- Implementation milestone name
-- Issues created (number, title, label, deps)
-- Execution order
-- Any research gaps that prevented full spec (flag as follow-up issues in the research milestone)
-- **Verdict**: "Ready for impl-worker — N issues filed, dependency graph complete."
+- Research milestone processed
+- Design docs produced (HLD + LLD list)
+- Any research gaps that prevented full design coverage (note inline; do not file new issues)
+- **Verdict**: "Ready for plan-issues — HLD and N LLD docs merged."
 
 File the next pipeline stage issue:
 ```bash
-gh issue create --title "Run impl-worker for <impl milestone>" --label "pipeline" --milestone "<impl milestone>"
+gh issue create \
+  --title "Run plan-issues for <research-milestone>" \
+  --label "pipeline" \
+  --milestone "<research-milestone>"
 ```
 
 Post a Notion report under "CC Autonomous Coding Sessions"
 (parent page ID: `317bb275-6a02-803d-a59f-dc56c3527942`) with:
 - **Title**: `Design Session — {YYYY-MM-DD} — {repo name}`
-- **Body**: research milestone processed, implementation issues filed, execution order, gaps
+- **Body**: research milestone processed, design docs produced, coverage gaps, verdict
 
 ## Constraints
 
-- **No code** — design-worker creates issues only, never touches source files
+- **No code** — design-worker creates design documents only, never touches source files
+- **No GitHub issues** — creating impl issues is plan-issues's job; design-worker MUST NOT file impl issues
 - **No dispatching** — design-worker does not launch sub-agents
-- **Spec first** — every issue must have acceptance criteria and scope before being filed
-- **One issue per logical unit** — split by module boundary (see CLAUDE.md module isolation)
-- **No gold-plating** — spec only what research explicitly determined; don't invent scope
+- **One PR per doc** — HLD gets its own PR; each LLD gets its own PR; merge before writing the next
+- **No gold-plating** — document only what research explicitly determined; don't invent scope
 - **Post session report to Notion** when done
