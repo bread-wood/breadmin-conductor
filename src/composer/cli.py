@@ -3628,6 +3628,11 @@ def run(
 
     Stages: plan-milestones → research-worker → design-worker → plan-issues → impl-worker.
     """
+    # composer run IS the top-level orchestrator; its internal stage calls are direct
+    # Python function invocations, not nested Claude Code sessions. Clear the env var
+    # so sub-stage load_config() calls don't raise OrchestratorNestingError.
+    os.environ.pop("CLAUDECODE", None)
+
     # -----------------------------------------------------------------------
     # Validate --from
     # -----------------------------------------------------------------------
@@ -3693,6 +3698,9 @@ def run(
                 resume_cmd = f"composer run --from {stage}"
                 if repo:
                     resume_cmd += f" --repo {repo}"
+                cause = exc.__cause__
+                if cause is not None:
+                    click.echo(str(cause), err=True)
                 click.echo(
                     f"Error: {stage} failed. To resume: {resume_cmd}",
                     err=True,
@@ -3702,6 +3710,7 @@ def run(
             resume_cmd = f"composer run --from {stage}"
             if repo:
                 resume_cmd += f" --repo {repo}"
+            click.echo(str(exc), err=True)
             click.echo(
                 f"Error: {stage} failed. To resume: {resume_cmd}",
                 err=True,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -525,3 +526,88 @@ class TestRunInHelp:
         assert "--version" in output
         assert "--from" in output
         assert "--dry-run" in output
+
+
+# ---------------------------------------------------------------------------
+# composer run: error message surfaced (regression for Bug 1)
+# ---------------------------------------------------------------------------
+
+
+class TestRunErrorMessageSurfaced:
+    def test_exception_message_printed_before_resume_hint(self, tmp_path: Path) -> None:
+        """When a stage raises, its exception message must appear before the resume hint."""
+
+        def fake_run_stage(stage: str, **kwargs: object) -> None:
+            if stage == "plan-milestones":
+                raise Exception("something went wrong")
+
+        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
+            with (
+                patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
+                patch("composer.cli._run_pipeline_stage", side_effect=fake_run_stage),
+            ):
+                runner = CliRunner()
+                result = runner.invoke(
+                    composer,
+                    ["run", "--repo", "owner/repo", "--version", "MVP"],
+                )
+
+        assert result.exit_code != 0
+        # The raw exception message must appear in the combined output
+        assert "something went wrong" in result.output
+        # The resume hint must also appear
+        assert "To resume:" in result.output
+        # The exception message must appear before (at an earlier position than) the resume hint
+        assert result.output.index("something went wrong") < result.output.index("To resume:")
+
+
+# ---------------------------------------------------------------------------
+# composer run: CLAUDECODE cleared before stage execution (regression for Bug 2)
+# ---------------------------------------------------------------------------
+
+
+class TestRunClearsCLAUDECODE:
+    def test_claudecode_cleared_before_stages_run(self, tmp_path: Path) -> None:
+        """composer run must clear CLAUDECODE so sub-stage load_config() calls succeed."""
+        env_snapshots: list[str | None] = []
+
+        def fake_run_stage(stage: str, **kwargs: object) -> None:
+            env_snapshots.append(os.environ.get("CLAUDECODE"))
+
+        with patch.dict("os.environ", {**MINIMAL_ENV, "CLAUDECODE": "1"}, clear=False):
+            with (
+                patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
+                patch("composer.cli._run_pipeline_stage", side_effect=fake_run_stage),
+            ):
+                runner = CliRunner()
+                result = runner.invoke(
+                    composer,
+                    ["run", "--repo", "owner/repo", "--version", "MVP", "--dry-run"],
+                )
+
+        # dry-run exits cleanly
+        assert result.exit_code == 0, result.output
+
+    def test_claudecode_not_set_during_stage_execution(self, tmp_path: Path) -> None:
+        """CLAUDECODE must not be present in os.environ when stages are called."""
+        env_snapshots: list[str | None] = []
+
+        def fake_run_stage(stage: str, **kwargs: object) -> None:
+            env_snapshots.append(os.environ.get("CLAUDECODE"))
+
+        with patch.dict("os.environ", {**MINIMAL_ENV, "CLAUDECODE": "1"}, clear=False):
+            with (
+                patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
+                patch("composer.cli._run_pipeline_stage", side_effect=fake_run_stage),
+            ):
+                runner = CliRunner()
+                result = runner.invoke(
+                    composer,
+                    ["run", "--repo", "owner/repo", "--version", "MVP"],
+                )
+
+        assert result.exit_code == 0, result.output
+        # All stage invocations must have seen CLAUDECODE as absent (None)
+        assert all(v is None for v in env_snapshots), (
+            f"CLAUDECODE was still set during stage execution: {env_snapshots}"
+        )
