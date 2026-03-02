@@ -328,6 +328,46 @@ def _is_git_repo(path: str) -> bool:
     return result.returncode == 0
 
 
+def _ensure_remote(repo_path: str, name: str) -> None:
+    """Ensure *repo_path* has a git remote named ``origin`` pointing at the GitHub repo.
+
+    If a remote already exists, this is a no-op.  If no remote is configured,
+    the SSH URL is fetched via ``gh repo view`` and added with ``git remote add``.
+
+    Args:
+        repo_path: Absolute path to a local git repository.
+        name: GitHub repository name (no slashes) used to look up the remote URL.
+
+    Raises:
+        click.ClickException: If ``gh repo view`` or ``git remote add`` fails.
+    """
+    remote_check = subprocess.run(
+        ["git", "-C", repo_path, "remote", "-v"],
+        capture_output=True,
+        text=True,
+    )
+    if remote_check.stdout.strip():
+        # Remote already configured — nothing to do.
+        return
+
+    view = subprocess.run(
+        ["gh", "repo", "view", name, "--json", "sshUrl", "--jq", ".sshUrl"],
+        capture_output=True,
+        text=True,
+    )
+    if view.returncode != 0:
+        raise click.ClickException(f"gh repo view failed for '{name}':\n{view.stderr}")
+    ssh_url = view.stdout.strip()
+
+    add_remote = subprocess.run(
+        ["git", "-C", repo_path, "remote", "add", "origin", ssh_url],
+        capture_output=True,
+        text=True,
+    )
+    if add_remote.returncode != 0:
+        raise click.ClickException(f"git remote add failed for '{repo_path}':\n{add_remote.stderr}")
+
+
 def _scaffold_new_repo(name: str) -> str:
     """Create a new local directory, init git, and push to GitHub as a private repo.
 
@@ -336,11 +376,19 @@ def _scaffold_new_repo(name: str) -> str:
       2. ``git init``, ``git add .``, ``git commit -m "init"``
       3. ``gh repo create <name> --private --source=. --push``
 
+    If the directory already exists and is a git repository, the scaffold is
+    treated as already complete — ``_ensure_remote`` is called to guarantee a
+    remote is configured, and the path is returned immediately.
+
+    If ``gh repo create`` fails because the repository name already exists on
+    GitHub, the error is treated as success and ``_ensure_remote`` is called to
+    configure the remote if needed.
+
     Args:
         name: Repository name (no slashes). Used for directory and GitHub repo names.
 
     Returns:
-        Absolute path to the newly-created local directory.
+        Absolute path to the newly-created (or already-existing) local directory.
 
     Raises:
         click.ClickException: If directory creation, git init, or gh repo create fails.
@@ -348,8 +396,13 @@ def _scaffold_new_repo(name: str) -> str:
     repo_path = os.path.abspath(name)
 
     if os.path.exists(repo_path):
+        if _is_git_repo(repo_path):
+            # Already scaffolded — reuse as-is, ensure remote is configured.
+            _ensure_remote(repo_path, name)
+            return repo_path
         raise click.ClickException(
-            f"Directory '{repo_path}' already exists. Remove it or choose a different name."
+            f"Directory '{repo_path}' already exists but is not a git repository. "
+            "Remove it or choose a different name."
         )
 
     try:
@@ -405,7 +458,10 @@ def _scaffold_new_repo(name: str) -> str:
         text=True,
     )
     if create.returncode != 0:
-        raise click.ClickException(f"gh repo create failed for '{name}':\n{create.stderr}")
+        if "Name already exists" in create.stderr or "already exists" in create.stderr.lower():
+            _ensure_remote(repo_path, name)
+        else:
+            raise click.ClickException(f"gh repo create failed for '{name}':\n{create.stderr}")
 
     return repo_path
 
