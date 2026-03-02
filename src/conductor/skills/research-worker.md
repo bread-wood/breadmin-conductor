@@ -135,7 +135,16 @@ Launch sub-agents in parallel using `Agent(isolation: "worktree")`.
 >    - Represents a genuinely new architectural/research question
 >    - Is NOT already covered by an existing issue (check: `gh issue list --state all --label research --limit 300 --json number,title`)
 >    - Would require a standalone research document to answer
->    - Use: `gh issue create --title "Research: <topic>" --label "research,triage" --milestone "<milestone name>" --body "..."`
+>    - Tag each recommendation in the doc's "Follow-Up Research Recommendations" section:
+>      - `[BLOCKS_IMPL]` — needed before the current implementation milestone can be designed
+>      - `[V2_RESEARCH]` — useful but doesn't block v1; belongs in a later research milestone
+>      - `[WONT_RESEARCH]` — not worth a standalone doc; note inline, don't file an issue
+>    - Only create GitHub issues for `[BLOCKS_IMPL]` and `[V2_RESEARCH]` items
+>    - To assign the milestone, inspect what milestones exist and their descriptions:
+>      `gh milestone list --repo <owner>/<repo>`
+>      Pick the lowest-numbered *research* milestone beyond the current one for `[V2_RESEARCH]` items.
+>      Use the current research milestone for `[BLOCKS_IMPL]` items.
+>    - Use: `gh issue create --title "Research: <topic>" --label "research,triage" --milestone "<resolved milestone name>" --body "..."`
 >    - Body MUST include: `## Spawned From`, `## Research Areas`, `## Deliverable`, `## Dependencies`
 >    - DO NOT create issues for: implementation tasks, data collection scripts, narrow empirical measurements, things already covered in existing docs
 >    - Add `triage` label to ALL follow-up issues — the orchestrator will score them; don't pre-filter, but be conservative
@@ -188,13 +197,29 @@ As **each agent completes** (do not wait for the entire batch):
 7. **Dispatch next batch** (up to 5 agents total active)
 8. **Continue** until active milestone queue is empty AND all agents complete
 
-### Step 4 — Completeness Check
+### Step 4 — Completeness Check and Research Gate
 
 When the pipeline drains for the active milestone:
 
-1. **Cross-cutting gap analysis**: Are there critical topics missing from the milestone that would block implementation?
-2. **Report any gaps** as new issues with the same milestone — do NOT auto-dispatch, leave for next session
-3. **Do NOT** generate follow-ups just to keep the pipeline going
+1. **Blocking gap analysis**: For each remaining open research issue in this milestone, ask:
+   *"Is there a specific implementation issue in the next milestone that cannot be designed
+   without this answer?"*
+   - YES → **blocking**: must dispatch before implementation begins; leave in current milestone
+   - NO → **non-blocking**: migrate to the next research milestone now:
+     ```bash
+     gh issue edit <N> --milestone "<next research milestone>"
+     ```
+
+2. **Ready-to-implement verdict**: If zero blocking issues remain after step 1:
+   - Declare: "Research milestone complete — ready to begin implementation."
+   - Do NOT create more research issues to fill the queue.
+   - The session report must include this verdict prominently.
+
+3. **Cross-cutting gap check**: Are there *blocking* topics not yet covered by any issue?
+   - If yes, file them as new issues in the current milestone — do NOT auto-dispatch.
+   - Apply the triage rubric and the `[BLOCKS_IMPL]` / `[V2_RESEARCH]` tags before filing.
+   - If no, leave it at that — a complete research milestone does not require every possible
+     question to be answered.
 
 ### Step 5 — Session Report
 
