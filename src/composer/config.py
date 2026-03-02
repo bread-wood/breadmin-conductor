@@ -105,6 +105,25 @@ class Config(BaseSettings):
         description="Directory for session checkpoints",
     )
 
+    # --- Git / GitHub ---
+    default_branch: str = Field(
+        default="main",
+        description="Expected default branch name for the repository",
+    )
+    github_repo: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("GITHUB_REPO", "github_repo"),
+        description='GitHub repository in "owner/repo" format',
+    )
+
+    # --- Health checks ---
+    max_orphaned_issues: int = Field(
+        default=5,
+        ge=0,
+        validation_alias=AliasChoices("CONDUCTOR_MAX_ORPHANED_ISSUES", "max_orphaned_issues"),
+        description="Maximum number of orphaned in-progress issues before health check fails",
+    )
+
     # --- Credential proxy ---
     api_key_helper: str | None = Field(
         default=None,
