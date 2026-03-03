@@ -3115,6 +3115,7 @@ def _run_plan_milestones(
     version: str,
     config: Config,
     checkpoint: Checkpoint,
+    local_path: str | None = None,
     dry_run: bool = False,
 ) -> None:
     """Dispatch a single plan-milestones agent to create a milestone pair and seed issues.
@@ -3128,10 +3129,21 @@ def _run_plan_milestones(
         version:    Version identifier (e.g. ``"MVP"``, ``"v2"``).
         config:     Validated Config instance.
         checkpoint: Active Checkpoint instance.
+        local_path: Absolute path to the local repo checkout (or None for remote-only).
         dry_run:    If True, print the prompt length without executing.
     """
     checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
     today = date.today().isoformat()
+
+    if local_path is not None:
+        spec_read_instruction = (
+            f"Read the spec from the local checkout:\n  cat {local_path}/docs/specs/{version}.md"
+        )
+    else:
+        spec_read_instruction = (
+            f"Read the spec using the GitHub API:\n"
+            f"  gh api repos/{repo}/contents/docs/specs/{version}.md --jq '.content' | base64 -d"
+        )
 
     base_prompt = (
         f"## Session Parameters\n"
@@ -3140,8 +3152,7 @@ def _run_plan_milestones(
         f"- Session Date: {today}\n\n"
         f"You are the plan-milestones orchestrator for the `{repo}` repository.\n"
         f"You are running in a headless temp directory (not inside the repo checkout).\n"
-        f"Read the spec using the GitHub API:\n"
-        f"  gh api repos/{repo}/contents/docs/specs/{version}.md --jq '.content' | base64 -d\n"
+        f"{spec_read_instruction}\n"
         f"Then create the milestone pair and file seed research issues"
         f" following the skill instructions below."
     )
@@ -3642,6 +3653,7 @@ def _run_pipeline_stage(
             version=version,
             config=_config,
             checkpoint=_checkpoint,
+            local_path=local_path,
             dry_run=dry_run,
         )
 
