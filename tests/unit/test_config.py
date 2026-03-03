@@ -85,13 +85,13 @@ def test_config_paths_default_to_home_composer(monkeypatch: pytest.MonkeyPatch) 
 
 
 # ---------------------------------------------------------------------------
-# Config loading — CONDUCTOR_* overrides
+# Config loading — COMPOSER_* overrides
 # ---------------------------------------------------------------------------
 
 
 def test_conductor_max_concurrency_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
-    """CONDUCTOR_MAX_CONCURRENCY overrides the default."""
-    for key, val in make_env(CONDUCTOR_MAX_CONCURRENCY="5").items():
+    """COMPOSER_MAX_CONCURRENCY overrides the default."""
+    for key, val in make_env(COMPOSER_MAX_CONCURRENCY="5").items():
         monkeypatch.setenv(key, val)
 
     config = Config()
@@ -99,8 +99,8 @@ def test_conductor_max_concurrency_env_var(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_conductor_max_concurrency_custom_value(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A custom CONDUCTOR_MAX_CONCURRENCY value is reflected in the config."""
-    for key, val in make_env(CONDUCTOR_MAX_CONCURRENCY="8").items():
+    """A custom COMPOSER_MAX_CONCURRENCY value is reflected in the config."""
+    for key, val in make_env(COMPOSER_MAX_CONCURRENCY="8").items():
         monkeypatch.setenv(key, val)
 
     config = Config()
@@ -108,8 +108,8 @@ def test_conductor_max_concurrency_custom_value(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_conductor_subscription_tier_max(monkeypatch: pytest.MonkeyPatch) -> None:
-    """CONDUCTOR_SUBSCRIPTION_TIER=max is accepted."""
-    for key, val in make_env(CONDUCTOR_SUBSCRIPTION_TIER="max").items():
+    """COMPOSER_SUBSCRIPTION_TIER=max is accepted."""
+    for key, val in make_env(COMPOSER_SUBSCRIPTION_TIER="max").items():
         monkeypatch.setenv(key, val)
 
     config = Config()
@@ -117,8 +117,8 @@ def test_conductor_subscription_tier_max(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_conductor_subscription_tier_max20x(monkeypatch: pytest.MonkeyPatch) -> None:
-    """CONDUCTOR_SUBSCRIPTION_TIER=max20x is accepted."""
-    for key, val in make_env(CONDUCTOR_SUBSCRIPTION_TIER="max20x").items():
+    """COMPOSER_SUBSCRIPTION_TIER=max20x is accepted."""
+    for key, val in make_env(COMPOSER_SUBSCRIPTION_TIER="max20x").items():
         monkeypatch.setenv(key, val)
 
     config = Config()
@@ -161,9 +161,9 @@ def test_missing_github_token_raises_configuration_error(
 def test_invalid_subscription_tier_raises_configuration_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An unrecognised CONDUCTOR_SUBSCRIPTION_TIER raises ConfigurationError."""
+    """An unrecognised COMPOSER_SUBSCRIPTION_TIER raises ConfigurationError."""
     monkeypatch.delenv("CLAUDECODE", raising=False)
-    for key, val in make_env(CONDUCTOR_SUBSCRIPTION_TIER="enterprise").items():
+    for key, val in make_env(COMPOSER_SUBSCRIPTION_TIER="enterprise").items():
         monkeypatch.setenv(key, val)
 
     with pytest.raises(ConfigurationError):
@@ -173,9 +173,9 @@ def test_invalid_subscription_tier_raises_configuration_error(
 def test_invalid_max_budget_type_raises_configuration_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A non-numeric CONDUCTOR_MAX_BUDGET_USD raises ConfigurationError."""
+    """A non-numeric COMPOSER_MAX_BUDGET_USD raises ConfigurationError."""
     monkeypatch.delenv("CLAUDECODE", raising=False)
-    for key, val in make_env(CONDUCTOR_MAX_BUDGET_USD="not-a-number").items():
+    for key, val in make_env(COMPOSER_MAX_BUDGET_USD="not-a-number").items():
         monkeypatch.setenv(key, val)
 
     with pytest.raises(ConfigurationError):
@@ -244,7 +244,7 @@ def test_build_subprocess_env_does_not_include_parent_env_secrets() -> None:
             "AWS_SECRET_ACCESS_KEY": "top-secret",
             "DATABASE_URL": "postgres://user:pass@host/db",
             "GOOGLE_API_KEY": "google-key",
-            "CONDUCTOR_SOME_INTERNAL": "internal-value",
+            "COMPOSER_SOME_INTERNAL": "internal-value",
             "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
         },
     ):
@@ -253,7 +253,7 @@ def test_build_subprocess_env_does_not_include_parent_env_secrets() -> None:
     assert "AWS_SECRET_ACCESS_KEY" not in env
     assert "DATABASE_URL" not in env
     assert "GOOGLE_API_KEY" not in env
-    assert "CONDUCTOR_SOME_INTERNAL" not in env
+    assert "COMPOSER_SOME_INTERNAL" not in env
     assert "SSH_AUTH_SOCK" not in env
 
 
@@ -347,7 +347,7 @@ def test_build_subprocess_env_includes_anthropic_api_key() -> None:
 
 def test_sessions_dir_derived_from_log_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     """sessions_dir is log_dir.expanduser() / 'sessions'."""
-    for key, val in make_env(CONDUCTOR_LOG_DIR="/tmp/test-logs").items():
+    for key, val in make_env(COMPOSER_LOG_DIR="/tmp/test-logs").items():
         monkeypatch.setenv(key, val)
 
     config = Config()
@@ -356,7 +356,7 @@ def test_sessions_dir_derived_from_log_dir(monkeypatch: pytest.MonkeyPatch) -> N
 
 def test_cost_ledger_derived_from_log_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     """cost_ledger is log_dir.expanduser() / 'cost.jsonl'."""
-    for key, val in make_env(CONDUCTOR_LOG_DIR="/tmp/test-logs").items():
+    for key, val in make_env(COMPOSER_LOG_DIR="/tmp/test-logs").items():
         monkeypatch.setenv(key, val)
 
     config = Config()

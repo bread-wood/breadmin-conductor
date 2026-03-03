@@ -42,14 +42,14 @@ class Config(BaseSettings):
     """Runtime configuration for composer commands."""
 
     model_config = SettingsConfigDict(
-        env_prefix="CONDUCTOR_",
+        env_prefix="COMPOSER_",
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
         populate_by_name=True,
     )
 
-    # --- Required credentials (no CONDUCTOR_ prefix) ---
+    # --- Required credentials (no COMPOSER_ prefix) ---
     anthropic_api_key: str = Field(
         validation_alias=AliasChoices("ANTHROPIC_API_KEY", "anthropic_api_key"),
         description="Anthropic API key",
@@ -151,7 +151,7 @@ class Config(BaseSettings):
     max_orphaned_issues: int = Field(
         default=5,
         ge=0,
-        validation_alias=AliasChoices("CONDUCTOR_MAX_ORPHANED_ISSUES", "max_orphaned_issues"),
+        validation_alias=AliasChoices("COMPOSER_MAX_ORPHANED_ISSUES", "max_orphaned_issues"),
         description="Maximum number of orphaned in-progress issues before health check fails",
     )
 
@@ -248,14 +248,14 @@ def _reraise_validation_error(exc: Exception) -> None:
 
 def _field_to_env_var(field_name: str) -> str:
     """Convert a Config field name to its corresponding environment variable name."""
-    # Fields with custom aliases (no CONDUCTOR_ prefix)
+    # Fields with custom aliases (no COMPOSER_ prefix)
     no_prefix = {
         "anthropic_api_key": "ANTHROPIC_API_KEY",
         "github_token": "GITHUB_TOKEN",
     }
     if field_name in no_prefix:
         return no_prefix[field_name]
-    return "CONDUCTOR_" + field_name.upper()
+    return "COMPOSER_" + field_name.upper()
 
 
 # ---------------------------------------------------------------------------

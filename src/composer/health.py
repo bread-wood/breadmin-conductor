@@ -202,7 +202,7 @@ def _check_default_branch(config: Config) -> CheckResult:
         status="warn",
         message=f"Mismatch: config={configured_branch}, repo={actual_branch}",
         remediation=(
-            f"Set CONDUCTOR_DEFAULT_BRANCH={actual_branch} or update config to match "
+            f"Set COMPOSER_DEFAULT_BRANCH={actual_branch} or update config to match "
             f"the repo's default branch ({actual_branch})."
         ),
     )
