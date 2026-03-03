@@ -214,7 +214,7 @@ def run(
         )
 
     if verbose:
-        print("  (first response may take a few minutes…)", file=sys.stderr, flush=True)
+        print("  agent starting…", file=sys.stderr, flush=True)
 
     proc = subprocess.Popen(
         cmd,
