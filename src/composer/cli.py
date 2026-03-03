@@ -3120,6 +3120,7 @@ def _run_plan_milestones(
         )
         if result.stderr:
             click.echo(f"stderr:\n{result.stderr[:2000]}", err=True)
+        raise SystemExit(1)
     else:
         click.echo(f"Plan-milestones complete for version '{version}'.")
 
