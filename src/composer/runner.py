@@ -214,12 +214,6 @@ def run(
         )
 
     if verbose:
-        claude_config_dir = env.get("CLAUDE_CONFIG_DIR", "")
-        print(
-            f"  [debug] subprocess config dir: {claude_config_dir}",
-            file=sys.stderr,
-            flush=True,
-        )
         print("  (first response may take a few minutes…)", file=sys.stderr, flush=True)
 
     proc = subprocess.Popen(
