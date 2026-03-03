@@ -214,7 +214,7 @@ def run(
         )
 
     if verbose:
-        print("  agent starting…", file=sys.stderr, flush=True)
+        print("composer: agent starting…", file=sys.stderr, flush=True)
 
     proc = subprocess.Popen(
         cmd,
