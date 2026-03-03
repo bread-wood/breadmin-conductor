@@ -1,12 +1,10 @@
 # brimstone
 
-brimstone — headless Claude Code orchestrator for automated GitHub issue workstreams.
+Headless Claude Code orchestrator for automated GitHub issue workstreams.
 
-Runs a four-stage research → design → implementation pipeline entirely from the terminal,
-invoking `claude -p` headlessly (no human at the terminal) to process GitHub issues,
-write research docs, translate findings into scoped implementation issues, and merge PRs.
-Each stage is driven by a dedicated CLI command that dispatches sub-agents in parallel and
-monitors CI until all work is complete.
+Runs a multi-stage pipeline (research → design → scoping → implementation → QA → release)
+against a target GitHub repo by invoking `claude -p` headlessly. Each stage dispatches
+sub-agents in parallel, monitors their output, and merges results back to the default branch.
 
 ## Installation
 
@@ -14,72 +12,82 @@ monitors CI until all work is complete.
 uv sync
 ```
 
-Requires Python 3.11+ and the following external tools on `$PATH`:
+Requires Python 3.11+ and the following tools on `$PATH`:
 
 - `claude` — Claude Code CLI (`claude -p` headless mode)
 - `gh` — GitHub CLI (authenticated)
 - `git`
 
-## Worker Pipeline
+## Pipeline
 
 ```
-plan-issues → research-worker → design-worker → impl-worker
+spec → init → research → design → scoping → implementation → qa → release
 ```
 
-Each product version flows through all four stages in order.
-No stage may be skipped. See `CLAUDE.md` for the full orchestration protocol.
+No stage may be skipped. Each stage is triggered via `brimstone run --<stage>`.
+See `CLAUDE.md` for the full orchestration protocol.
 
-## Entry Points
+## Commands
 
-| Command | Description |
-|---------|-------------|
-| `research-worker` | Processes research issues for a milestone; writes docs to `docs/research/` |
-| `design-worker` | Translates completed research docs into scoped implementation issues |
-| `plan-issues` | Plans milestones and seeds research issues for the next version |
-| `impl-worker` | Claims impl issues, dispatches sub-agents, monitors CI, and merges PRs |
-| `brimstone` | Admin commands: `health` (preflight checks) and `cost` (cost ledger summary) |
+```
+brimstone run     Run one or more pipeline stages for a milestone
+brimstone init    Upload spec + create milestone + seed research issues
+brimstone health  Preflight checks (credentials, repo state, active worktrees)
+brimstone cost    Cost ledger summary
+brimstone adopt   Adopt an existing repo (not yet implemented)
+```
 
-## Quick Usage
+### `brimstone run`
 
 ```bash
-# Preflight check
-brimstone health --repo OWNER/REPO
+# Research stage
+brimstone run --research --repo OWNER/REPO --milestone "v0.1.0-cold-start"
 
-# Plan milestones and seed research issues for a new version
-plan-issues --repo OWNER/REPO
+# Design stage (after research completes)
+brimstone run --design --repo OWNER/REPO --milestone "v0.1.0-cold-start"
 
-# Research phase
-research-worker --repo OWNER/REPO --milestone "MVP Research"
+# Implementation stage
+brimstone run --impl --repo OWNER/REPO --milestone "v0.1.0-cold-start"
 
-# Design phase (after research declares complete)
-design-worker --repo OWNER/REPO --research-milestone "MVP Research"
-
-# Implementation phase
-impl-worker --repo OWNER/REPO --milestone "MVP Implementation"
-
-# Show cost ledger
-brimstone cost
+# All stages in order
+brimstone run --all --repo OWNER/REPO --milestone "v0.1.0-cold-start"
 ```
 
-Each worker accepts `--dry-run` (print without executing), `--model` (override Claude model),
-`--max-budget` (USD cap), `--max-turns`, and `--resume <run-id>` (resume a previous session).
+Common flags: `--dry-run`, `--model <model-id>`, `--max-budget <usd>`.
+
+### `brimstone init`
+
+```bash
+brimstone init --repo OWNER/REPO --spec docs/specs/v0.1.x-cold-start.md
+```
+
+Reads the spec, creates the GitHub milestone, and seeds the first batch of
+`stage/research` issues.
+
+### `--repo` resolution
+
+| Invocation | Behaviour |
+|---|---|
+| *(no flag)* | Operates on the current working directory. Fails if cwd is not a git repo. |
+| `--repo owner/name` | Clones the remote repo to a temp dir and operates on it. |
+| `--repo path/to/local/dir` | Operates on the local directory. Fails if not a git repo. |
+| `--repo name` | Scaffolds a new private GitHub repo named `name`, then operates on it. |
 
 ## Module Listing
 
 ```
 src/brimstone/
-├── cli.py          ← Click entry points: research-worker, design-worker,
-│                     plan-issues, impl-worker, brimstone
-├── config.py       ← Config pydantic-settings model; env/flag resolution
-├── runner.py       ← claude -p subprocess invocation; stream-json capture
+├── cli.py          ← Click entry point: brimstone (subcommands: run, init, health, cost, adopt)
+├── config.py       ← Config pydantic-settings model; env/flag resolution; subprocess env builder
+├── runner.py       ← claude -p subprocess invocation; stream-json capture; RunResult
 ├── session.py      ← Session ID persistence and --resume logic
 ├── logger.py       ← Per-session JSONL logging and cost ledger
-├── health.py       ← Preflight checks (claude, gh, git, ANTHROPIC_API_KEY)
+├── health.py       ← Preflight checks (claude, gh, git, credentials, worktrees)
 └── skills/
-    ├── impl-worker.md      ← Bundled skill prompt for impl-worker
-    ├── research-worker.md  ← Bundled skill prompt for research-worker
-    ├── design-worker.md    ← Bundled skill prompt for design-worker
-    └── plan-milestones.md  ← Bundled skill prompt for plan-issues
+    ├── impl-worker.md      ← Bundled system prompt for the implementation stage
+    ├── research-worker.md  ← Bundled system prompt for the research stage
+    ├── design-worker.md    ← Bundled system prompt for the design stage
+    └── plan-milestones.md  ← Bundled system prompt for brimstone init
 ```
 
 ## Key Types
@@ -92,15 +100,19 @@ src/brimstone/
 
 ## Configuration
 
-Set environment variables or create a `.env` file:
+Set environment variables or create a `.env` file in the working directory:
 
-| Variable | Description |
-|----------|-------------|
-| `ANTHROPIC_API_KEY` | Required — Anthropic API key |
-| `BRIMSTONE_MODEL` | Claude model to use (default: `claude-opus-4-5`) |
-| `BRIMSTONE_MAX_BUDGET` | USD budget cap per session |
-| `BRIMSTONE_MAX_TURNS` | Max turns per `claude -p` invocation |
-| `BRIMSTONE_DATA_DIR` | Directory for checkpoints and logs (default: `~/.brimstone`) |
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `ANTHROPIC_API_KEY` | Yes | — | Anthropic API key |
+| `BRIMSTONE_GH_TOKEN` or `GH_TOKEN` | Yes | — | GitHub token passed to sub-agents |
+| `BRIMSTONE_MODEL` | No | `claude-opus-4-6` | Claude model ID |
+| `BRIMSTONE_MAX_BUDGET_USD` | No | `5.00` | USD budget cap per session |
+| `BRIMSTONE_MAX_CONCURRENCY` | No | `5` | Max parallel sub-agents |
+| `BRIMSTONE_AGENT_TIMEOUT_MINUTES` | No | `30` | Timeout per sub-agent |
+| `BRIMSTONE_DEFAULT_BRANCH` | No | `main` | Default branch name of the target repo |
+| `BRIMSTONE_LOG_DIR` | No | `~/.brimstone/logs` | Session logs and cost ledger |
+| `BRIMSTONE_CHECKPOINT_DIR` | No | `~/.brimstone/checkpoints` | Session checkpoints |
 
 ## Dependencies
 
