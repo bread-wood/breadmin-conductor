@@ -58,11 +58,13 @@ Common flags: `--dry-run`, `--model <model-id>`, `--max-budget <usd>`.
 ### `brimstone init`
 
 ```bash
-brimstone init --repo OWNER/REPO --spec docs/specs/v0.1.x-cold-start.md
+brimstone init --repo OWNER/REPO \
+               --spec docs/specs/v0.1.x-cold-start.md \
+               --milestone "v0.1.0-cold-start"
 ```
 
-Reads the spec, creates the GitHub milestone, and seeds the first batch of
-`stage/research` issues.
+Uploads the spec to `docs/specs/<spec-stem>.md` in the target repo, creates the
+GitHub milestone with the given name, and seeds the first batch of `stage/research` issues.
 
 ### `--repo` resolution
 

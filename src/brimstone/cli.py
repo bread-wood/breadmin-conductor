@@ -4260,6 +4260,7 @@ def _run_plan_milestones(
     checkpoint: Checkpoint,
     local_path: str | None = None,
     dry_run: bool = False,
+    spec_stem: str | None = None,
 ) -> None:
     """Dispatch a single plan-milestones agent to create a milestone pair and seed issues.
 
@@ -4269,23 +4270,27 @@ def _run_plan_milestones(
 
     Args:
         repo:       GitHub repository in ``owner/repo`` format.
-        version:    Version identifier (e.g. ``"MVP"``, ``"v2"``).
+        version:    Milestone name (e.g. ``"v0.1.0-cold-start"``).
         config:     Validated Config instance.
         checkpoint: Active Checkpoint instance.
         local_path: Absolute path to the local repo checkout (or None for remote-only).
         dry_run:    If True, print the prompt length without executing.
+        spec_stem:  Filename stem of the spec file (e.g. ``"v0.1.x-cold-start"``).
+                    When None, falls back to ``version``.
     """
+    if spec_stem is None:
+        spec_stem = version
     checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
     today = date.today().isoformat()
 
     if local_path is not None:
         spec_read_instruction = (
-            f"Read the spec from the local checkout:\n  cat {local_path}/docs/specs/{version}.md"
+            f"Read the spec from the local checkout:\n  cat {local_path}/docs/specs/{spec_stem}.md"
         )
     else:
         spec_read_instruction = (
             f"Read the spec using the GitHub API:\n"
-            f"  gh api repos/{repo}/contents/docs/specs/{version}.md --jq '.content' | base64 -d"
+            f"  gh api repos/{repo}/contents/docs/specs/{spec_stem}.md --jq '.content' | base64 -d"
         )
 
     dry_run_instruction = (
@@ -4712,11 +4717,17 @@ def run(
     type=click.Path(dir_okay=False),
     help="Path to the .md spec file to seed into the target repo.",
 )
+@click.option(
+    "--milestone",
+    required=True,
+    help="Milestone name to create on GitHub (e.g. 'v0.1.0-cold-start').",
+)
 @click.option("--model", default=None, help="Override Claude model")
 @click.option("--dry-run", is_flag=True, help="Print what would happen without executing")
 def init(
     repo: str,
     spec: str,
+    milestone: str,
     model: str | None,
     dry_run: bool,
 ) -> None:
@@ -4725,10 +4736,11 @@ def init(
     Equivalent to: upload spec → run plan-milestones.
 
     After this command completes, use:
-      brimstone run --research --milestone <version>
+      brimstone run --research --milestone <milestone>
     """
     resolved_spec = _validate_spec_path(spec)
-    version = resolved_spec.stem
+    spec_stem = resolved_spec.stem  # e.g. "v0.1.x-cold-start" — used for the file path
+    # milestone is the explicit GitHub milestone name, e.g. "v0.1.0-cold-start"
 
     repo_ref, local_path = _resolve_repo(repo)
     overrides: dict = {"github_repo": repo_ref or None, "target_repo": repo_ref or None}
@@ -4749,27 +4761,28 @@ def init(
     _config, _checkpoint = startup_sequence(
         config=config,
         checkpoint_path=checkpoint_path,
-        milestone=version,
+        milestone=milestone,
         stage="plan-milestones",
         skip_checks=_HEADLESS_SKIP,
     )
 
     if dry_run:
-        click.echo(f"[dry-run] would upload {resolved_spec} to {repo_ref}/docs/specs/{version}.md")
+        click.echo(f"[dry-run] would upload {resolved_spec} to {repo_ref}/docs/specs/{spec_stem}.md")
         click.echo(f"[dry-run] would add {_BRIMSTONE_BOT} as collaborator on {repo_ref}")
         _setup_ci(repo_ref, _config, dry_run=True)
     else:
         _add_brimstone_bot_collaborator(repo_ref)
-        _upload_spec_to_repo(repo_ref, resolved_spec, version)
+        _upload_spec_to_repo(repo_ref, resolved_spec, spec_stem)
         _setup_ci(repo_ref, _config, dry_run=False)
 
     _run_plan_milestones(
         repo=repo_ref,
-        version=version,
+        version=milestone,
         config=_config,
         checkpoint=_checkpoint,
         local_path=local_path,
         dry_run=dry_run,
+        spec_stem=spec_stem,
     )
 
 
