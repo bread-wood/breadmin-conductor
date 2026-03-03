@@ -548,8 +548,21 @@ def _resolve_repo(repo_arg: str | None) -> tuple[str, str | None]:
         return repo_ref, abs_path
 
     # -----------------------------------------------------------------------
-    # Case 4: Plain name with no slashes → scaffold a new private repo
+    # Case 4: Plain name with no slashes.
+    # First check if the repo already exists on GitHub (gh repo view).
+    # If it does, use it as a remote-only reference — no local scaffolding.
+    # Only scaffold when the repo genuinely does not exist yet.
     # -----------------------------------------------------------------------
+    view_result = subprocess.run(
+        ["gh", "repo", "view", repo_arg, "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+        capture_output=True,
+        text=True,
+    )
+    if view_result.returncode == 0 and view_result.stdout.strip():
+        # Repo already exists on GitHub — use it as a remote reference
+        return view_result.stdout.strip(), None
+
+    # Repo does not exist — scaffold it
     local_path = _scaffold_new_repo(repo_arg)
     # After scaffolding, infer the remote owner/name
     repo_ref = _infer_github_repo_from_path(local_path) or repo_arg
@@ -3475,12 +3488,17 @@ def plan_issues(
     "--version",
     default=None,
     help=(
-        "Version name (e.g. 'MVP', 'v2'). "
-        "Required unless --spec is given, in which case it defaults to the spec filename stem."
+        "Version name for the milestone (e.g. 'v1', 'MVP'). "
+        "Required unless --spec is given, in which case it defaults to the spec filename stem. "
+        "Tip: name your spec file v1.md, or pass --version v1 explicitly."
     ),
 )
 @click.option("--model", default=None, help="Override Claude model")
-@click.option("--dry-run", is_flag=True, help="Print planned milestones without creating them")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Run the planning agent and display the plan without creating anything on GitHub.",
+)
 @click.option(
     "--spec",
     type=click.Path(dir_okay=False),

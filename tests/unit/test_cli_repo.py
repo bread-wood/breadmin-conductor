@@ -130,44 +130,73 @@ class TestResolveRepoRemoteMode:
 # ---------------------------------------------------------------------------
 
 
+def _gh_not_found() -> MagicMock:
+    """Fake subprocess result for 'gh repo view' when the repo does not exist."""
+    m = MagicMock()
+    m.returncode = 1
+    m.stdout = ""
+    return m
+
+
+def _gh_found(name_with_owner: str) -> MagicMock:
+    """Fake subprocess result for 'gh repo view' when the repo exists."""
+    m = MagicMock()
+    m.returncode = 0
+    m.stdout = name_with_owner + "\n"
+    return m
+
+
 class TestResolveRepoScaffoldMode:
-    def test_plain_name_triggers_scaffold(self, tmp_path: Path) -> None:
-        """Plain name (no slash) triggers _scaffold_new_repo."""
+    def test_plain_name_triggers_scaffold_when_repo_not_on_github(self, tmp_path: Path) -> None:
+        """Plain name (no slash) triggers _scaffold_new_repo when repo doesn't exist on GitHub."""
         fake_path = str(tmp_path / "mynewrepo")
-        with patch("composer.cli._scaffold_new_repo", return_value=fake_path) as mock_scaffold:
-            with patch(
-                "composer.cli._infer_github_repo_from_path",
-                return_value="myuser/mynewrepo",
-            ):
-                repo_ref, local_path = _resolve_repo("mynewrepo")
+        with patch("composer.cli.subprocess.run", return_value=_gh_not_found()):
+            with patch("composer.cli._scaffold_new_repo", return_value=fake_path) as mock_scaffold:
+                with patch(
+                    "composer.cli._infer_github_repo_from_path",
+                    return_value="myuser/mynewrepo",
+                ):
+                    repo_ref, local_path = _resolve_repo("mynewrepo")
         mock_scaffold.assert_called_once_with("mynewrepo")
         assert local_path == fake_path
+
+    def test_plain_name_uses_existing_remote_repo(self) -> None:
+        """Plain name returns (owner/name, None) when the repo already exists on GitHub."""
+        with patch(
+            "composer.cli.subprocess.run", return_value=_gh_found("bread-wood/calculator-cli")
+        ):
+            repo_ref, local_path = _resolve_repo("calculator-cli")
+        assert repo_ref == "bread-wood/calculator-cli"
+        assert local_path is None
 
     def test_scaffold_called_with_correct_name(self, tmp_path: Path) -> None:
         """The name passed to _scaffold_new_repo matches the CLI argument."""
         fake_path = str(tmp_path / "calculator-cli")
-        with patch("composer.cli._scaffold_new_repo", return_value=fake_path) as mock_scaffold:
-            with patch("composer.cli._infer_github_repo_from_path", return_value=None):
-                _resolve_repo("calculator-cli")
+        with patch("composer.cli.subprocess.run", return_value=_gh_not_found()):
+            with patch("composer.cli._scaffold_new_repo", return_value=fake_path) as mock_scaffold:
+                with patch("composer.cli._infer_github_repo_from_path", return_value=None):
+                    _resolve_repo("calculator-cli")
         mock_scaffold.assert_called_once_with("calculator-cli")
 
     def test_scaffold_returns_repo_ref_from_infer(self, tmp_path: Path) -> None:
         """When _infer_github_repo_from_path succeeds, repo_ref is owner/name."""
         fake_path = str(tmp_path / "testapp")
-        with patch("composer.cli._scaffold_new_repo", return_value=fake_path):
-            with patch(
-                "composer.cli._infer_github_repo_from_path",
-                return_value="bread-wood/testapp",
-            ):
-                repo_ref, _ = _resolve_repo("testapp")
+        with patch("composer.cli.subprocess.run", return_value=_gh_not_found()):
+            with patch("composer.cli._scaffold_new_repo", return_value=fake_path):
+                with patch(
+                    "composer.cli._infer_github_repo_from_path",
+                    return_value="bread-wood/testapp",
+                ):
+                    repo_ref, _ = _resolve_repo("testapp")
         assert repo_ref == "bread-wood/testapp"
 
     def test_scaffold_falls_back_to_name_when_infer_fails(self, tmp_path: Path) -> None:
         """When _infer_github_repo_from_path returns None, repo_ref is the name."""
         fake_path = str(tmp_path / "testapp")
-        with patch("composer.cli._scaffold_new_repo", return_value=fake_path):
-            with patch("composer.cli._infer_github_repo_from_path", return_value=None):
-                repo_ref, _ = _resolve_repo("testapp")
+        with patch("composer.cli.subprocess.run", return_value=_gh_not_found()):
+            with patch("composer.cli._scaffold_new_repo", return_value=fake_path):
+                with patch("composer.cli._infer_github_repo_from_path", return_value=None):
+                    repo_ref, _ = _resolve_repo("testapp")
         assert repo_ref == "testapp"
 
 

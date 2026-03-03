@@ -353,7 +353,12 @@ def _print_progress(event: dict, print_text_output: bool = False) -> None:
             elif block.get("type") == "text" and print_text_output:
                 text = block.get("text", "")
                 if text.strip():
-                    print(text, flush=True)
+                    print(text, end="", flush=True)
+
+    elif event_type == "result" and print_text_output:
+        text = event.get("result", "")
+        if text and text.strip():
+            print(text, flush=True)
 
     elif event_type == "user":
         message = event.get("message")
