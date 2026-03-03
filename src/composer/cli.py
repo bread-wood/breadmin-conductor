@@ -3195,6 +3195,7 @@ def _run_plan_milestones(
         allowed_tools=["Bash", "Read", "Glob", "Grep"],
         env=env,
         max_turns=200,
+        print_text_output=dry_run,
         timeout_seconds=config.agent_timeout_minutes * 60,
         model=config.model,
     )

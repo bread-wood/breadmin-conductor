@@ -130,6 +130,7 @@ def run(
     append_system_prompt_file: Path | None = None,
     mcp_config: Path | None = None,
     verbose: bool = True,
+    print_text_output: bool = False,
     timeout_seconds: float | None = None,
     model: str | None = None,
 ) -> RunResult:
@@ -234,7 +235,7 @@ def run(
     )
 
     result_event, all_events, stderr_text, overage_detected, timed_out = _parse_stream(
-        proc, verbose=verbose, timeout_seconds=timeout_seconds
+        proc, verbose=verbose, print_text_output=print_text_output, timeout_seconds=timeout_seconds
     )
     proc.wait()
     exit_code = proc.returncode
@@ -316,12 +317,15 @@ def _assemble_command(
 # ---------------------------------------------------------------------------
 
 
-def _print_progress(event: dict) -> None:
+def _print_progress(event: dict, print_text_output: bool = False) -> None:
     """Print a one-line terminal summary of a stream-json event to stderr.
 
     Shows tool invocations (assistant → tool_use blocks) and brief tool
     output (user → tool_result blocks) so the operator can see what Claude
     is doing without waiting for the full session to complete.
+
+    When print_text_output is True, also prints assistant text content blocks
+    to stdout so the agent's narrative output is visible in real time.
     """
     event_type = event.get("type")
 
@@ -330,21 +334,26 @@ def _print_progress(event: dict) -> None:
         if not isinstance(message, dict):
             return
         for block in message.get("content", []):
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
+            if not isinstance(block, dict):
                 continue
-            name = block.get("name", "?")
-            inp = block.get("input") or {}
-            if name == "Bash":
-                detail = (inp.get("command") or "").split("\n")[0][:120]
-            elif name in ("Read", "Write", "Edit", "NotebookEdit"):
-                detail = inp.get("file_path", "")
-            elif name == "Glob":
-                detail = inp.get("pattern", "")
-            elif name == "Grep":
-                detail = inp.get("pattern", "")
-            else:
-                detail = str(inp)[:80]
-            print(f"  → {name}: {detail}", file=sys.stderr, flush=True)
+            if block.get("type") == "tool_use":
+                name = block.get("name", "?")
+                inp = block.get("input") or {}
+                if name == "Bash":
+                    detail = (inp.get("command") or "").split("\n")[0][:120]
+                elif name in ("Read", "Write", "Edit", "NotebookEdit"):
+                    detail = inp.get("file_path", "")
+                elif name == "Glob":
+                    detail = inp.get("pattern", "")
+                elif name == "Grep":
+                    detail = inp.get("pattern", "")
+                else:
+                    detail = str(inp)[:80]
+                print(f"  → {name}: {detail}", file=sys.stderr, flush=True)
+            elif block.get("type") == "text" and print_text_output:
+                text = block.get("text", "")
+                if text.strip():
+                    print(text, flush=True)
 
     elif event_type == "user":
         message = event.get("message")
@@ -378,6 +387,7 @@ def _print_progress(event: dict) -> None:
 def _parse_stream(
     proc: subprocess.Popen,
     verbose: bool = True,
+    print_text_output: bool = False,
     timeout_seconds: float | None = None,
 ) -> tuple[dict | None, list[dict], str, bool, bool]:
     """Read stream-json events from proc.stdout until EOF or timeout.
@@ -454,7 +464,7 @@ def _parse_stream(
 
                         all_events.append(event)
                         if verbose:
-                            _print_progress(event)
+                            _print_progress(event, print_text_output=print_text_output)
                         event_type = event.get("type")
 
                         if event_type == "result":
