@@ -64,13 +64,19 @@ composer plan-milestones --repo calculator-cli --spec docs/specs/calculator.md -
 
 ### Step 0 — Read the Spec
 
-Before doing anything else, locate and read the spec file for the target version:
+Before doing anything else, locate and read the spec file for the target version.
 
+**For remote repos** (`owner/name` format — running headless outside the repo checkout):
 ```bash
-cat docs/specs/<version>.md
+gh api repos/<owner>/<repo>/contents/docs/specs/<version>.md --jq '.content' | base64 -d
 ```
 
-**If the spec file does not exist**, halt immediately with this error:
+**For local repos** (path format — running inside or alongside the repo checkout):
+```bash
+cat <local_path>/docs/specs/<version>.md
+```
+
+**If the spec file does not exist** (the API returns a 404 or the local file is missing), halt immediately with this error:
 
 ```
 Error: No spec found at docs/specs/<version>.md.

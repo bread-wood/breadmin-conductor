@@ -6,7 +6,9 @@ CLI flags take precedence over env vars; env vars take precedence over defaults.
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -295,8 +297,34 @@ def build_subprocess_env(
     # Resolve the API key — either from the helper script or directly
     api_key = _resolve_api_key(config)
 
-    # Create a fresh temp dir for Claude's config isolation
+    # Create a temp dir for Claude's config isolation.
     claude_config_dir = tempfile.mkdtemp(prefix="composer-claude-config-")
+    claude_home = Path(os.environ.get("HOME", "~")).expanduser() / ".claude"
+
+    # Seed the statsig cache so the SDK doesn't hang on a cold-start network
+    # fetch when cached evaluations are absent.
+    real_statsig = claude_home / "statsig"
+    if real_statsig.is_dir():
+        shutil.copytree(str(real_statsig), os.path.join(claude_config_dir, "statsig"))
+
+    # Write a minimal settings.json so Claude Code skips the first-run
+    # dangerous-mode consent dialog (which blocks on /dev/tty when absent).
+    settings_path = Path(claude_config_dir) / "settings.json"
+    settings_path.write_text(
+        json.dumps({"skipDangerousModePermissionPrompt": True}),
+        encoding="utf-8",
+    )
+
+    # Pre-seed policy-limits.json with allow_remote_control:false so that when
+    # Claude fetches the same value from the API, it sees no change and skips
+    # the remote-control shutdown handler.  That handler deadlocks in headless
+    # mode when the remote-control server was never started (introduced in
+    # Claude Code ~2.1.58 when Remote Control was expanded to all users).
+    policy_limits_path = Path(claude_config_dir) / "policy-limits.json"
+    policy_limits_path.write_text(
+        json.dumps({"restrictions": {"allow_remote_control": {"allowed": False}}}),
+        encoding="utf-8",
+    )
 
     env: dict[str, str] = {
         # Shell essentials
@@ -320,6 +348,9 @@ def build_subprocess_env(
         "DISABLE_TELEMETRY": "1",
         "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
         "ENABLE_TOOL_SEARCH": "false",
+        # Suppress nonessential startup network calls that can deadlock in
+        # headless mode (e.g. the remote-control keepalive infrastructure).
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     }
 
     # Include the resolved API key if available

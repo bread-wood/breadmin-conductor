@@ -47,6 +47,7 @@ MAX_PROMPT_CHARS: int = 16_000
 TRIAGE_LABEL: str = "triage"
 RESEARCH_LABEL: str = "research"
 BACKOFF_SLEEP_SECONDS: int = 30
+STALL_MAX_ITERATIONS: int = 5  # 5 × BACKOFF_SLEEP_SECONDS = 2.5 min before escalation
 
 # ---------------------------------------------------------------------------
 # Startup sequence
@@ -1294,6 +1295,7 @@ def _run_research_worker(
     gov = UsageGovernor(config, checkpoint)
     checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
     retry_counts: dict[int, int] = {}
+    stall_count: int = 0
 
     today = date.today().isoformat()
 
@@ -1372,13 +1374,34 @@ def _run_research_worker(
         if not unblocked:
             # Blockers exist but all are blocked by dependencies — wait or sleep
             if gov._active_agents == 0:
-                # Nothing is running and nothing is unblocked — unusual; sleep and retry
+                # Nothing is running and nothing is unblocked — detect stall
+                stall_count += 1
+                if stall_count >= STALL_MAX_ITERATIONS:
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="dispatch",
+                        event_type="human_escalate",
+                        payload={
+                            "reason": "deadlock_detected",
+                            "stall_iterations": stall_count,
+                            "stall_duration_seconds": stall_count * BACKOFF_SLEEP_SECONDS,
+                            "action_required": (
+                                "All blocking research issues are dependency-blocked "
+                                "and no agents are running. Manual intervention required "
+                                "to resolve the dependency cycle or close/skip issues."
+                            ),
+                        },
+                        log_dir=config.log_dir.expanduser(),
+                    )
+                    break
                 time.sleep(BACKOFF_SLEEP_SECONDS)
                 continue
             else:
+                stall_count = 0
                 time.sleep(BACKOFF_SLEEP_SECONDS)
                 continue
 
+        stall_count = 0
         ranked = _sort_issues(unblocked)
         issue = ranked[0]
         issue_number: int = issue["number"]
@@ -3040,8 +3063,11 @@ def _run_plan_milestones(
         f"- Version: {version}\n"
         f"- Session Date: {today}\n\n"
         f"You are the plan-milestones orchestrator for the `{repo}` repository.\n"
-        f"Read the spec at `docs/specs/{version}.md`, create the milestone pair, "
-        f"and file seed research issues following the skill instructions below."
+        f"You are running in a headless temp directory (not inside the repo checkout).\n"
+        f"Read the spec using the GitHub API:\n"
+        f"  gh api repos/{repo}/contents/docs/specs/{version}.md --jq '.content' | base64 -d\n"
+        f"Then create the milestone pair and file seed research issues"
+        f" following the skill instructions below."
     )
     prompt = inject_skill("plan-milestones", base_prompt)
 
@@ -3081,6 +3107,7 @@ def _run_plan_milestones(
             "subtype": result.subtype,
             "is_error": result.is_error,
             "error_code": result.error_code,
+            "stderr": result.stderr[:2000] if result.stderr else "",
         },
         log_dir=config.log_dir.expanduser(),
     )
@@ -3091,6 +3118,8 @@ def _run_plan_milestones(
             f"Plan-milestones completed with error: {result.subtype} / {result.error_code}",
             err=True,
         )
+        if result.stderr:
+            click.echo(f"stderr:\n{result.stderr[:2000]}", err=True)
     else:
         click.echo(f"Plan-milestones complete for version '{version}'.")
 
@@ -3654,6 +3683,19 @@ def run(
     if version is None:
         if resolved_spec is not None:
             version = resolved_spec.stem
+        elif from_stage is not None:
+            # Resuming from a mid-pipeline stage — infer version (and repo) from checkpoint.
+            _chk_path = Path("~/.composer/checkpoints/current.json").expanduser()
+            _chk = session.load(_chk_path)
+            if _chk is not None:
+                version = _chk.milestone
+                if repo is None:
+                    repo = _chk.repo
+            else:
+                raise click.UsageError(
+                    "--version is required when --spec is not provided and no checkpoint exists. "
+                    "Pass --version to identify the milestone pair."
+                )
         else:
             raise click.UsageError(
                 "--version is required when --spec is not provided. "
