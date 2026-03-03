@@ -3905,10 +3905,16 @@ def _accept_brimstone_bot_invitation(repo: str) -> None:
     Args:
         repo: GitHub repository in ``owner/repo`` format.
     """
-    token = os.environ.get("GITHUB_TOKEN", "")
+    token = (
+        os.environ.get("BRIMSTONE_GH_TOKEN")
+        or os.environ.get("GH_TOKEN")
+        or os.environ.get("GITHUB_TOKEN")
+        or ""
+    )
     if not token:
         click.echo(
-            f"Warning: GITHUB_TOKEN not set; cannot auto-accept invitation for {repo}",
+            f"Warning: no GitHub token found (BRIMSTONE_GH_TOKEN / GH_TOKEN / GITHUB_TOKEN); "
+            f"cannot auto-accept invitation for {repo}",
             err=True,
         )
         return
