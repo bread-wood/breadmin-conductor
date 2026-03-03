@@ -16,6 +16,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -213,14 +214,29 @@ def run(
         )
 
     if verbose:
+        claude_config_dir = env.get("CLAUDE_CONFIG_DIR", "")
+        print(
+            f"  [debug] subprocess config dir: {claude_config_dir}",
+            file=sys.stderr,
+            flush=True,
+        )
         print("  (first response may take a few minutes…)", file=sys.stderr, flush=True)
 
     proc = subprocess.Popen(
         cmd,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=env,
         text=False,  # binary mode; we decode manually
+        # Run from a non-git directory so Claude does not detect a GitHub
+        # remote URL.  When a remote is detected, Claude fetches policy limits
+        # before the policySettings notification fires; that ordering triggers
+        # the remote-control shutdown handler, which connects to the macOS NE
+        # daemon (fd 10) — a socket that never responds in headless mode,
+        # causing an indefinite hang.  A non-git cwd breaks the detection and
+        # restores the safe ordering.
+        cwd=tempfile.gettempdir(),
     )
 
     result_event, all_events, stderr_text, overage_detected, timed_out = _parse_stream(
