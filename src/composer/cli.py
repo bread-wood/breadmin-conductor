@@ -3486,6 +3486,16 @@ def _run_pipeline_stage(
         "github_repo": repo_ref or None,
         "target_repo": repo_ref or None,
     }
+    # Auto-detect the target repo's default branch so the health check doesn't
+    # warn about a mismatch when the target uses a different branch name than
+    # the config default (e.g. "mainline" vs "main").
+    _branch_proc = subprocess.run(
+        ["git", "symbolic-ref", "--short", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    if _branch_proc.returncode == 0 and _branch_proc.stdout.strip():
+        overrides["default_branch"] = _branch_proc.stdout.strip()
     config = load_config(**overrides)
     checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
 
@@ -3661,6 +3671,11 @@ def run(
     # Resolve repo
     # -----------------------------------------------------------------------
     repo_ref, local_path = _resolve_repo(repo)
+
+    # When a local repo path is known, change into it so that all subsequent
+    # git commands and health checks run against the correct repository.
+    if local_path is not None:
+        os.chdir(local_path)
 
     # -----------------------------------------------------------------------
     # Determine which stages to skip based on --from
