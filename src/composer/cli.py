@@ -1501,7 +1501,7 @@ def _run_research_worker(
             log_dir=config.log_dir.expanduser(),
         )
 
-        if result.subtype == "success" and not result.is_error:
+        if not result.is_error:
             # Success: apply triage rubric to any follow-up issues
             _apply_triage_rubric(
                 repo=repo,
@@ -3172,6 +3172,12 @@ def _run_plan_milestones(
         if result.stderr:
             click.echo(f"stderr:\n{result.stderr[:2000]}", err=True)
         raise SystemExit(1)
+    elif result.subtype == "missing_result_event":
+        click.echo(
+            "Warning: plan-milestones subprocess exited without a result event "
+            "(known Claude Code issue). Work likely completed; continuing.",
+            err=True,
+        )
     else:
         click.echo(f"Plan-milestones complete for version '{version}'.")
 

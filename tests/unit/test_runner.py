@@ -396,7 +396,7 @@ def test_crash_exit_0_no_result_event_synthesised() -> None:
             env=MINIMAL_ENV,
         )
 
-    assert result.is_error is True
+    assert result.is_error is False
     assert result.subtype == "missing_result_event"
 
 
@@ -873,7 +873,7 @@ def test_classify_error_code_auth_failure_from_stderr() -> None:
 def test_synthesise_result_exit_0() -> None:
     r = _synthesise_result(exit_code=0, all_events=[], stderr_text="", overage_detected=False)
     assert r.subtype == "missing_result_event"
-    assert r.is_error is True
+    assert r.is_error is False
 
 
 def test_synthesise_result_exit_143() -> None:

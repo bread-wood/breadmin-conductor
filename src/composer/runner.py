@@ -556,6 +556,7 @@ def _synthesise_result(
     """Synthesise a RunResult when no ``result`` event was received."""
     if exit_code == 0:
         # Exit 0 with no result event — known bug in some Claude Code versions.
+        # The subprocess completed its work; treat as non-error.
         subtype = "missing_result_event"
     elif exit_code == 143:
         # SIGTERM
@@ -573,7 +574,7 @@ def _synthesise_result(
         subtype = "unknown"
 
     return RunResult(
-        is_error=True,
+        is_error=exit_code != 0,
         subtype=subtype,
         error_code=_classify_error_code_from_stderr(stderr_text),
         exit_code=exit_code,
