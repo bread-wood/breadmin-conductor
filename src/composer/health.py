@@ -558,6 +558,13 @@ def _check_orchestrator_lock(config: Config) -> CheckResult:
             remediation=f"Inspect or remove: {lock_path}",
         )
 
+    if pid == os.getpid():
+        return CheckResult(
+            name="Single orchestrator guard",
+            status="pass",
+            message="Orchestrator lock is held by the current process.",
+        )
+
     try:
         os.kill(pid, 0)
         # No exception — PID is alive
