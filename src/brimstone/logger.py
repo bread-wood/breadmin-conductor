@@ -12,7 +12,7 @@ LogContext          -- frozen dataclass carrying per-invocation identity fields
 log_cost            -- append one entry to cost.jsonl
 log_session_event   -- append one structured event to sessions/<session-id>.jsonl
 log_conductor_event -- append one structured event to conductor/<run-id>.jsonl
-read_cost_ledger    -- read and optionally filter cost.jsonl; used by ``composer cost``
+read_cost_ledger    -- read and optionally filter cost.jsonl; used by ``brimstone cost``
 
 Conductor event types (11 total)
 ---------------------------------
@@ -49,7 +49,7 @@ from pathlib import Path
 
 #: All valid conductor event_type values. Callers should pass one of these strings
 #: to log_conductor_event to keep the log parseable.
-COMPOSER_EVENT_TYPES: frozenset[str] = frozenset(
+BRIMSTONE_EVENT_TYPES: frozenset[str] = frozenset(
     {
         "stage_start",
         "issue_claimed",
@@ -324,7 +324,7 @@ def log_conductor_event(
     The conductor log is single-writer (only the orchestrator process writes to
     its own run file); no file locking is applied.
 
-    Valid event types (see ``COMPOSER_EVENT_TYPES``):
+    Valid event types (see ``BRIMSTONE_EVENT_TYPES``):
       stage_start, issue_claimed, agent_dispatched, agent_completed,
       pr_created, ci_checked, pr_merged, backoff_enter, backoff_exit,
       human_escalate, checkpoint_write, stage_complete.
@@ -333,7 +333,7 @@ def log_conductor_event(
         run_id:     UUID of the conductor run; used as the filename.
         phase:      Current pipeline phase (e.g. ``init``, ``claim``,
                     ``dispatch``, ``ci_check``, ``merge``, ``backoff``).
-        event_type: Discriminator string; one of ``COMPOSER_EVENT_TYPES``.
+        event_type: Discriminator string; one of ``BRIMSTONE_EVENT_TYPES``.
         payload:    Event-type-specific dict; must be JSON-serialisable.
         log_dir:    Resolved log root directory.
 

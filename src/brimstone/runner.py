@@ -114,6 +114,14 @@ class RunResult:
     Signals to the caller that the session consumed extra usage credits.
     """
 
+    # --- diagnostic ---
+    num_events: int = field(default=0)
+    """
+    Total number of stream-json events received from the subprocess stdout.
+    Zero indicates the subprocess exited before emitting a single event, which
+    is the primary diagnostic signal for the 'missing_result_event' case.
+    """
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -128,10 +136,11 @@ def run(
     dry_run: bool = False,
     max_turns: int = 100,
     append_system_prompt_file: Path | None = None,
-    mcp_config: Path | None = None,
     verbose: bool = True,
+    print_text_output: bool = True,
     timeout_seconds: float | None = None,
     model: str | None = None,
+    prefix: str = "",
 ) -> RunResult:
     """Invoke ``claude -p`` as a subprocess and return a structured result.
 
@@ -192,7 +201,6 @@ def run(
         allowed_tools=allowed_tools,
         max_turns=max_turns,
         append_system_prompt_file=append_system_prompt_file,
-        mcp_config=mcp_config,
         model=model,
     )
 
@@ -214,13 +222,15 @@ def run(
         )
 
     if verbose:
-        claude_config_dir = env.get("CLAUDE_CONFIG_DIR", "")
+        model_arg = next(
+            (cmd[i + 1] for i, a in enumerate(cmd) if a == "--model" and i + 1 < len(cmd)),
+            "unknown",
+        )
         print(
-            f"  [debug] subprocess config dir: {claude_config_dir}",
+            f"{prefix}agent starting… (model={model_arg})",
             file=sys.stderr,
             flush=True,
         )
-        print("  (first response may take a few minutes…)", file=sys.stderr, flush=True)
 
     proc = subprocess.Popen(
         cmd,
@@ -240,7 +250,11 @@ def run(
     )
 
     result_event, all_events, stderr_text, overage_detected, timed_out = _parse_stream(
-        proc, verbose=verbose, timeout_seconds=timeout_seconds
+        proc,
+        verbose=verbose,
+        print_text_output=print_text_output,
+        timeout_seconds=timeout_seconds,
+        prefix=prefix,
     )
     proc.wait()
     exit_code = proc.returncode
@@ -276,7 +290,6 @@ def _assemble_command(
     allowed_tools: list[str],
     max_turns: int,
     append_system_prompt_file: Path | None,
-    mcp_config: Path | None,
     model: str | None = None,
 ) -> list[str]:
     """Assemble the ``claude`` command list."""
@@ -286,8 +299,8 @@ def _assemble_command(
     if model:
         cmd += ["--model", model]
 
-    # Output format — always stream-json
-    cmd += ["--output-format", "stream-json"]
+    # Output format — always stream-json (--verbose required by claude 2.1.63+)
+    cmd += ["--output-format", "stream-json", "--verbose"]
 
     # Tool restriction
     cmd += ["--allowedTools", ",".join(allowed_tools)]
@@ -308,12 +321,6 @@ def _assemble_command(
     if append_system_prompt_file is not None:
         cmd += ["--append-system-prompt", str(append_system_prompt_file)]
 
-    # MCP suppression or explicit config
-    if mcp_config is None:
-        cmd += ["--strict-mcp-config", "--mcp-config", "{}"]
-    else:
-        cmd += ["--mcp-config", str(mcp_config)]
-
     return cmd
 
 
@@ -322,12 +329,15 @@ def _assemble_command(
 # ---------------------------------------------------------------------------
 
 
-def _print_progress(event: dict) -> None:
+def _print_progress(event: dict, print_text_output: bool = False, prefix: str = "") -> None:
     """Print a one-line terminal summary of a stream-json event to stderr.
 
     Shows tool invocations (assistant → tool_use blocks) and brief tool
     output (user → tool_result blocks) so the operator can see what Claude
     is doing without waiting for the full session to complete.
+
+    When print_text_output is True, also prints assistant text content blocks
+    to stdout so the agent's narrative output is visible in real time.
     """
     event_type = event.get("type")
 
@@ -336,21 +346,30 @@ def _print_progress(event: dict) -> None:
         if not isinstance(message, dict):
             return
         for block in message.get("content", []):
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
+            if not isinstance(block, dict):
                 continue
-            name = block.get("name", "?")
-            inp = block.get("input") or {}
-            if name == "Bash":
-                detail = (inp.get("command") or "").split("\n")[0][:120]
-            elif name in ("Read", "Write", "Edit", "NotebookEdit"):
-                detail = inp.get("file_path", "")
-            elif name == "Glob":
-                detail = inp.get("pattern", "")
-            elif name == "Grep":
-                detail = inp.get("pattern", "")
-            else:
-                detail = str(inp)[:80]
-            print(f"  → {name}: {detail}", file=sys.stderr, flush=True)
+            if block.get("type") == "tool_use":
+                name = block.get("name", "?")
+                inp = block.get("input") or {}
+                if name == "Bash":
+                    detail = (inp.get("command") or "").split("\n")[0][:120]
+                elif name in ("Read", "Write", "Edit", "NotebookEdit"):
+                    detail = inp.get("file_path", "")
+                elif name == "Glob":
+                    detail = inp.get("pattern", "")
+                elif name == "Grep":
+                    detail = inp.get("pattern", "")
+                else:
+                    detail = str(inp)[:80]
+                print(f"{prefix}→ {name}: {detail}", file=sys.stderr, flush=True)
+            elif block.get("type") == "text" and print_text_output:
+                text = block.get("text", "")
+                if text.strip():
+                    # Ensure text ends with newline so the next stderr line
+                    # (tool call or prefix) starts on its own line.
+                    if not text.endswith("\n"):
+                        text += "\n"
+                    print(text, end="", flush=True)
 
     elif event_type == "user":
         message = event.get("message")
@@ -374,17 +393,20 @@ def _print_progress(event: dict) -> None:
             lines = text.strip().splitlines()
             n = len(lines)
             if n == 0:
-                print("    (empty)", file=sys.stderr, flush=True)
+                print(f"{prefix}  (empty)", file=sys.stderr, flush=True)
             elif n == 1:
-                print(f"    {lines[0][:120]}", file=sys.stderr, flush=True)
+                print(f"{prefix}  {lines[0][:120]}", file=sys.stderr, flush=True)
             else:
-                print(f"    {lines[0][:100]}  (+{n - 1} lines)", file=sys.stderr, flush=True)
+                tail = f"  (+{n - 1} lines)"
+                print(f"{prefix}  {lines[0][:100]}{tail}", file=sys.stderr, flush=True)
 
 
 def _parse_stream(
     proc: subprocess.Popen,
     verbose: bool = True,
+    print_text_output: bool = True,
     timeout_seconds: float | None = None,
+    prefix: str = "",
 ) -> tuple[dict | None, list[dict], str, bool, bool]:
     """Read stream-json events from proc.stdout until EOF or timeout.
 
@@ -460,7 +482,11 @@ def _parse_stream(
 
                         all_events.append(event)
                         if verbose:
-                            _print_progress(event)
+                            _print_progress(
+                                event,
+                                print_text_output=print_text_output,
+                                prefix=prefix,
+                            )
                         event_type = event.get("type")
 
                         if event_type == "result":
@@ -544,6 +570,7 @@ def _build_result_from_event(
         raw_result_event=result_event,
         stderr=stderr_text,
         overage_detected=overage_detected,
+        num_events=len(all_events),
     )
 
 
@@ -556,6 +583,7 @@ def _synthesise_result(
     """Synthesise a RunResult when no ``result`` event was received."""
     if exit_code == 0:
         # Exit 0 with no result event — known bug in some Claude Code versions.
+        # The subprocess completed its work; treat as non-error.
         subtype = "missing_result_event"
     elif exit_code == 143:
         # SIGTERM
@@ -573,7 +601,7 @@ def _synthesise_result(
         subtype = "unknown"
 
     return RunResult(
-        is_error=True,
+        is_error=exit_code != 0,
         subtype=subtype,
         error_code=_classify_error_code_from_stderr(stderr_text),
         exit_code=exit_code,
@@ -585,6 +613,7 @@ def _synthesise_result(
         raw_result_event=None,
         stderr=stderr_text,
         overage_detected=overage_detected,
+        num_events=len(all_events),
     )
 
 

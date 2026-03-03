@@ -1,10 +1,11 @@
-"""Unit tests for the research-worker loop in src/composer/cli.py.
+"""Unit tests for the research-worker loop in src/brimstone/cli.py.
 
 Tests cover:
 - Issue selection filters (label, milestone, no assignee, not in-progress)
 - Triage rubric scoring (mock runner.run returning different scores)
 - Completion gate logic (zero blocking → stop)
 - Rate-limit requeue (record_429 called, issue unclaimed)
+- Resume: stale in-progress issues with no PR are unclaimed for re-dispatch
 - All subprocess and GitHub API calls are mocked
 """
 
@@ -14,13 +15,14 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from composer.cli import (
+import pytest
+
+from brimstone.cli import (
     UsageGovernor,
     _apply_triage_rubric,
     _classify_blocking_issues,
     _filter_unblocked,
-    _find_impl_milestone,
-    _find_next_research_milestone,
+    _find_next_milestone,
     _list_open_research_issues,
     _list_triage_issues,
     _parse_dependencies,
@@ -30,9 +32,21 @@ from composer.cli import (
     _score_triage_issue,
     _sort_issues,
 )
-from composer.config import Config
-from composer.runner import RunResult
-from composer.session import Checkpoint
+from brimstone.config import Config
+from brimstone.runner import RunResult
+from brimstone.session import Checkpoint
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def mock_milestone_exists():
+    """Patch _milestone_exists to return True so tests don't hit GitHub."""
+    with patch("brimstone.cli._milestone_exists", return_value=True):
+        yield
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -40,7 +54,7 @@ from composer.session import Checkpoint
 
 MINIMAL_ENV = {
     "ANTHROPIC_API_KEY": "sk-ant-test-key",
-    "GITHUB_TOKEN": "ghp-test-token",
+    "BRIMSTONE_GH_TOKEN": "ghp-test-token",
 }
 
 
@@ -49,7 +63,7 @@ def make_config(**overrides) -> Config:
     with patch.dict("os.environ", MINIMAL_ENV, clear=False):
         config = Config(
             anthropic_api_key=MINIMAL_ENV["ANTHROPIC_API_KEY"],
-            github_token=MINIMAL_ENV["GITHUB_TOKEN"],
+            github_token=MINIMAL_ENV["BRIMSTONE_GH_TOKEN"],
         )
     for k, v in overrides.items():
         object.__setattr__(config, k, v)
@@ -257,7 +271,7 @@ class TestListOpenResearchIssues:
         ]
         gh_output = json.dumps(issues)
 
-        with patch("composer.cli.subprocess.run", return_value=make_gh_result(stdout=gh_output)):
+        with patch("brimstone.cli.subprocess.run", return_value=make_gh_result(stdout=gh_output)):
             result = _list_open_research_issues("owner/repo", "MVP Research")
 
         assert len(result) == 1
@@ -285,19 +299,19 @@ class TestListOpenResearchIssues:
         ]
         gh_output = json.dumps(issues)
 
-        with patch("composer.cli.subprocess.run", return_value=make_gh_result(stdout=gh_output)):
+        with patch("brimstone.cli.subprocess.run", return_value=make_gh_result(stdout=gh_output)):
             result = _list_open_research_issues("owner/repo", "MVP Research")
 
         assert len(result) == 1
         assert result[0]["number"] == 4
 
     def test_returns_empty_on_gh_failure(self) -> None:
-        with patch("composer.cli.subprocess.run", return_value=make_gh_result(returncode=1)):
+        with patch("brimstone.cli.subprocess.run", return_value=make_gh_result(returncode=1)):
             result = _list_open_research_issues("owner/repo", "MVP Research")
         assert result == []
 
     def test_returns_empty_on_invalid_json(self) -> None:
-        with patch("composer.cli.subprocess.run", return_value=make_gh_result(stdout="not json")):
+        with patch("brimstone.cli.subprocess.run", return_value=make_gh_result(stdout="not json")):
             result = _list_open_research_issues("owner/repo", "MVP Research")
         assert result == []
 
@@ -313,13 +327,13 @@ class TestListTriageIssues:
             {"number": 10, "title": "Follow-up A", "body": "...", "labels": [{"name": "triage"}]}
         ]
         gh_output = json.dumps(issues)
-        with patch("composer.cli.subprocess.run", return_value=make_gh_result(stdout=gh_output)):
+        with patch("brimstone.cli.subprocess.run", return_value=make_gh_result(stdout=gh_output)):
             result = _list_triage_issues("owner/repo")
         assert len(result) == 1
         assert result[0]["number"] == 10
 
     def test_returns_empty_on_failure(self) -> None:
-        with patch("composer.cli.subprocess.run", return_value=make_gh_result(returncode=1)):
+        with patch("brimstone.cli.subprocess.run", return_value=make_gh_result(returncode=1)):
             result = _list_triage_issues("owner/repo")
         assert result == []
 
@@ -340,8 +354,8 @@ class TestScoreTriageIssue:
         checkpoint = make_checkpoint()
         issue = make_issue(10, title="Follow-up", body="Does X affect Y?")
 
-        with patch("composer.cli.runner.run", return_value=self._make_score_result(2)):
-            with patch("composer.cli.build_subprocess_env", return_value={}):
+        with patch("brimstone.cli.runner.run", return_value=self._make_score_result(2)):
+            with patch("brimstone.cli.build_subprocess_env", return_value={}):
                 score = _score_triage_issue(issue, "owner/repo", "MVP Research", config, checkpoint)
 
         assert score == 2
@@ -353,8 +367,8 @@ class TestScoreTriageIssue:
 
         result_text = "Q1: YES\nQ2: YES\nQ3: YES\nSCORE: 3\n"
         with (
-            patch("composer.cli.runner.run", return_value=make_run_result(result_text=result_text)),
-            patch("composer.cli.build_subprocess_env", return_value={}),
+            patch("brimstone.cli.runner.run", return_value=make_run_result(result_text=result_text)),
+            patch("brimstone.cli.build_subprocess_env", return_value={}),
         ):
             score = _score_triage_issue(issue, "owner/repo", "MVP Research", config, checkpoint)
 
@@ -367,8 +381,8 @@ class TestScoreTriageIssue:
 
         result_text = "Q1: NO\nQ2: NO\nQ3: NO\nSCORE: 0\n"
         with (
-            patch("composer.cli.runner.run", return_value=make_run_result(result_text=result_text)),
-            patch("composer.cli.build_subprocess_env", return_value={}),
+            patch("brimstone.cli.runner.run", return_value=make_run_result(result_text=result_text)),
+            patch("brimstone.cli.build_subprocess_env", return_value={}),
         ):
             score = _score_triage_issue(issue, "owner/repo", "MVP Research", config, checkpoint)
 
@@ -382,8 +396,8 @@ class TestScoreTriageIssue:
 
         err_result = make_run_result(is_error=True, subtype="error_during_execution")
         with (
-            patch("composer.cli.runner.run", return_value=err_result),
-            patch("composer.cli.build_subprocess_env", return_value={}),
+            patch("brimstone.cli.runner.run", return_value=err_result),
+            patch("brimstone.cli.build_subprocess_env", return_value={}),
         ):
             score = _score_triage_issue(issue, "owner/repo", "MVP Research", config, checkpoint)
 
@@ -395,7 +409,7 @@ class TestScoreTriageIssue:
         checkpoint = make_checkpoint()
         issue = make_issue(14)
 
-        with patch("composer.cli.runner.run") as mock_run:
+        with patch("brimstone.cli.runner.run") as mock_run:
             score = _score_triage_issue(
                 issue, "owner/repo", "MVP Research", config, checkpoint, dry_run=True
             )
@@ -417,10 +431,10 @@ class TestApplyTriageRubric:
         triage_issues = [make_issue(20, title="Low-value followup")]
 
         with (
-            patch("composer.cli._list_triage_issues", return_value=triage_issues),
-            patch("composer.cli._score_triage_issue", return_value=1),
-            patch("composer.cli._close_issue_wont_research") as mock_close,
-            patch("composer.cli.logger.log_conductor_event"),
+            patch("brimstone.cli._list_triage_issues", return_value=triage_issues),
+            patch("brimstone.cli._score_triage_issue", return_value=1),
+            patch("brimstone.cli._close_issue_wont_research") as mock_close,
+            patch("brimstone.cli.logger.log_conductor_event"),
         ):
             _apply_triage_rubric("owner/repo", "MVP Research", config, checkpoint)
 
@@ -438,10 +452,10 @@ class TestApplyTriageRubric:
         triage_issues = [make_issue(21, title="High-value followup")]
 
         with (
-            patch("composer.cli._list_triage_issues", return_value=triage_issues),
-            patch("composer.cli._score_triage_issue", return_value=3),
-            patch("composer.cli._keep_triage_issue") as mock_keep,
-            patch("composer.cli.logger.log_conductor_event"),
+            patch("brimstone.cli._list_triage_issues", return_value=triage_issues),
+            patch("brimstone.cli._score_triage_issue", return_value=3),
+            patch("brimstone.cli._keep_triage_issue") as mock_keep,
+            patch("brimstone.cli.logger.log_conductor_event"),
         ):
             _apply_triage_rubric("owner/repo", "MVP Research", config, checkpoint)
 
@@ -458,11 +472,11 @@ class TestApplyTriageRubric:
         triage_issues = [make_issue(22)]
 
         with (
-            patch("composer.cli._list_triage_issues", return_value=triage_issues),
-            patch("composer.cli._score_triage_issue", return_value=2),
-            patch("composer.cli._keep_triage_issue") as mock_keep,
-            patch("composer.cli._close_issue_wont_research") as mock_close,
-            patch("composer.cli.logger.log_conductor_event"),
+            patch("brimstone.cli._list_triage_issues", return_value=triage_issues),
+            patch("brimstone.cli._score_triage_issue", return_value=2),
+            patch("brimstone.cli._keep_triage_issue") as mock_keep,
+            patch("brimstone.cli._close_issue_wont_research") as mock_close,
+            patch("brimstone.cli.logger.log_conductor_event"),
         ):
             _apply_triage_rubric("owner/repo", "MVP Research", config, checkpoint)
 
@@ -475,9 +489,9 @@ class TestApplyTriageRubric:
         checkpoint = make_checkpoint()
 
         with (
-            patch("composer.cli._list_triage_issues", return_value=[]),
-            patch("composer.cli._close_issue_wont_research") as mock_close,
-            patch("composer.cli._keep_triage_issue") as mock_keep,
+            patch("brimstone.cli._list_triage_issues", return_value=[]),
+            patch("brimstone.cli._close_issue_wont_research") as mock_close,
+            patch("brimstone.cli._keep_triage_issue") as mock_keep,
         ):
             _apply_triage_rubric("owner/repo", "MVP Research", config, checkpoint)
 
@@ -513,8 +527,8 @@ class TestClassifyBlockingIssues:
 
         blocking_result = make_run_result(result_text="BLOCKING\nBecause it affects auth design.")
         with (
-            patch("composer.cli.runner.run", return_value=blocking_result),
-            patch("composer.cli.build_subprocess_env", return_value={}),
+            patch("brimstone.cli.runner.run", return_value=blocking_result),
+            patch("brimstone.cli.build_subprocess_env", return_value={}),
         ):
             blocking, non_blocking = _classify_blocking_issues(
                 issues, "owner/repo", "MVP Research", config, checkpoint
@@ -533,8 +547,8 @@ class TestClassifyBlockingIssues:
             result_text="NON-BLOCKING\nCan use reasonable default."
         )
         with (
-            patch("composer.cli.runner.run", return_value=non_blocking_result),
-            patch("composer.cli.build_subprocess_env", return_value={}),
+            patch("brimstone.cli.runner.run", return_value=non_blocking_result),
+            patch("brimstone.cli.build_subprocess_env", return_value={}),
         ):
             blocking, non_blocking = _classify_blocking_issues(
                 issues, "owner/repo", "MVP Research", config, checkpoint
@@ -551,8 +565,8 @@ class TestClassifyBlockingIssues:
 
         err_result = make_run_result(is_error=True, subtype="error_during_execution")
         with (
-            patch("composer.cli.runner.run", return_value=err_result),
-            patch("composer.cli.build_subprocess_env", return_value={}),
+            patch("brimstone.cli.runner.run", return_value=err_result),
+            patch("brimstone.cli.build_subprocess_env", return_value={}),
         ):
             blocking, non_blocking = _classify_blocking_issues(
                 issues, "owner/repo", "MVP Research", config, checkpoint
@@ -567,7 +581,7 @@ class TestClassifyBlockingIssues:
         checkpoint = make_checkpoint()
         issues = [make_issue(5, body="[BLOCKS_IMPL]"), make_issue(6, body="normal")]
 
-        with patch("composer.cli.runner.run") as mock_run:
+        with patch("brimstone.cli.runner.run") as mock_run:
             blocking, non_blocking = _classify_blocking_issues(
                 issues, "owner/repo", "MVP Research", config, checkpoint, dry_run=True
             )
@@ -578,60 +592,34 @@ class TestClassifyBlockingIssues:
 
 
 # ---------------------------------------------------------------------------
-# _find_next_research_milestone
+# _find_next_milestone
 # ---------------------------------------------------------------------------
 
 
-class TestFindNextResearchMilestone:
-    def test_finds_next_research_milestone(self) -> None:
+class TestFindNextMilestone:
+    def test_finds_next_milestone_by_number(self) -> None:
         milestones = [
-            {"title": "MVP Research", "number": 1, "state": "open"},
-            {"title": "v1.1 Research", "number": 3, "state": "open"},
-            {"title": "MVP Implementation", "number": 2, "state": "open"},
+            {"title": "v1", "number": 1, "state": "open"},
+            {"title": "v2", "number": 2, "state": "open"},
+            {"title": "v3", "number": 3, "state": "open"},
         ]
         gh_out = make_gh_result(stdout=json.dumps(milestones))
-        with patch("composer.cli.subprocess.run", return_value=gh_out):
-            result = _find_next_research_milestone("owner/repo", "MVP Research")
-        assert result == "v1.1 Research"
+        with patch("brimstone.cli.subprocess.run", return_value=gh_out):
+            result = _find_next_milestone("owner/repo", "v1")
+        assert result == "v2"
 
-    def test_returns_none_if_no_next_research_milestone(self) -> None:
+    def test_returns_none_if_no_next_milestone(self) -> None:
         milestones = [
-            {"title": "MVP Research", "number": 1, "state": "open"},
+            {"title": "v1", "number": 1, "state": "open"},
         ]
         gh_out = make_gh_result(stdout=json.dumps(milestones))
-        with patch("composer.cli.subprocess.run", return_value=gh_out):
-            result = _find_next_research_milestone("owner/repo", "MVP Research")
+        with patch("brimstone.cli.subprocess.run", return_value=gh_out):
+            result = _find_next_milestone("owner/repo", "v1")
         assert result is None
 
     def test_returns_none_on_gh_failure(self) -> None:
-        with patch("composer.cli.subprocess.run", return_value=make_gh_result(returncode=1)):
-            result = _find_next_research_milestone("owner/repo", "MVP Research")
-        assert result is None
-
-
-# ---------------------------------------------------------------------------
-# _find_impl_milestone
-# ---------------------------------------------------------------------------
-
-
-class TestFindImplMilestone:
-    def test_finds_matching_impl_milestone(self) -> None:
-        milestones = [
-            {"title": "MVP Research", "number": 1, "state": "open"},
-            {"title": "MVP Implementation", "number": 2, "state": "open"},
-        ]
-        gh_out = make_gh_result(stdout=json.dumps(milestones))
-        with patch("composer.cli.subprocess.run", return_value=gh_out):
-            result = _find_impl_milestone("owner/repo", "MVP Research")
-        assert result == "MVP Implementation"
-
-    def test_returns_none_if_no_matching_impl(self) -> None:
-        milestones = [
-            {"title": "MVP Research", "number": 1, "state": "open"},
-        ]
-        gh_out = make_gh_result(stdout=json.dumps(milestones))
-        with patch("composer.cli.subprocess.run", return_value=gh_out):
-            result = _find_impl_milestone("owner/repo", "MVP Research")
+        with patch("brimstone.cli.subprocess.run", return_value=make_gh_result(returncode=1)):
+            result = _find_next_milestone("owner/repo", "v1")
         assert result is None
 
 
@@ -650,24 +638,23 @@ class TestRunCompletionGate:
         non_blocking = [make_issue(5), make_issue(6)]
 
         with (
-            patch("composer.cli._find_next_research_milestone", return_value="v1.1 Research"),
-            patch("composer.cli._find_impl_milestone", return_value="MVP Implementation"),
-            patch("composer.cli._migrate_issue_to_milestone") as mock_migrate,
-            patch("composer.cli._file_pipeline_issue"),
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
+            patch("brimstone.cli._find_next_milestone", return_value="v2"),
+            patch("brimstone.cli._migrate_issue_to_milestone") as mock_migrate,
+            patch("brimstone.cli._file_pipeline_issue"),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
         ):
             _run_completion_gate(
                 repo="owner/repo",
-                milestone="MVP Research",
+                milestone="v1",
                 open_issues=non_blocking,
                 config=config,
                 checkpoint=checkpoint,
             )
 
         assert mock_migrate.call_count == 2
-        mock_migrate.assert_any_call(repo="owner/repo", issue_number=5, milestone="v1.1 Research")
-        mock_migrate.assert_any_call(repo="owner/repo", issue_number=6, milestone="v1.1 Research")
+        mock_migrate.assert_any_call(repo="owner/repo", issue_number=5, milestone="v2")
+        mock_migrate.assert_any_call(repo="owner/repo", issue_number=6, milestone="v2")
 
     def test_files_pipeline_issue(self, tmp_path: Path) -> None:
         """A 'Run design-worker for <milestone>' pipeline issue is created."""
@@ -677,16 +664,15 @@ class TestRunCompletionGate:
         checkpoint = make_checkpoint()
 
         with (
-            patch("composer.cli._find_next_research_milestone", return_value="v1.1 Research"),
-            patch("composer.cli._find_impl_milestone", return_value="MVP Implementation"),
-            patch("composer.cli._migrate_issue_to_milestone"),
-            patch("composer.cli._file_pipeline_issue") as mock_file,
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
+            patch("brimstone.cli._find_next_milestone", return_value="v2"),
+            patch("brimstone.cli._migrate_issue_to_milestone"),
+            patch("brimstone.cli._file_pipeline_issue") as mock_file,
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
         ):
             _run_completion_gate(
                 repo="owner/repo",
-                milestone="MVP Research",
+                milestone="v1",
                 open_issues=[],
                 config=config,
                 checkpoint=checkpoint,
@@ -695,8 +681,7 @@ class TestRunCompletionGate:
         mock_file.assert_called_once_with(
             repo="owner/repo",
             next_worker="design-worker",
-            milestone="MVP Research",
-            impl_milestone="MVP Implementation",
+            milestone="v1",
         )
 
     def test_logs_stage_complete(self, tmp_path: Path) -> None:
@@ -707,16 +692,15 @@ class TestRunCompletionGate:
         checkpoint = make_checkpoint()
 
         with (
-            patch("composer.cli._find_next_research_milestone", return_value=None),
-            patch("composer.cli._find_impl_milestone", return_value=None),
-            patch("composer.cli._migrate_issue_to_milestone"),
-            patch("composer.cli._file_pipeline_issue"),
-            patch("composer.cli.logger.log_conductor_event") as mock_log,
-            patch("composer.cli.session.save"),
+            patch("brimstone.cli._find_next_milestone", return_value=None),
+            patch("brimstone.cli._migrate_issue_to_milestone"),
+            patch("brimstone.cli._file_pipeline_issue"),
+            patch("brimstone.cli.logger.log_conductor_event") as mock_log,
+            patch("brimstone.cli.session.save"),
         ):
             _run_completion_gate(
                 repo="owner/repo",
-                milestone="MVP Research",
+                milestone="v1",
                 open_issues=[],
                 config=config,
                 checkpoint=checkpoint,
@@ -733,17 +717,16 @@ class TestRunCompletionGate:
         checkpoint = make_checkpoint()
 
         with (
-            patch("composer.cli._find_next_research_milestone", return_value="v1.1 Research"),
-            patch("composer.cli._find_impl_milestone", return_value=None),
-            patch("composer.cli._migrate_issue_to_milestone") as mock_migrate,
-            patch("composer.cli._file_pipeline_issue") as mock_file,
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
-            patch("composer.cli.click.echo"),
+            patch("brimstone.cli._find_next_milestone", return_value="v2"),
+            patch("brimstone.cli._migrate_issue_to_milestone") as mock_migrate,
+            patch("brimstone.cli._file_pipeline_issue") as mock_file,
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
+            patch("brimstone.cli.click.echo"),
         ):
             _run_completion_gate(
                 repo="owner/repo",
-                milestone="MVP Research",
+                milestone="v1",
                 open_issues=[make_issue(99)],
                 config=config,
                 checkpoint=checkpoint,
@@ -768,10 +751,10 @@ class TestRunResearchWorkerCompletionGate:
         checkpoint = make_checkpoint()
 
         with (
-            patch("composer.cli._list_open_research_issues", return_value=[]),
-            patch("composer.cli._run_completion_gate") as mock_gate,
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
+            patch("brimstone.cli._list_open_research_issues", return_value=[]),
+            patch("brimstone.cli._run_completion_gate") as mock_gate,
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
         ):
             _run_research_worker(
                 repo="owner/repo",
@@ -792,11 +775,11 @@ class TestRunResearchWorkerCompletionGate:
         open_issues = [make_issue(10, body="Non-blocking research")]
 
         with (
-            patch("composer.cli._list_open_research_issues", return_value=open_issues),
-            patch("composer.cli._classify_blocking_issues", return_value=([], open_issues)),
-            patch("composer.cli._run_completion_gate") as mock_gate,
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
+            patch("brimstone.cli._list_open_research_issues", return_value=open_issues),
+            patch("brimstone.cli._classify_blocking_issues", return_value=([], open_issues)),
+            patch("brimstone.cli._run_completion_gate") as mock_gate,
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
         ):
             _run_research_worker(
                 repo="owner/repo",
@@ -846,18 +829,18 @@ class TestRunResearchWorkerIssueSelection:
             return ([], [])
 
         with (
-            patch("composer.cli._list_open_research_issues", side_effect=open_issues_side_effect),
-            patch("composer.cli._classify_blocking_issues", side_effect=classify_side_effect),
-            patch("composer.cli._filter_unblocked", return_value=[blocking_issue]),
-            patch("composer.cli._sort_issues", return_value=[blocking_issue]),
-            patch("composer.cli._claim_issue") as mock_claim,
-            patch("composer.cli.runner.run", return_value=success_result),
-            patch("composer.cli._apply_triage_rubric"),
-            patch("composer.cli._run_completion_gate"),
-            patch("composer.cli.build_subprocess_env", return_value={}),
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.record_dispatch"),
-            patch("composer.cli.session.save"),
+            patch("brimstone.cli._list_open_research_issues", side_effect=open_issues_side_effect),
+            patch("brimstone.cli._classify_blocking_issues", side_effect=classify_side_effect),
+            patch("brimstone.cli._filter_unblocked", return_value=[blocking_issue]),
+            patch("brimstone.cli._sort_issues", return_value=[blocking_issue]),
+            patch("brimstone.cli._claim_issue") as mock_claim,
+            patch("brimstone.cli.runner.run", return_value=success_result),
+            patch("brimstone.cli._apply_triage_rubric"),
+            patch("brimstone.cli._run_completion_gate"),
+            patch("brimstone.cli.build_subprocess_env", return_value={}),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.record_dispatch"),
+            patch("brimstone.cli.session.save"),
         ):
             _run_research_worker(
                 repo="owner/repo",
@@ -892,18 +875,18 @@ class TestRunResearchWorkerIssueSelection:
             return ([], [])
 
         with (
-            patch("composer.cli._list_open_research_issues", side_effect=open_issues_side_effect),
-            patch("composer.cli._classify_blocking_issues", side_effect=classify_side_effect),
-            patch("composer.cli._filter_unblocked", return_value=[blocking_issue]),
-            patch("composer.cli._sort_issues", return_value=[blocking_issue]),
-            patch("composer.cli._claim_issue"),
-            patch("composer.cli.runner.run", return_value=success_result),
-            patch("composer.cli._apply_triage_rubric") as mock_triage,
-            patch("composer.cli._run_completion_gate"),
-            patch("composer.cli.build_subprocess_env", return_value={}),
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.record_dispatch"),
-            patch("composer.cli.session.save"),
+            patch("brimstone.cli._list_open_research_issues", side_effect=open_issues_side_effect),
+            patch("brimstone.cli._classify_blocking_issues", side_effect=classify_side_effect),
+            patch("brimstone.cli._filter_unblocked", return_value=[blocking_issue]),
+            patch("brimstone.cli._sort_issues", return_value=[blocking_issue]),
+            patch("brimstone.cli._claim_issue"),
+            patch("brimstone.cli.runner.run", return_value=success_result),
+            patch("brimstone.cli._apply_triage_rubric") as mock_triage,
+            patch("brimstone.cli._run_completion_gate"),
+            patch("brimstone.cli.build_subprocess_env", return_value={}),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.record_dispatch"),
+            patch("brimstone.cli.session.save"),
         ):
             _run_research_worker(
                 repo="owner/repo",
@@ -952,19 +935,19 @@ class TestRunResearchWorkerRateLimit:
             return ([], [])
 
         with (
-            patch("composer.cli._list_open_research_issues", side_effect=open_issues_side_effect),
-            patch("composer.cli._classify_blocking_issues", side_effect=classify_side_effect),
-            patch("composer.cli._filter_unblocked", return_value=[blocking_issue]),
-            patch("composer.cli._sort_issues", return_value=[blocking_issue]),
-            patch("composer.cli._claim_issue"),
-            patch("composer.cli._unclaim_issue") as mock_unclaim,
-            patch("composer.cli.runner.run", return_value=rate_limited_result),
-            patch("composer.cli._run_completion_gate"),
-            patch("composer.cli.build_subprocess_env", return_value={}),
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.record_dispatch"),
-            patch("composer.cli.session.save"),
-            patch("composer.cli.time.sleep"),  # skip actual sleep
+            patch("brimstone.cli._list_open_research_issues", side_effect=open_issues_side_effect),
+            patch("brimstone.cli._classify_blocking_issues", side_effect=classify_side_effect),
+            patch("brimstone.cli._filter_unblocked", return_value=[blocking_issue]),
+            patch("brimstone.cli._sort_issues", return_value=[blocking_issue]),
+            patch("brimstone.cli._claim_issue"),
+            patch("brimstone.cli._unclaim_issue") as mock_unclaim,
+            patch("brimstone.cli.runner.run", return_value=rate_limited_result),
+            patch("brimstone.cli._run_completion_gate"),
+            patch("brimstone.cli.build_subprocess_env", return_value={}),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.record_dispatch"),
+            patch("brimstone.cli.session.save"),
+            patch("brimstone.cli.time.sleep"),  # skip actual sleep
         ):
             _run_research_worker(
                 repo="owner/repo",
@@ -1008,19 +991,19 @@ class TestRunResearchWorkerRateLimit:
             return ([], [])
 
         with (
-            patch("composer.cli._list_open_research_issues", side_effect=open_issues_side_effect),
-            patch("composer.cli._classify_blocking_issues", side_effect=classify_side_effect),
-            patch("composer.cli._filter_unblocked", return_value=[blocking_issue]),
-            patch("composer.cli._sort_issues", return_value=[blocking_issue]),
-            patch("composer.cli._claim_issue"),
-            patch("composer.cli._unclaim_issue"),
-            patch("composer.cli.runner.run", return_value=rate_limited_result),
-            patch("composer.cli._run_completion_gate"),
-            patch("composer.cli.build_subprocess_env", return_value={}),
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.record_dispatch"),
-            patch("composer.cli.session.save"),
-            patch("composer.cli.time.sleep"),
+            patch("brimstone.cli._list_open_research_issues", side_effect=open_issues_side_effect),
+            patch("brimstone.cli._classify_blocking_issues", side_effect=classify_side_effect),
+            patch("brimstone.cli._filter_unblocked", return_value=[blocking_issue]),
+            patch("brimstone.cli._sort_issues", return_value=[blocking_issue]),
+            patch("brimstone.cli._claim_issue"),
+            patch("brimstone.cli._unclaim_issue"),
+            patch("brimstone.cli.runner.run", return_value=rate_limited_result),
+            patch("brimstone.cli._run_completion_gate"),
+            patch("brimstone.cli.build_subprocess_env", return_value={}),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.record_dispatch"),
+            patch("brimstone.cli.session.save"),
+            patch("brimstone.cli.time.sleep"),
             patch.object(UsageGovernor, "record_429") as mock_429,
         ):
             _run_research_worker(
@@ -1063,19 +1046,19 @@ class TestRunResearchWorkerRateLimit:
             return ([], [])
 
         with (
-            patch("composer.cli._list_open_research_issues", side_effect=open_issues_side_effect),
-            patch("composer.cli._classify_blocking_issues", side_effect=classify_side_effect),
-            patch("composer.cli._filter_unblocked", return_value=[blocking_issue]),
-            patch("composer.cli._sort_issues", return_value=[blocking_issue]),
-            patch("composer.cli._claim_issue"),
-            patch("composer.cli._unclaim_issue"),
-            patch("composer.cli.runner.run", return_value=budget_result),
-            patch("composer.cli._run_completion_gate"),
-            patch("composer.cli.build_subprocess_env", return_value={}),
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.record_dispatch"),
-            patch("composer.cli.session.save"),
-            patch("composer.cli.time.sleep"),
+            patch("brimstone.cli._list_open_research_issues", side_effect=open_issues_side_effect),
+            patch("brimstone.cli._classify_blocking_issues", side_effect=classify_side_effect),
+            patch("brimstone.cli._filter_unblocked", return_value=[blocking_issue]),
+            patch("brimstone.cli._sort_issues", return_value=[blocking_issue]),
+            patch("brimstone.cli._claim_issue"),
+            patch("brimstone.cli._unclaim_issue"),
+            patch("brimstone.cli.runner.run", return_value=budget_result),
+            patch("brimstone.cli._run_completion_gate"),
+            patch("brimstone.cli.build_subprocess_env", return_value={}),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.record_dispatch"),
+            patch("brimstone.cli.session.save"),
+            patch("brimstone.cli.time.sleep"),
         ):
             with patch.object(UsageGovernor, "record_429") as mock_429:
                 _run_research_worker(
@@ -1127,18 +1110,18 @@ class TestRunResearchWorkerErrorHandling:
             logged_events.append(kwargs.get("event_type", ""))
 
         with (
-            patch("composer.cli._list_open_research_issues", side_effect=open_issues_side_effect),
-            patch("composer.cli._classify_blocking_issues", side_effect=classify_side_effect),
-            patch("composer.cli._filter_unblocked", return_value=[blocking_issue]),
-            patch("composer.cli._sort_issues", return_value=[blocking_issue]),
-            patch("composer.cli._claim_issue"),
-            patch("composer.cli._unclaim_issue"),
-            patch("composer.cli.runner.run", return_value=error_result),
-            patch("composer.cli._run_completion_gate"),
-            patch("composer.cli.build_subprocess_env", return_value={}),
-            patch("composer.cli.logger.log_conductor_event", side_effect=capture_event),
-            patch("composer.cli.session.record_dispatch"),
-            patch("composer.cli.session.save"),
+            patch("brimstone.cli._list_open_research_issues", side_effect=open_issues_side_effect),
+            patch("brimstone.cli._classify_blocking_issues", side_effect=classify_side_effect),
+            patch("brimstone.cli._filter_unblocked", return_value=[blocking_issue]),
+            patch("brimstone.cli._sort_issues", return_value=[blocking_issue]),
+            patch("brimstone.cli._claim_issue"),
+            patch("brimstone.cli._unclaim_issue"),
+            patch("brimstone.cli.runner.run", return_value=error_result),
+            patch("brimstone.cli._run_completion_gate"),
+            patch("brimstone.cli.build_subprocess_env", return_value={}),
+            patch("brimstone.cli.logger.log_conductor_event", side_effect=capture_event),
+            patch("brimstone.cli.session.record_dispatch"),
+            patch("brimstone.cli.session.save"),
         ):
             _run_research_worker(
                 repo="owner/repo",
@@ -1176,18 +1159,18 @@ class TestRunResearchWorkerErrorHandling:
             return ([], [])
 
         with (
-            patch("composer.cli._list_open_research_issues", side_effect=open_issues_side_effect),
-            patch("composer.cli._classify_blocking_issues", side_effect=classify_side_effect),
-            patch("composer.cli._filter_unblocked", return_value=[blocking_issue]),
-            patch("composer.cli._sort_issues", return_value=[blocking_issue]),
-            patch("composer.cli._claim_issue"),
-            patch("composer.cli._unclaim_issue") as mock_unclaim,
-            patch("composer.cli.runner.run", return_value=error_result),
-            patch("composer.cli._run_completion_gate"),
-            patch("composer.cli.build_subprocess_env", return_value={}),
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.record_dispatch"),
-            patch("composer.cli.session.save"),
+            patch("brimstone.cli._list_open_research_issues", side_effect=open_issues_side_effect),
+            patch("brimstone.cli._classify_blocking_issues", side_effect=classify_side_effect),
+            patch("brimstone.cli._filter_unblocked", return_value=[blocking_issue]),
+            patch("brimstone.cli._sort_issues", return_value=[blocking_issue]),
+            patch("brimstone.cli._claim_issue"),
+            patch("brimstone.cli._unclaim_issue") as mock_unclaim,
+            patch("brimstone.cli.runner.run", return_value=error_result),
+            patch("brimstone.cli._run_completion_gate"),
+            patch("brimstone.cli.build_subprocess_env", return_value={}),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.record_dispatch"),
+            patch("brimstone.cli.session.save"),
         ):
             _run_research_worker(
                 repo="owner/repo",
@@ -1215,15 +1198,15 @@ class TestRunResearchWorkerDryRun:
         blocking_issue = make_issue(1, body="[BLOCKS_IMPL]")
 
         with (
-            patch("composer.cli._list_open_research_issues", return_value=[blocking_issue]),
-            patch("composer.cli._classify_blocking_issues", return_value=([blocking_issue], [])),
-            patch("composer.cli._filter_unblocked", return_value=[blocking_issue]),
-            patch("composer.cli._sort_issues", return_value=[blocking_issue]),
-            patch("composer.cli.runner.run") as mock_run,
-            patch("composer.cli._run_completion_gate"),
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
-            patch("composer.cli.click.echo"),
+            patch("brimstone.cli._list_open_research_issues", return_value=[blocking_issue]),
+            patch("brimstone.cli._classify_blocking_issues", return_value=([blocking_issue], [])),
+            patch("brimstone.cli._filter_unblocked", return_value=[blocking_issue]),
+            patch("brimstone.cli._sort_issues", return_value=[blocking_issue]),
+            patch("brimstone.cli.runner.run") as mock_run,
+            patch("brimstone.cli._run_completion_gate"),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
+            patch("brimstone.cli.click.echo"),
         ):
             _run_research_worker(
                 repo="owner/repo",
@@ -1245,15 +1228,15 @@ class TestRunResearchWorkerDryRun:
         blocking_issue = make_issue(1, body="[BLOCKS_IMPL]")
 
         with (
-            patch("composer.cli._list_open_research_issues", return_value=[blocking_issue]),
-            patch("composer.cli._classify_blocking_issues", return_value=([blocking_issue], [])),
-            patch("composer.cli._filter_unblocked", return_value=[blocking_issue]),
-            patch("composer.cli._sort_issues", return_value=[blocking_issue]),
-            patch("composer.cli.runner.run"),
-            patch("composer.cli._run_completion_gate") as mock_gate,
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
-            patch("composer.cli.click.echo"),
+            patch("brimstone.cli._list_open_research_issues", return_value=[blocking_issue]),
+            patch("brimstone.cli._classify_blocking_issues", return_value=([blocking_issue], [])),
+            patch("brimstone.cli._filter_unblocked", return_value=[blocking_issue]),
+            patch("brimstone.cli._sort_issues", return_value=[blocking_issue]),
+            patch("brimstone.cli.runner.run"),
+            patch("brimstone.cli._run_completion_gate") as mock_gate,
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
+            patch("brimstone.cli.click.echo"),
         ):
             _run_research_worker(
                 repo="owner/repo",
@@ -1264,3 +1247,144 @@ class TestRunResearchWorkerDryRun:
             )
 
         mock_gate.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Resume: unclaim stale in-progress issues with no PR
+# ---------------------------------------------------------------------------
+
+
+class TestResumeUnclaim:
+    """Verify the resume block correctly handles stale in-progress issues."""
+
+    def test_stale_issue_with_pr_is_monitored(self, tmp_path: Path) -> None:
+        """In-progress issue that already has an open PR is resumed via _monitor_pr."""
+        config = make_config()
+        object.__setattr__(config, "checkpoint_dir", tmp_path)
+        object.__setattr__(config, "log_dir", tmp_path / "logs")
+        checkpoint = make_checkpoint()
+
+        stale = make_issue(42, title="Stale with PR")
+
+        monitor_calls: list[int] = []
+        unclaim_calls: list[int] = []
+
+        with (
+            patch("brimstone.cli._list_in_progress_research_issues", return_value=[stale]),
+            patch("brimstone.cli._find_pr_for_issue", return_value=(99, "42-stale-branch")),
+            patch(
+                "brimstone.cli._monitor_pr",
+                side_effect=lambda pr_number, **kw: monitor_calls.append(pr_number),
+            ),
+            patch(
+                "brimstone.cli._unclaim_issue",
+                side_effect=lambda repo, num: unclaim_calls.append(num),
+            ),
+            # After resume, return no open issues so the main loop exits
+            patch("brimstone.cli._list_open_research_issues", return_value=[]),
+            patch("brimstone.cli._run_completion_gate"),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
+            patch("brimstone.cli.click.echo"),
+        ):
+            _run_research_worker(
+                repo="owner/repo",
+                milestone="MVP Research",
+                config=config,
+                checkpoint=checkpoint,
+                dry_run=False,
+            )
+
+        assert 99 in monitor_calls, "_monitor_pr should be called for issue with PR"
+        assert 42 not in unclaim_calls, "_unclaim_issue must NOT be called for issue with PR"
+
+    def test_stale_issue_without_pr_is_unclaimed(self, tmp_path: Path) -> None:
+        """In-progress issue with no PR is unclaimed so the loop can re-dispatch it."""
+        config = make_config()
+        object.__setattr__(config, "checkpoint_dir", tmp_path)
+        object.__setattr__(config, "log_dir", tmp_path / "logs")
+        checkpoint = make_checkpoint()
+
+        stale = make_issue(77, title="Stale no PR")
+
+        unclaim_calls: list[int] = []
+        monitor_calls: list[int] = []
+
+        with (
+            patch("brimstone.cli._list_in_progress_research_issues", return_value=[stale]),
+            patch("brimstone.cli._find_pr_for_issue", return_value=None),
+            patch(
+                "brimstone.cli._unclaim_issue",
+                side_effect=lambda repo, num: unclaim_calls.append(num),
+            ),
+            patch(
+                "brimstone.cli._monitor_pr",
+                side_effect=lambda **kw: monitor_calls.append(kw.get("pr_number")),
+            ),
+            # After unclaim, no open issues remain so the main loop exits
+            patch("brimstone.cli._list_open_research_issues", return_value=[]),
+            patch("brimstone.cli._run_completion_gate"),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
+            patch("brimstone.cli.click.echo"),
+        ):
+            _run_research_worker(
+                repo="owner/repo",
+                milestone="MVP Research",
+                config=config,
+                checkpoint=checkpoint,
+                dry_run=False,
+            )
+
+        assert 77 in unclaim_calls, "_unclaim_issue must be called for stale issue with no PR"
+        assert not monitor_calls, "_monitor_pr must NOT be called when there is no PR"
+
+    def test_multiple_stale_issues_handled_independently(self, tmp_path: Path) -> None:
+        """Each stale issue is handled independently: PR → monitor, no PR → unclaim."""
+        config = make_config()
+        object.__setattr__(config, "checkpoint_dir", tmp_path)
+        object.__setattr__(config, "log_dir", tmp_path / "logs")
+        checkpoint = make_checkpoint()
+
+        stale_with_pr = make_issue(10, title="Has PR")
+        stale_no_pr = make_issue(20, title="No PR")
+
+        def fake_find_pr(repo: str, issue_number: int):
+            if issue_number == 10:
+                return (55, "10-branch")
+            return None
+
+        monitor_calls: list[int] = []
+        unclaim_calls: list[int] = []
+
+        with (
+            patch(
+                "brimstone.cli._list_in_progress_research_issues",
+                return_value=[stale_with_pr, stale_no_pr],
+            ),
+            patch("brimstone.cli._find_pr_for_issue", side_effect=fake_find_pr),
+            patch(
+                "brimstone.cli._monitor_pr",
+                side_effect=lambda pr_number, **kw: monitor_calls.append(pr_number),
+            ),
+            patch(
+                "brimstone.cli._unclaim_issue",
+                side_effect=lambda repo, num: unclaim_calls.append(num),
+            ),
+            patch("brimstone.cli._list_open_research_issues", return_value=[]),
+            patch("brimstone.cli._run_completion_gate"),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
+            patch("brimstone.cli.click.echo"),
+        ):
+            _run_research_worker(
+                repo="owner/repo",
+                milestone="MVP Research",
+                config=config,
+                checkpoint=checkpoint,
+                dry_run=False,
+            )
+
+        assert 55 in monitor_calls, "Issue 10 (has PR) should be monitored"
+        assert 20 in unclaim_calls, "Issue 20 (no PR) should be unclaimed"
+        assert 10 not in unclaim_calls, "Issue 10 (has PR) must not be unclaimed"

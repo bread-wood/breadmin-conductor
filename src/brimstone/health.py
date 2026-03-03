@@ -1,8 +1,8 @@
-"""Preflight health checks for composer commands.
+"""Preflight health checks for brimstone commands.
 
 Runs 11 ordered checks at worker startup. Distinguishes fatal checks (abort)
 from warnings (proceed with caution). Manages the single-orchestrator lock file.
-Powers `composer health`.
+Powers `brimstone health`.
 """
 
 from __future__ import annotations
@@ -19,8 +19,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from composer.config import Config
-from composer.session import Checkpoint, is_backing_off
+from brimstone.config import Config
+from brimstone.session import Checkpoint, is_backing_off
 
 # ---------------------------------------------------------------------------
 # Module-level lock config ref (used by SIGTERM handler)
@@ -69,6 +69,7 @@ class HealthReport:
 def check_all(
     config: Config,
     checkpoint: Checkpoint | None = None,
+    skip_checks: frozenset[str] = frozenset(),
 ) -> HealthReport:
     """Run all 11 preflight checks in order.
 
@@ -77,8 +78,10 @@ def check_all(
     Sets fatal=True if any check is "fail".
 
     Args:
-        config:     Resolved Config instance.
-        checkpoint: Current Checkpoint object, or None if no checkpoint yet.
+        config:       Resolved Config instance.
+        checkpoint:   Current Checkpoint object, or None if no checkpoint yet.
+        skip_checks:  Set of check names to skip entirely (e.g. checks that are
+                      irrelevant for headless commands targeting a remote repo).
 
     Returns:
         A HealthReport with all check results.
@@ -101,7 +104,16 @@ def check_all(
     failed = False
 
     for name, fn in named_checks:
-        if failed:
+        if name in skip_checks:
+            results.append(
+                CheckResult(
+                    name=name,
+                    status="skip",
+                    message="Not applicable for this command.",
+                    remediation=None,
+                )
+            )
+        elif failed:
             results.append(
                 CheckResult(
                     name=name,
@@ -151,7 +163,7 @@ def _check_git_repo() -> CheckResult:
         name="Git repo present",
         status="fail",
         message="Working directory is not inside a git repo.",
-        remediation="Change to a git repository before running composer.",
+        remediation="Change to a git repository before running brimstone.",
     )
 
 
@@ -202,7 +214,7 @@ def _check_default_branch(config: Config) -> CheckResult:
         status="warn",
         message=f"Mismatch: config={configured_branch}, repo={actual_branch}",
         remediation=(
-            f"Set COMPOSER_DEFAULT_BRANCH={actual_branch} or update config to match "
+            f"Set BRIMSTONE_DEFAULT_BRANCH={actual_branch} or update config to match "
             f"the repo's default branch ({actual_branch})."
         ),
     )
@@ -242,7 +254,7 @@ def _check_api_key(config: Config) -> CheckResult:
         name="ANTHROPIC_API_KEY present",
         status="fail",
         message="ANTHROPIC_API_KEY is not set or is empty.",
-        remediation="Set the ANTHROPIC_API_KEY environment variable before running composer.",
+        remediation="Set the ANTHROPIC_API_KEY environment variable before running brimstone.",
     )
 
 
@@ -807,7 +819,7 @@ def format_report(report: HealthReport) -> str:
         A multi-line formatted string suitable for printing to stdout.
     """
     lines: list[str] = [
-        "breadmin-composer health check",
+        "brimstone health check",
         _SEPARATOR,
     ]
 

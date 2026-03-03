@@ -1,6 +1,6 @@
-# breadmin-composer
+# brimstone
 
-breadmin-composer — headless Claude Code orchestrator for automated GitHub issue workstreams.
+brimstone — headless Claude Code orchestrator for automated GitHub issue workstreams.
 
 Runs a four-stage research → design → implementation pipeline entirely from the terminal,
 invoking `claude -p` headlessly (no human at the terminal) to process GitHub issues,
@@ -37,13 +37,13 @@ No stage may be skipped. See `CLAUDE.md` for the full orchestration protocol.
 | `design-worker` | Translates completed research docs into scoped implementation issues |
 | `plan-issues` | Plans milestones and seeds research issues for the next version |
 | `impl-worker` | Claims impl issues, dispatches sub-agents, monitors CI, and merges PRs |
-| `composer` | Admin commands: `health` (preflight checks) and `cost` (cost ledger summary) |
+| `brimstone` | Admin commands: `health` (preflight checks) and `cost` (cost ledger summary) |
 
 ## Quick Usage
 
 ```bash
 # Preflight check
-composer health --repo OWNER/REPO
+brimstone health --repo OWNER/REPO
 
 # Plan milestones and seed research issues for a new version
 plan-issues --repo OWNER/REPO
@@ -58,7 +58,7 @@ design-worker --repo OWNER/REPO --research-milestone "MVP Research"
 impl-worker --repo OWNER/REPO --milestone "MVP Implementation"
 
 # Show cost ledger
-composer cost
+brimstone cost
 ```
 
 Each worker accepts `--dry-run` (print without executing), `--model` (override Claude model),
@@ -67,9 +67,9 @@ Each worker accepts `--dry-run` (print without executing), `--model` (override C
 ## Module Listing
 
 ```
-src/composer/
+src/brimstone/
 ├── cli.py          ← Click entry points: research-worker, design-worker,
-│                     plan-issues, impl-worker, composer
+│                     plan-issues, impl-worker, brimstone
 ├── config.py       ← Config pydantic-settings model; env/flag resolution
 ├── runner.py       ← claude -p subprocess invocation; stream-json capture
 ├── session.py      ← Session ID persistence and --resume logic
@@ -97,10 +97,10 @@ Set environment variables or create a `.env` file:
 | Variable | Description |
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | Required — Anthropic API key |
-| `COMPOSER_MODEL` | Claude model to use (default: `claude-opus-4-5`) |
-| `COMPOSER_MAX_BUDGET` | USD budget cap per session |
-| `COMPOSER_MAX_TURNS` | Max turns per `claude -p` invocation |
-| `COMPOSER_DATA_DIR` | Directory for checkpoints and logs (default: `~/.composer`) |
+| `BRIMSTONE_MODEL` | Claude model to use (default: `claude-opus-4-5`) |
+| `BRIMSTONE_MAX_BUDGET` | USD budget cap per session |
+| `BRIMSTONE_MAX_TURNS` | Max turns per `claude -p` invocation |
+| `BRIMSTONE_DATA_DIR` | Directory for checkpoints and logs (default: `~/.brimstone`) |
 
 ## Dependencies
 

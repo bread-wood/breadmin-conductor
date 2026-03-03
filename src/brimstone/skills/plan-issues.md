@@ -106,11 +106,11 @@ For each logical unit of work needed to implement what the design docs specify:
    Check for circular dependencies before proceeding.
 
 5. **Assign label** — use the appropriate `feat:*` label from CLAUDE.md:
-   - `feat:config` — `src/composer/config.py`
-   - `feat:runner` — `src/composer/runner.py`, `src/composer/session.py`
-   - `feat:health` — `src/composer/health.py`
-   - `feat:logging` — `src/composer/logger.py`
-   - `feat:cli` — `src/composer/cli.py`, `src/composer/skills/`
+   - `feat:config` — `src/brimstone/config.py`
+   - `feat:runner` — `src/brimstone/runner.py`, `src/brimstone/session.py`
+   - `feat:health` — `src/brimstone/health.py`
+   - `feat:logging` — `src/brimstone/logger.py`
+   - `feat:cli` — `src/brimstone/cli.py`, `src/brimstone/skills/`
    - `infra` — `pyproject.toml`, `.github/`, `CLAUDE.md`, `README.md`
 
 6. **Skip if duplicate** — if a normalized version of the proposed title matches an existing

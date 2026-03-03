@@ -1,4 +1,4 @@
-"""Unit tests for plan_milestones --spec flag in src/composer/cli.py.
+"""Unit tests for spec-seeding helpers and the `brimstone init` command in cli.py.
 
 Tests cover:
 - _validate_spec_path: relative path resolved from cwd
@@ -8,8 +8,9 @@ Tests cover:
 - _seed_spec: version inferred from filename stem
 - _seed_spec: spec already exists in target repo → warning printed, no overwrite
 - _seed_spec: spec does not exist → file is copied and committed
-- plan_milestones command: --version required when --spec not given
-- plan_milestones command: --version inferred from spec filename stem when --spec given
+- brimstone init: --repo and --spec are required
+- brimstone init: version inferred from spec filename stem
+- brimstone init: calls _upload_spec_to_repo and _run_plan_milestones
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-from composer.cli import _seed_spec, _validate_spec_path, plan_milestones
+from brimstone.cli import _seed_spec, _validate_spec_path, composer
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -29,7 +30,7 @@ from composer.cli import _seed_spec, _validate_spec_path, plan_milestones
 
 MINIMAL_ENV = {
     "ANTHROPIC_API_KEY": "sk-ant-test-key",
-    "GITHUB_TOKEN": "ghp-test-token",
+    "BRIMSTONE_GH_TOKEN": "ghp-test-token",
 }
 
 
@@ -226,7 +227,7 @@ class TestSeedSpec:
         spec = tmp_path / "myspec.md"
         spec.write_text("# Spec")
 
-        with patch("composer.cli.subprocess.run", wraps=subprocess.run) as mock_run:
+        with patch("brimstone.cli.subprocess.run", wraps=subprocess.run) as mock_run:
             _seed_spec(spec, "myspec", str(repo))
 
         calls = [c for c in mock_run.call_args_list]
@@ -237,111 +238,180 @@ class TestSeedSpec:
 
 
 # ---------------------------------------------------------------------------
-# plan_milestones Click command
+# brimstone init Click command
 # ---------------------------------------------------------------------------
 
 
-class TestPlanMilestonesCommand:
-    def test_missing_version_and_spec_fails(self) -> None:
-        """plan-milestones fails with a clear error when neither --version nor --spec is given."""
+class TestInitCommand:
+    def test_missing_spec_fails(self) -> None:
+        """brimstone init fails when --spec is not given."""
         runner = CliRunner()
-        result = runner.invoke(plan_milestones, ["--repo", "owner/repo"])
+        result = runner.invoke(composer, ["init", "--repo", "owner/repo"])
         assert result.exit_code != 0
-        output = result.output
-        assert "--version" in output or "version" in output.lower() or "Error" in output
+
+    def test_missing_repo_fails(self, tmp_path: Path) -> None:
+        """brimstone init fails when --repo is not given."""
+        spec_file = tmp_path / "calculator.md"
+        spec_file.write_text("# Spec")
+        runner = CliRunner()
+        result = runner.invoke(composer, ["init", "--spec", str(spec_file)])
+        assert result.exit_code != 0
 
     def test_version_inferred_from_spec_filename(self, tmp_path: Path) -> None:
-        """When --spec is given and --version is omitted, version is inferred from stem."""
+        """Version is inferred from the spec filename stem."""
         spec_file = tmp_path / "calculator.md"
         spec_file.write_text("# Spec")
 
         runner = CliRunner()
         with (
-            patch("composer.cli.load_config") as mock_load_config,
-            patch("composer.cli.startup_sequence") as mock_startup,
-            patch("composer.cli._seed_spec") as mock_seed,
-            patch("composer.cli._run_plan_milestones") as mock_run,
-            patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
+            patch("brimstone.cli.load_config") as mock_load_config,
+            patch("brimstone.cli.startup_sequence") as mock_startup,
+            patch("brimstone.cli._upload_spec_to_repo") as mock_upload,
+            patch("brimstone.cli._run_plan_milestones") as mock_run,
+            patch("brimstone.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
         ):
             mock_config = MagicMock()
             mock_config.checkpoint_dir = tmp_path
             mock_load_config.return_value = mock_config
             mock_startup.return_value = (mock_config, MagicMock())
             mock_run.return_value = None
-            mock_seed.return_value = None
+            mock_upload.return_value = None
 
             result = runner.invoke(
-                plan_milestones,
-                ["--repo", "owner/repo", "--spec", str(spec_file)],
+                composer,
+                ["init", "--repo", "owner/repo", "--spec", str(spec_file)],
             )
 
         assert result.exit_code == 0, result.output
-        # The inferred version should be "calculator"
         run_call_kwargs = mock_run.call_args.kwargs
         assert run_call_kwargs["version"] == "calculator"
 
-    def test_explicit_version_overrides_spec_stem(self, tmp_path: Path) -> None:
-        """When both --spec and --version are given, the explicit --version is used."""
-        spec_file = tmp_path / "calculator.md"
-        spec_file.write_text("# Spec")
+    def test_upload_spec_called_with_correct_args(self, tmp_path: Path) -> None:
+        """_upload_spec_to_repo is called with repo, spec path, and version."""
+        spec_file = tmp_path / "mvp.md"
+        spec_file.write_text("# MVP")
+
+        upload_calls: list[tuple] = []
+
+        def fake_upload(repo: str, spec_path, version: str) -> None:
+            upload_calls.append((repo, str(spec_path), version))
 
         runner = CliRunner()
         with (
-            patch("composer.cli.load_config") as mock_load_config,
-            patch("composer.cli.startup_sequence") as mock_startup,
-            patch("composer.cli._seed_spec") as mock_seed,
-            patch("composer.cli._run_plan_milestones") as mock_run,
-            patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
+            patch("brimstone.cli.load_config") as mock_load_config,
+            patch("brimstone.cli.startup_sequence") as mock_startup,
+            patch("brimstone.cli._upload_spec_to_repo", side_effect=fake_upload),
+            patch("brimstone.cli._run_plan_milestones"),
+            patch("brimstone.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
         ):
             mock_config = MagicMock()
             mock_config.checkpoint_dir = tmp_path
             mock_load_config.return_value = mock_config
             mock_startup.return_value = (mock_config, MagicMock())
-            mock_run.return_value = None
-            mock_seed.return_value = None
 
             result = runner.invoke(
-                plan_milestones,
-                [
-                    "--repo",
-                    "owner/repo",
-                    "--spec",
-                    str(spec_file),
-                    "--version",
-                    "MVP",
-                ],
+                composer,
+                ["init", "--repo", "owner/repo", "--spec", str(spec_file)],
             )
 
         assert result.exit_code == 0, result.output
-        run_call_kwargs = mock_run.call_args.kwargs
-        assert run_call_kwargs["version"] == "MVP"
+        assert len(upload_calls) == 1
+        repo_arg, _, version_arg = upload_calls[0]
+        assert repo_arg == "owner/repo"
+        assert version_arg == "mvp"
 
-    def test_spec_with_remote_only_repo_fails(self, tmp_path: Path) -> None:
-        """--spec requires a local repo path; remote-only ref raises ClickException."""
-        spec_file = tmp_path / "calc.md"
-        spec_file.write_text("# Spec")
+    def test_dry_run_skips_upload(self, tmp_path: Path) -> None:
+        """--dry-run must not call _upload_spec_to_repo."""
+        spec_file = tmp_path / "mvp.md"
+        spec_file.write_text("# MVP")
+
+        upload_called: list[bool] = []
 
         runner = CliRunner()
         with (
-            patch("composer.cli.load_config") as mock_load_config,
-            patch("composer.cli.startup_sequence") as mock_startup,
-            patch("composer.cli._run_plan_milestones") as mock_run,
-            # _resolve_repo returns (remote_ref, None) for a GitHub slug
+            patch("brimstone.cli.load_config") as mock_load_config,
+            patch("brimstone.cli.startup_sequence") as mock_startup,
             patch(
-                "composer.cli._resolve_repo",
-                return_value=("owner/repo", None),
+                "brimstone.cli._upload_spec_to_repo",
+                side_effect=lambda *a, **kw: upload_called.append(True),
             ),
+            patch("brimstone.cli._add_brimstone_bot_collaborator"),
+            patch("brimstone.cli._run_plan_milestones"),
+            patch("brimstone.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
         ):
             mock_config = MagicMock()
             mock_config.checkpoint_dir = tmp_path
             mock_load_config.return_value = mock_config
             mock_startup.return_value = (mock_config, MagicMock())
-            mock_run.return_value = None
 
             result = runner.invoke(
-                plan_milestones,
-                ["--repo", "owner/repo", "--spec", str(spec_file), "--version", "calc"],
+                composer,
+                ["init", "--repo", "owner/repo", "--spec", str(spec_file), "--dry-run"],
             )
 
-        assert result.exit_code != 0
-        assert "local" in result.output.lower() or "Error" in result.output
+        assert result.exit_code == 0, result.output
+        assert not upload_called, "_upload_spec_to_repo must not be called in --dry-run mode"
+
+    def test_collaborator_added_on_init(self, tmp_path: Path) -> None:
+        """brimstone init must add yeast-bot as a collaborator on the repo."""
+        spec_file = tmp_path / "mvp.md"
+        spec_file.write_text("# MVP")
+
+        collab_calls: list[str] = []
+
+        runner = CliRunner()
+        with (
+            patch("brimstone.cli.load_config") as mock_load_config,
+            patch("brimstone.cli.startup_sequence") as mock_startup,
+            patch("brimstone.cli._upload_spec_to_repo"),
+            patch(
+                "brimstone.cli._add_brimstone_bot_collaborator",
+                side_effect=lambda repo: collab_calls.append(repo),
+            ),
+            patch("brimstone.cli._run_plan_milestones"),
+            patch("brimstone.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
+        ):
+            mock_config = MagicMock()
+            mock_config.checkpoint_dir = tmp_path
+            mock_load_config.return_value = mock_config
+            mock_startup.return_value = (mock_config, MagicMock())
+
+            result = runner.invoke(
+                composer,
+                ["init", "--repo", "owner/repo", "--spec", str(spec_file)],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert collab_calls == ["owner/repo"], "yeast-bot must be added as collaborator"
+
+    def test_collaborator_not_added_in_dry_run(self, tmp_path: Path) -> None:
+        """--dry-run must not call _add_brimstone_bot_collaborator."""
+        spec_file = tmp_path / "mvp.md"
+        spec_file.write_text("# MVP")
+
+        collab_calls: list[str] = []
+
+        runner = CliRunner()
+        with (
+            patch("brimstone.cli.load_config") as mock_load_config,
+            patch("brimstone.cli.startup_sequence") as mock_startup,
+            patch("brimstone.cli._upload_spec_to_repo"),
+            patch(
+                "brimstone.cli._add_brimstone_bot_collaborator",
+                side_effect=lambda repo: collab_calls.append(repo),
+            ),
+            patch("brimstone.cli._run_plan_milestones"),
+            patch("brimstone.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
+        ):
+            mock_config = MagicMock()
+            mock_config.checkpoint_dir = tmp_path
+            mock_load_config.return_value = mock_config
+            mock_startup.return_value = (mock_config, MagicMock())
+
+            result = runner.invoke(
+                composer,
+                ["init", "--repo", "owner/repo", "--spec", str(spec_file), "--dry-run"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert not collab_calls, "_add_brimstone_bot_collaborator must not be called in --dry-run"

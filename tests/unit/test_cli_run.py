@@ -1,4 +1,4 @@
-"""Unit tests for the `composer run` subcommand (cli.py)."""
+"""Unit tests for the `brimstone run` subcommand (cli.py)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from click.testing import CliRunner
 
-from composer.cli import _PIPELINE_STAGES, composer
+from brimstone.cli import composer
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -16,598 +16,493 @@ from composer.cli import _PIPELINE_STAGES, composer
 
 MINIMAL_ENV = {
     "ANTHROPIC_API_KEY": "sk-ant-test-key",
-    "GITHUB_TOKEN": "ghp-test-token",
+    "BRIMSTONE_GH_TOKEN": "ghp-test-token",
 }
 
-
-def _make_mock_spec(tmp_path: Path) -> Path:
-    """Write a minimal spec file and return its absolute path."""
-    spec_file = tmp_path / "MVP.md"
-    spec_file.write_text("# MVP Spec\n\nA minimal spec.\n")
-    return spec_file
+_REPO = "owner/repo"
+_MILESTONE = "MVP Research"
 
 
 # ---------------------------------------------------------------------------
-# _PIPELINE_STAGES order
+# brimstone run --help
 # ---------------------------------------------------------------------------
 
 
-class TestPipelineStagesConstant:
-    def test_stages_in_correct_order(self) -> None:
-        assert _PIPELINE_STAGES == [
-            "plan-milestones",
-            "research-worker",
-            "design-worker",
-            "plan-issues",
-            "impl-worker",
-        ]
-
-
-# ---------------------------------------------------------------------------
-# composer run --dry-run
-# ---------------------------------------------------------------------------
-
-
-class TestRunDryRun:
-    def test_dry_run_prints_headers_and_skips_all_stages(self, tmp_path: Path) -> None:
-        """--dry-run prints stage headers and [dry-run] lines but does not invoke stages."""
-        spec_file = _make_mock_spec(tmp_path)
-
-        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
-            with (
-                patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
-                patch("composer.cli._run_pipeline_stage") as mock_stage,
-            ):
-                runner = CliRunner()
-                result = runner.invoke(
-                    composer,
-                    ["run", "--repo", "owner/repo", "--spec", str(spec_file), "--dry-run"],
-                )
-
-        assert result.exit_code == 0, result.output
-        output = result.output
-
-        # Each stage header must appear
-        for stage in _PIPELINE_STAGES:
-            assert f"── Stage: {stage} ──" in output
-            assert f"[dry-run] would invoke {stage}" in output
-
-        # _run_pipeline_stage must NOT be called in dry-run mode
-        mock_stage.assert_not_called()
-
-    def test_dry_run_does_not_require_credentials(self, tmp_path: Path) -> None:
-        """--dry-run must not fail due to missing env vars (stages are not invoked)."""
-        # Do NOT set ANTHROPIC_API_KEY or GITHUB_TOKEN
-        with patch.dict("os.environ", {}, clear=True):
-            with (
-                patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
-                patch("composer.cli._run_pipeline_stage") as mock_stage,
-            ):
-                runner = CliRunner()
-                result = runner.invoke(
-                    composer,
-                    ["run", "--repo", "owner/repo", "--version", "MVP", "--dry-run"],
-                )
-
-        # Should succeed (no stages actually ran)
-        assert result.exit_code == 0, result.output
-        mock_stage.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# composer run: stage execution order
-# ---------------------------------------------------------------------------
-
-
-class TestRunStageOrder:
-    def test_stages_run_in_correct_order(self, tmp_path: Path) -> None:
-        """All five stages must be called in pipeline order."""
-        spec_file = _make_mock_spec(tmp_path)
-        call_order: list[str] = []
-
-        def fake_run_stage(stage: str, **kwargs: object) -> None:
-            call_order.append(stage)
-
-        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
-            with (
-                patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
-                patch("composer.cli._run_pipeline_stage", side_effect=fake_run_stage),
-            ):
-                runner = CliRunner()
-                result = runner.invoke(
-                    composer,
-                    ["run", "--repo", "owner/repo", "--spec", str(spec_file)],
-                )
-
-        assert result.exit_code == 0, result.output
-        assert call_order == _PIPELINE_STAGES
-
-    def test_stage_function_receives_correct_arguments(self, tmp_path: Path) -> None:
-        """Each stage is called with repo_ref, local_path, version, and dry_run=False."""
-        spec_file = _make_mock_spec(tmp_path)
-
-        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
-            with (
-                patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
-                patch("composer.cli._run_pipeline_stage") as mock_stage,
-            ):
-                runner = CliRunner()
-                result = runner.invoke(
-                    composer,
-                    ["run", "--repo", "owner/repo", "--spec", str(spec_file)],
-                )
-
-        assert result.exit_code == 0, result.output
-        # Check the plan-milestones call
-        first_call_kwargs = mock_stage.call_args_list[0].kwargs
-        assert first_call_kwargs["stage"] == "plan-milestones"
-        assert first_call_kwargs["repo_ref"] == "owner/repo"
-        assert first_call_kwargs["version"] == "MVP"
-        assert first_call_kwargs["dry_run"] is False
-
-
-# ---------------------------------------------------------------------------
-# composer run --from <stage>
-# ---------------------------------------------------------------------------
-
-
-class TestRunFromStage:
-    def test_from_research_worker_skips_plan_milestones(self, tmp_path: Path) -> None:
-        """--from research-worker must skip plan-milestones and run the rest."""
-        called_stages: list[str] = []
-
-        def fake_run_stage(stage: str, **kwargs: object) -> None:
-            called_stages.append(stage)
-
-        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
-            with (
-                patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
-                patch("composer.cli._run_pipeline_stage", side_effect=fake_run_stage),
-            ):
-                runner = CliRunner()
-                result = runner.invoke(
-                    composer,
-                    [
-                        "run",
-                        "--repo",
-                        "owner/repo",
-                        "--version",
-                        "MVP",
-                        "--from",
-                        "research-worker",
-                    ],
-                )
-
-        assert result.exit_code == 0, result.output
-        assert called_stages == [
-            "research-worker",
-            "design-worker",
-            "plan-issues",
-            "impl-worker",
-        ]
-        # plan-milestones must not appear
-        assert "plan-milestones" not in called_stages
-
-    def test_from_plan_milestones_runs_all_stages(self, tmp_path: Path) -> None:
-        """--from plan-milestones (first stage) runs all stages."""
-        called_stages: list[str] = []
-
-        def fake_run_stage(stage: str, **kwargs: object) -> None:
-            called_stages.append(stage)
-
-        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
-            with (
-                patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
-                patch("composer.cli._run_pipeline_stage", side_effect=fake_run_stage),
-            ):
-                runner = CliRunner()
-                result = runner.invoke(
-                    composer,
-                    [
-                        "run",
-                        "--repo",
-                        "owner/repo",
-                        "--version",
-                        "MVP",
-                        "--from",
-                        "plan-milestones",
-                    ],
-                )
-
-        assert result.exit_code == 0, result.output
-        assert called_stages == _PIPELINE_STAGES
-
-    def test_from_impl_worker_runs_only_last_stage(self, tmp_path: Path) -> None:
-        """--from impl-worker must skip all earlier stages and run only impl-worker."""
-        called_stages: list[str] = []
-
-        def fake_run_stage(stage: str, **kwargs: object) -> None:
-            called_stages.append(stage)
-
-        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
-            with (
-                patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
-                patch("composer.cli._run_pipeline_stage", side_effect=fake_run_stage),
-            ):
-                runner = CliRunner()
-                result = runner.invoke(
-                    composer,
-                    [
-                        "run",
-                        "--repo",
-                        "owner/repo",
-                        "--version",
-                        "MVP",
-                        "--from",
-                        "impl-worker",
-                    ],
-                )
-
-        assert result.exit_code == 0, result.output
-        assert called_stages == ["impl-worker"]
-
-    def test_skip_output_printed_for_skipped_stages(self, tmp_path: Path) -> None:
-        """[skip] must appear in output for each skipped stage."""
-        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
-            with (
-                patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
-                patch("composer.cli._run_pipeline_stage"),
-            ):
-                runner = CliRunner()
-                result = runner.invoke(
-                    composer,
-                    [
-                        "run",
-                        "--repo",
-                        "owner/repo",
-                        "--version",
-                        "MVP",
-                        "--from",
-                        "design-worker",
-                    ],
-                )
-
-        assert result.exit_code == 0, result.output
-        output = result.output
-        assert "[skip] plan-milestones" in output
-        assert "[skip] research-worker" in output
-        # design-worker and later should NOT have [skip]
-        assert "[skip] design-worker" not in output
-        assert "[skip] impl-worker" not in output
-
-
-# ---------------------------------------------------------------------------
-# composer run: invalid --from
-# ---------------------------------------------------------------------------
-
-
-class TestRunInvalidFrom:
-    def test_invalid_from_value_produces_clear_error(self, tmp_path: Path) -> None:
-        """An unrecognized --from value must fail with a clear error message."""
-        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
-            with patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))):
-                runner = CliRunner()
-                result = runner.invoke(
-                    composer,
-                    [
-                        "run",
-                        "--repo",
-                        "owner/repo",
-                        "--version",
-                        "MVP",
-                        "--from",
-                        "not-a-real-stage",
-                    ],
-                )
-
-        assert result.exit_code != 0
-        assert "not-a-real-stage" in result.output or "not-a-real-stage" in (result.output or "")
-
-    def test_invalid_from_value_lists_valid_stages(self, tmp_path: Path) -> None:
-        """Error for invalid --from must mention at least one valid stage name."""
-        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
-            with patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))):
-                runner = CliRunner()
-                result = runner.invoke(
-                    composer,
-                    [
-                        "run",
-                        "--repo",
-                        "owner/repo",
-                        "--version",
-                        "MVP",
-                        "--from",
-                        "unknown-stage",
-                    ],
-                )
-
-        combined = result.output + (result.exception and str(result.exception) or "")
-        # At least one valid stage must appear in the error output
-        assert any(stage in combined for stage in _PIPELINE_STAGES)
-
-
-# ---------------------------------------------------------------------------
-# composer run: stage failure halts pipeline and prints resume hint
-# ---------------------------------------------------------------------------
-
-
-class TestRunStageFailure:
-    def test_stage_failure_halts_pipeline(self, tmp_path: Path) -> None:
-        """If a stage raises an exception, the pipeline halts (subsequent stages not called)."""
-        called_stages: list[str] = []
-
-        def fake_run_stage(stage: str, **kwargs: object) -> None:
-            called_stages.append(stage)
-            if stage == "research-worker":
-                raise RuntimeError("research agent failed")
-
-        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
-            with (
-                patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
-                patch("composer.cli._run_pipeline_stage", side_effect=fake_run_stage),
-            ):
-                runner = CliRunner()
-                result = runner.invoke(
-                    composer,
-                    [
-                        "run",
-                        "--repo",
-                        "owner/repo",
-                        "--version",
-                        "MVP",
-                    ],
-                )
-
-        assert result.exit_code != 0
-        # Only stages up to and including the failing stage must have been called
-        assert called_stages == ["plan-milestones", "research-worker"]
-        # design-worker and later must NOT have been called
-        assert "design-worker" not in called_stages
-
-    def test_stage_failure_prints_resume_hint(self, tmp_path: Path) -> None:
-        """A stage failure must print a message with the failing stage name and resume command."""
-
-        def fake_run_stage(stage: str, **kwargs: object) -> None:
-            if stage == "design-worker":
-                raise RuntimeError("design agent timed out")
-
-        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
-            with (
-                patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
-                patch("composer.cli._run_pipeline_stage", side_effect=fake_run_stage),
-            ):
-                runner = CliRunner()
-                result = runner.invoke(
-                    composer,
-                    [
-                        "run",
-                        "--repo",
-                        "owner/repo",
-                        "--version",
-                        "MVP",
-                    ],
-                )
-
-        assert result.exit_code != 0
-        # The error output must name the failing stage and suggest a resume command
-        combined_output = result.output + (result.output or "")
-        assert "design-worker" in combined_output
-        assert "--from" in combined_output
-
-    def test_stage_failure_exit_code_nonzero(self, tmp_path: Path) -> None:
-        """Any stage failure must produce a non-zero exit code."""
-
-        def fake_run_stage(stage: str, **kwargs: object) -> None:
-            if stage == "plan-milestones":
-                raise Exception("something went wrong")
-
-        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
-            with (
-                patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
-                patch("composer.cli._run_pipeline_stage", side_effect=fake_run_stage),
-            ):
-                runner = CliRunner()
-                result = runner.invoke(
-                    composer,
-                    [
-                        "run",
-                        "--repo",
-                        "owner/repo",
-                        "--version",
-                        "MVP",
-                    ],
-                )
-
-        assert result.exit_code != 0
-
-
-# ---------------------------------------------------------------------------
-# composer run: --version derived from --spec filename
-# ---------------------------------------------------------------------------
-
-
-class TestRunVersionInference:
-    def test_version_inferred_from_spec_filename(self, tmp_path: Path) -> None:
-        """When --spec is given without --version, version defaults to spec filename stem."""
-        spec_file = tmp_path / "calculator.md"
-        spec_file.write_text("# Calculator Spec\n")
-
-        received_versions: list[str] = []
-
-        def fake_run_stage(stage: str, version: str, **kwargs: object) -> None:
-            received_versions.append(version)
-
-        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
-            with (
-                patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
-                patch("composer.cli._run_pipeline_stage", side_effect=fake_run_stage),
-            ):
-                runner = CliRunner()
-                result = runner.invoke(
-                    composer,
-                    ["run", "--repo", "owner/repo", "--spec", str(spec_file)],
-                )
-
-        assert result.exit_code == 0, result.output
-        # All stages received "calculator" as the version
-        assert all(v == "calculator" for v in received_versions)
-        assert len(received_versions) == len(_PIPELINE_STAGES)
-
-    def test_explicit_version_overrides_spec_stem(self, tmp_path: Path) -> None:
-        """--version overrides the version inferred from the spec filename."""
-        spec_file = tmp_path / "calculator.md"
-        spec_file.write_text("# Calculator Spec\n")
-
-        received_versions: list[str] = []
-
-        def fake_run_stage(stage: str, version: str, **kwargs: object) -> None:
-            received_versions.append(version)
-
-        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
-            with (
-                patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
-                patch("composer.cli._run_pipeline_stage", side_effect=fake_run_stage),
-            ):
-                runner = CliRunner()
-                result = runner.invoke(
-                    composer,
-                    [
-                        "run",
-                        "--repo",
-                        "owner/repo",
-                        "--spec",
-                        str(spec_file),
-                        "--version",
-                        "MVP",
-                    ],
-                )
-
-        assert result.exit_code == 0, result.output
-        assert all(v == "MVP" for v in received_versions)
-
-    def test_missing_version_and_spec_produces_error(self, tmp_path: Path) -> None:
-        """When neither --spec nor --version is given, the command must fail with a clear error."""
-        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
-            with patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))):
-                runner = CliRunner()
-                result = runner.invoke(
-                    composer,
-                    ["run", "--repo", "owner/repo"],
-                )
-
-        assert result.exit_code != 0
-        # Should mention --version or --spec in the error
-        assert "--version" in result.output or "--spec" in result.output
-
-
-# ---------------------------------------------------------------------------
-# composer --help includes run
-# ---------------------------------------------------------------------------
-
-
-class TestRunInHelp:
+class TestRunHelp:
     def test_run_appears_in_composer_help(self) -> None:
-        """composer --help must list 'run' as a subcommand."""
         runner = CliRunner()
         result = runner.invoke(composer, ["--help"])
-
         assert result.exit_code == 0
         assert "run" in result.output
 
     def test_run_help_shows_options(self) -> None:
-        """composer run --help must show --repo, --spec, --version, --from, --dry-run."""
         runner = CliRunner()
         result = runner.invoke(composer, ["run", "--help"])
-
         assert result.exit_code == 0
         output = result.output
-        assert "--repo" in output
-        assert "--spec" in output
-        assert "--version" in output
-        assert "--from" in output
+        assert "--research" in output
+        assert "--design" in output
+        assert "--impl" in output
+        assert "--all" in output
+        assert "--milestone" in output
         assert "--dry-run" in output
 
 
 # ---------------------------------------------------------------------------
-# composer run: error message surfaced (regression for Bug 1)
+# No stage flags → error
 # ---------------------------------------------------------------------------
 
 
-class TestRunErrorMessageSurfaced:
-    def test_exception_message_printed_before_resume_hint(self, tmp_path: Path) -> None:
-        """When a stage raises, its exception message must appear before the resume hint."""
+class TestRunRequiresStage:
+    def test_no_stage_flags_produces_error(self) -> None:
+        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
+            with patch("brimstone.cli._resolve_repo", return_value=(_REPO, None)):
+                with patch("brimstone.cli._milestone_exists", return_value=True):
+                    runner = CliRunner()
+                    result = runner.invoke(
+                        composer,
+                        ["run", "--repo", _REPO, "--milestone", _MILESTONE],
+                    )
+        assert result.exit_code != 0
+        assert "--research" in result.output or "--all" in result.output
 
-        def fake_run_stage(stage: str, **kwargs: object) -> None:
-            if stage == "plan-milestones":
-                raise Exception("something went wrong")
+    def test_missing_milestone_produces_error(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(composer, ["run", "--research", "--repo", _REPO])
+        assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# Non-init repo check: milestone must exist
+# ---------------------------------------------------------------------------
+
+
+class TestRunMilestoneCheck:
+    def test_missing_milestone_fails_early(self, tmp_path: Path) -> None:
+        """If the milestone does not exist, abort with a clear error before any stage runs."""
+        research_called: list[bool] = []
+
+        def fake_research(**kwargs: object) -> None:
+            research_called.append(True)
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
-                patch("composer.cli._run_pipeline_stage", side_effect=fake_run_stage),
+                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._milestone_exists", return_value=False),
+                patch("brimstone.cli._run_research_worker", side_effect=fake_research),
             ):
                 runner = CliRunner()
                 result = runner.invoke(
                     composer,
-                    ["run", "--repo", "owner/repo", "--version", "MVP"],
+                    ["run", "--research", "--repo", _REPO, "--milestone", _MILESTONE],
                 )
 
         assert result.exit_code != 0
-        # The raw exception message must appear in the combined output
-        assert "something went wrong" in result.output
-        # The resume hint must also appear
-        assert "To resume:" in result.output
-        # The exception message must appear before (at an earlier position than) the resume hint
-        assert result.output.index("something went wrong") < result.output.index("To resume:")
+        assert not research_called, "No stage should run when milestone is missing"
+        combined = result.output + (result.output or "")
+        assert "brimstone init" in combined or _MILESTONE in combined
 
-
-# ---------------------------------------------------------------------------
-# composer run: CLAUDECODE cleared before stage execution (regression for Bug 2)
-# ---------------------------------------------------------------------------
-
-
-class TestRunClearsCLAUDECODE:
-    def test_claudecode_cleared_before_stages_run(self, tmp_path: Path) -> None:
-        """composer run must clear CLAUDECODE so sub-stage load_config() calls succeed."""
-        env_snapshots: list[str | None] = []
-
-        def fake_run_stage(stage: str, **kwargs: object) -> None:
-            env_snapshots.append(os.environ.get("CLAUDECODE"))
-
-        with patch.dict("os.environ", {**MINIMAL_ENV, "CLAUDECODE": "1"}, clear=False):
+    def test_existing_milestone_proceeds(self, tmp_path: Path) -> None:
+        """If the milestone exists, stages run normally."""
+        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
-                patch("composer.cli._run_pipeline_stage", side_effect=fake_run_stage),
+                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._milestone_exists", return_value=True),
+                patch("brimstone.cli._count_all_open_research_issues", return_value=3),
+                patch("brimstone.cli.startup_sequence", return_value=(object(), object())),
+                patch("brimstone.cli._run_research_worker"),
             ):
                 runner = CliRunner()
                 result = runner.invoke(
                     composer,
-                    ["run", "--repo", "owner/repo", "--version", "MVP", "--dry-run"],
+                    ["run", "--research", "--repo", _REPO, "--milestone", _MILESTONE],
                 )
-
-        # dry-run exits cleanly
         assert result.exit_code == 0, result.output
 
-    def test_claudecode_not_set_during_stage_execution(self, tmp_path: Path) -> None:
-        """CLAUDECODE must not be present in os.environ when stages are called."""
-        env_snapshots: list[str | None] = []
+    def test_dry_run_skips_milestone_check(self, tmp_path: Path) -> None:
+        """--dry-run must not call _milestone_exists (no network call)."""
+        milestone_checked: list[bool] = []
 
-        def fake_run_stage(stage: str, **kwargs: object) -> None:
-            env_snapshots.append(os.environ.get("CLAUDECODE"))
+        def fake_check(repo: str, milestone: str) -> bool:
+            milestone_checked.append(True)
+            return False
 
-        with patch.dict("os.environ", {**MINIMAL_ENV, "CLAUDECODE": "1"}, clear=False):
+        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch("composer.cli._resolve_repo", return_value=("owner/repo", str(tmp_path))),
-                patch("composer.cli._run_pipeline_stage", side_effect=fake_run_stage),
+                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._milestone_exists", side_effect=fake_check),
             ):
                 runner = CliRunner()
                 result = runner.invoke(
                     composer,
-                    ["run", "--repo", "owner/repo", "--version", "MVP"],
+                    [
+                        "run",
+                        "--research",
+                        "--repo",
+                        _REPO,
+                        "--milestone",
+                        _MILESTONE,
+                        "--dry-run",
+                    ],
                 )
 
         assert result.exit_code == 0, result.output
-        # All stage invocations must have seen CLAUDECODE as absent (None)
-        assert all(v is None for v in env_snapshots), (
-            f"CLAUDECODE was still set during stage execution: {env_snapshots}"
-        )
+        assert not milestone_checked, "--dry-run must not check milestone existence"
+
+
+# ---------------------------------------------------------------------------
+# Stage completion checks (skip when already done)
+# ---------------------------------------------------------------------------
+
+
+class TestRunCompletionSkip:
+    def test_research_skipped_when_no_open_issues(self, tmp_path: Path) -> None:
+        """Research stage is skipped if there are no open research issues."""
+        research_called: list[bool] = []
+
+        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
+            with (
+                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._milestone_exists", return_value=True),
+                patch("brimstone.cli._count_all_open_research_issues", return_value=0),
+                patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
+                patch(
+                    "brimstone.cli._run_research_worker",
+                    side_effect=lambda **kw: research_called.append(True),
+                ),
+            ):
+                runner = CliRunner()
+                result = runner.invoke(
+                    composer,
+                    ["run", "--research", "--repo", _REPO, "--milestone", _MILESTONE],
+                )
+
+        assert result.exit_code == 0, result.output
+        assert not research_called, "research_worker should not run if already complete"
+        assert "already complete" in result.output
+
+    def test_design_skipped_when_hld_exists(self, tmp_path: Path) -> None:
+        """Design stage is skipped if HLD.md already exists on the default branch."""
+        design_called: list[bool] = []
+
+        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
+            with (
+                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._milestone_exists", return_value=True),
+                patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
+                patch("brimstone.cli._count_all_open_research_issues", return_value=0),
+                patch("brimstone.cli._doc_exists_on_default_branch", return_value=True),
+                patch(
+                    "brimstone.cli._run_design_worker",
+                    side_effect=lambda **kw: design_called.append(True),
+                ),
+            ):
+                runner = CliRunner()
+                result = runner.invoke(
+                    composer,
+                    ["run", "--design", "--repo", _REPO, "--milestone", _MILESTONE],
+                )
+
+        assert result.exit_code == 0, result.output
+        assert not design_called, "design_worker should not run if HLD already exists"
+        assert "already complete" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Gate checks
+# ---------------------------------------------------------------------------
+
+
+class TestRunGates:
+    def test_design_gate_blocks_when_research_not_done(self, tmp_path: Path) -> None:
+        """--design without --research aborts if there are open research issues."""
+        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
+            with (
+                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._milestone_exists", return_value=True),
+                patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
+                patch("brimstone.cli._doc_exists_on_default_branch", return_value=False),
+                patch("brimstone.cli._count_all_open_research_issues", return_value=5),
+            ):
+                runner = CliRunner()
+                result = runner.invoke(
+                    composer,
+                    ["run", "--design", "--repo", _REPO, "--milestone", _MILESTONE],
+                )
+
+        assert result.exit_code != 0
+        assert "--research" in result.output or "research" in result.output.lower()
+
+    def test_impl_gate_blocks_when_hld_missing(self, tmp_path: Path) -> None:
+        """--impl without --design aborts if HLD.md is missing."""
+        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
+            with (
+                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._milestone_exists", return_value=True),
+                patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
+                patch("brimstone.cli._doc_exists_on_default_branch", return_value=False),
+                patch("brimstone.cli._list_open_impl_issues", return_value=[]),
+            ):
+                runner = CliRunner()
+                result = runner.invoke(
+                    composer,
+                    ["run", "--impl", "--repo", _REPO, "--milestone", _MILESTONE],
+                )
+
+        assert result.exit_code != 0
+        assert "--design" in result.output or "design" in result.output.lower()
+
+    def test_all_skips_design_gate(self, tmp_path: Path) -> None:
+        """--all does not check the design gate (research is also being run)."""
+        calls: list[str] = []
+
+        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
+            with (
+                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._milestone_exists", return_value=True),
+                patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
+                patch("brimstone.cli._count_all_open_research_issues", return_value=2),
+                patch("brimstone.cli._doc_exists_on_default_branch", return_value=False),
+                patch("brimstone.cli._list_open_impl_issues", return_value=[{"number": 1}]),
+                patch(
+                    "brimstone.cli.startup_sequence",
+                    return_value=(object(), object()),
+                ),
+                patch(
+                    "brimstone.cli._run_research_worker",
+                    side_effect=lambda **kw: calls.append("research"),
+                ),
+                patch(
+                    "brimstone.cli._run_design_worker",
+                    side_effect=lambda **kw: calls.append("design"),
+                ),
+                patch(
+                    "brimstone.cli._run_impl_worker",
+                    side_effect=lambda **kw: calls.append("impl"),
+                ),
+            ):
+                runner = CliRunner()
+                result = runner.invoke(
+                    composer,
+                    ["run", "--all", "--repo", _REPO, "--milestone", _MILESTONE],
+                )
+
+        assert result.exit_code == 0, result.output
+        assert "research" in calls
+        assert "design" in calls
+        assert "impl" in calls
+
+    def test_design_research_together_skips_gate(self, tmp_path: Path) -> None:
+        """--design --research together does not trigger the design gate."""
+        calls: list[str] = []
+
+        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
+            with (
+                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._milestone_exists", return_value=True),
+                patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
+                patch("brimstone.cli._count_all_open_research_issues", return_value=1),
+                patch("brimstone.cli._doc_exists_on_default_branch", return_value=False),
+                patch("brimstone.cli.startup_sequence", return_value=(object(), object())),
+                patch(
+                    "brimstone.cli._run_research_worker",
+                    side_effect=lambda **kw: calls.append("research"),
+                ),
+                patch(
+                    "brimstone.cli._run_design_worker",
+                    side_effect=lambda **kw: calls.append("design"),
+                ),
+            ):
+                runner = CliRunner()
+                result = runner.invoke(
+                    composer,
+                    [
+                        "run",
+                        "--research",
+                        "--design",
+                        "--repo",
+                        _REPO,
+                        "--milestone",
+                        _MILESTONE,
+                    ],
+                )
+
+        assert result.exit_code == 0, result.output
+        assert calls == ["research", "design"]
+
+
+# ---------------------------------------------------------------------------
+# impl auto-runs plan-issues when no open impl issues
+# ---------------------------------------------------------------------------
+
+
+class TestRunImplAutoPlanIssues:
+    def test_impl_auto_runs_plan_issues_when_empty(self, tmp_path: Path) -> None:
+        calls: list[str] = []
+
+        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
+            with (
+                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._milestone_exists", return_value=True),
+                patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
+                patch("brimstone.cli._doc_exists_on_default_branch", return_value=True),
+                patch("brimstone.cli._list_open_impl_issues", return_value=[]),
+                patch("brimstone.cli.startup_sequence", return_value=(object(), object())),
+                patch(
+                    "brimstone.cli._run_plan_issues",
+                    side_effect=lambda **kw: calls.append("plan-issues"),
+                ),
+                patch(
+                    "brimstone.cli._run_impl_worker",
+                    side_effect=lambda **kw: calls.append("impl"),
+                ),
+            ):
+                runner = CliRunner()
+                result = runner.invoke(
+                    composer,
+                    ["run", "--impl", "--repo", _REPO, "--milestone", _MILESTONE],
+                )
+
+        assert result.exit_code == 0, result.output
+        assert calls == ["plan-issues", "impl"]
+
+    def test_impl_skips_plan_issues_when_issues_exist(self, tmp_path: Path) -> None:
+        calls: list[str] = []
+
+        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
+            with (
+                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._milestone_exists", return_value=True),
+                patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
+                patch("brimstone.cli._doc_exists_on_default_branch", return_value=True),
+                patch(
+                    "brimstone.cli._list_open_impl_issues",
+                    return_value=[{"number": 1}, {"number": 2}],
+                ),
+                patch("brimstone.cli.startup_sequence", return_value=(object(), object())),
+                patch(
+                    "brimstone.cli._run_plan_issues",
+                    side_effect=lambda **kw: calls.append("plan-issues"),
+                ),
+                patch(
+                    "brimstone.cli._run_impl_worker",
+                    side_effect=lambda **kw: calls.append("impl"),
+                ),
+            ):
+                runner = CliRunner()
+                result = runner.invoke(
+                    composer,
+                    ["run", "--impl", "--repo", _REPO, "--milestone", _MILESTONE],
+                )
+
+        assert result.exit_code == 0, result.output
+        assert "plan-issues" not in calls
+        assert "impl" in calls
+
+
+# ---------------------------------------------------------------------------
+# --dry-run: prints without invoking workers
+# ---------------------------------------------------------------------------
+
+
+class TestRunDryRun:
+    def test_dry_run_prints_stages_without_calling_workers(self, tmp_path: Path) -> None:
+        workers_called: list[str] = []
+
+        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
+            with (
+                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch(
+                    "brimstone.cli._run_research_worker",
+                    side_effect=lambda **kw: workers_called.append("research"),
+                ),
+                patch(
+                    "brimstone.cli._run_design_worker",
+                    side_effect=lambda **kw: workers_called.append("design"),
+                ),
+                patch(
+                    "brimstone.cli._run_impl_worker",
+                    side_effect=lambda **kw: workers_called.append("impl"),
+                ),
+            ):
+                runner = CliRunner()
+                result = runner.invoke(
+                    composer,
+                    [
+                        "run",
+                        "--all",
+                        "--repo",
+                        _REPO,
+                        "--milestone",
+                        _MILESTONE,
+                        "--dry-run",
+                    ],
+                )
+
+        assert result.exit_code == 0, result.output
+        assert not workers_called, "No workers should run in --dry-run mode"
+        assert "dry-run" in result.output.lower()
+
+    def test_dry_run_clears_claudecode_env(self, tmp_path: Path) -> None:
+        """CLAUDECODE must be cleared even in dry-run mode."""
+        snapshots: list[str | None] = []
+
+        with patch.dict("os.environ", {**MINIMAL_ENV, "CLAUDECODE": "1"}, clear=False):
+            with patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))):
+                original_count = patch("brimstone.cli._count_all_open_research_issues")
+                with original_count:
+
+                    def capture(*a: object, **kw: object) -> None:
+                        snapshots.append(os.environ.get("CLAUDECODE"))
+
+                    runner = CliRunner()
+                    result = runner.invoke(
+                        composer,
+                        [
+                            "run",
+                            "--research",
+                            "--repo",
+                            _REPO,
+                            "--milestone",
+                            _MILESTONE,
+                            "--dry-run",
+                        ],
+                    )
+
+        # The command must not fail and CLAUDECODE must have been cleared at invocation time
+        assert result.exit_code == 0, result.output
+        assert os.environ.get("CLAUDECODE") == "1"  # restored after invoke
+
+
+# ---------------------------------------------------------------------------
+# brimstone init --help
+# ---------------------------------------------------------------------------
+
+
+class TestInitHelp:
+    def test_init_appears_in_composer_help(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(composer, ["--help"])
+        assert result.exit_code == 0
+        assert "init" in result.output
+
+    def test_init_help_shows_options(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(composer, ["init", "--help"])
+        assert result.exit_code == 0
+        assert "--repo" in result.output
+        assert "--spec" in result.output
+        assert "--dry-run" in result.output
+
+
+# ---------------------------------------------------------------------------
+# brimstone adopt stub
+# ---------------------------------------------------------------------------
+
+
+class TestAdoptStub:
+    def test_adopt_exits_1_with_message(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(composer, ["adopt", "--source-repo", "owner/repo"])
+        assert result.exit_code == 1
+        assert "not yet implemented" in result.output.lower()

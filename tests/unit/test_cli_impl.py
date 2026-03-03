@@ -1,4 +1,4 @@
-"""Unit tests for the impl-worker loop in src/composer/cli.py.
+"""Unit tests for the impl-worker loop in src/brimstone/cli.py.
 
 Tests cover:
 - Issue selection respects module isolation (active module blocked)
@@ -20,21 +20,23 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from composer.cli import (
+from brimstone.cli import (
     UsageGovernor,
     _extract_module,
     _find_next_version,
     _find_pr_for_branch,
+    _find_pr_for_issue,
     _get_pr_checks_status,
     _get_review_status,
     _list_open_impl_issues,
     _monitor_pr,
     _run_impl_worker,
     _slugify,
+    _triage_review_comments,
 )
-from composer.config import Config
-from composer.runner import RunResult
-from composer.session import Checkpoint
+from brimstone.config import Config
+from brimstone.runner import RunResult
+from brimstone.session import Checkpoint
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -42,7 +44,7 @@ from composer.session import Checkpoint
 
 MINIMAL_ENV = {
     "ANTHROPIC_API_KEY": "sk-ant-test-key",
-    "GITHUB_TOKEN": "ghp-test-token",
+    "BRIMSTONE_GH_TOKEN": "ghp-test-token",
 }
 
 
@@ -51,7 +53,7 @@ def make_config(**overrides) -> Config:
     with patch.dict("os.environ", MINIMAL_ENV, clear=False):
         config = Config(
             anthropic_api_key=MINIMAL_ENV["ANTHROPIC_API_KEY"],
-            github_token=MINIMAL_ENV["GITHUB_TOKEN"],
+            github_token=MINIMAL_ENV["BRIMSTONE_GH_TOKEN"],
         )
     for k, v in overrides.items():
         object.__setattr__(config, k, v)
@@ -207,7 +209,7 @@ class TestExtractModule:
 
 class TestListOpenImplIssues:
     def _call(self, issues_json: str, returncode: int = 0) -> list[dict]:
-        with patch("composer.cli._gh") as mock_gh:
+        with patch("brimstone.cli._gh") as mock_gh:
             mock_gh.return_value = make_gh_result(stdout=issues_json, returncode=returncode)
             return _list_open_impl_issues("owner/repo", "M2: Implementation")
 
@@ -287,7 +289,7 @@ class TestModuleIsolation:
 
         dispatchable = []
         for issue in issues:
-            from composer.cli import _extract_module
+            from brimstone.cli import _extract_module
 
             mod = _extract_module(issue)
             if mod == "none" or mod not in active_modules:
@@ -309,7 +311,7 @@ class TestModuleIsolation:
 
         dispatchable = []
         for issue in issues:
-            from composer.cli import _extract_module
+            from brimstone.cli import _extract_module
 
             mod = _extract_module(issue)
             if mod == "none" or mod not in active_modules:
@@ -330,7 +332,7 @@ class TestModuleIsolation:
 
         dispatchable = []
         for issue in issues:
-            from composer.cli import _extract_module
+            from brimstone.cli import _extract_module
 
             mod = _extract_module(issue)
             if mod == "none" or mod not in active_modules:
@@ -370,15 +372,16 @@ class TestFindNextVersion:
 
 class TestGetPrChecksStatus:
     def _call(self, checks_json: str, returncode: int = 0) -> str:
-        with patch("composer.cli._gh") as mock_gh:
+        with patch("brimstone.cli._gh") as mock_gh:
             mock_gh.return_value = make_gh_result(stdout=checks_json, returncode=returncode)
             return _get_pr_checks_status("owner/repo", 42)
 
     def test_returns_pending_on_gh_failure(self) -> None:
         assert self._call("", returncode=1) == "pending"
 
-    def test_returns_pending_on_empty_checks(self) -> None:
-        assert self._call("[]") == "pending"
+    def test_returns_pass_on_empty_checks(self) -> None:
+        # No CI configured → treat as green so PRs aren't stuck
+        assert self._call("[]") == "pass"
 
     def test_returns_pass_when_all_succeed(self) -> None:
         checks = [
@@ -416,7 +419,7 @@ class TestGetPrChecksStatus:
 
 class TestGetReviewStatus:
     def _call(self, reviews_json: str, returncode: int = 0) -> str:
-        with patch("composer.cli._gh") as mock_gh:
+        with patch("brimstone.cli._gh") as mock_gh:
             mock_gh.return_value = make_gh_result(stdout=reviews_json, returncode=returncode)
             return _get_review_status("owner/repo", 42)
 
@@ -459,19 +462,112 @@ class TestGetReviewStatus:
 
 class TestFindPrForBranch:
     def test_returns_none_on_gh_failure(self) -> None:
-        with patch("composer.cli._gh") as mock_gh:
+        with patch("brimstone.cli._gh") as mock_gh:
             mock_gh.return_value = make_gh_result(returncode=1)
             assert _find_pr_for_branch("owner/repo", "42-add-config") is None
 
     def test_returns_none_when_no_prs(self) -> None:
-        with patch("composer.cli._gh") as mock_gh:
+        with patch("brimstone.cli._gh") as mock_gh:
             mock_gh.return_value = make_gh_result(stdout="[]")
             assert _find_pr_for_branch("owner/repo", "42-add-config") is None
 
     def test_returns_pr_number(self) -> None:
-        with patch("composer.cli._gh") as mock_gh:
+        with patch("brimstone.cli._gh") as mock_gh:
             mock_gh.return_value = make_gh_result(stdout=json.dumps([{"number": 99}]))
             assert _find_pr_for_branch("owner/repo", "42-add-config") == 99
+
+
+# ---------------------------------------------------------------------------
+# _find_pr_for_issue
+# ---------------------------------------------------------------------------
+
+
+class TestFindPrForIssue:
+    def _prs(self, items: list[dict]) -> str:
+        return json.dumps(items)
+
+    def test_returns_none_on_gh_failure(self) -> None:
+        with patch("brimstone.cli._gh") as mock_gh:
+            mock_gh.return_value = make_gh_result(returncode=1)
+            assert _find_pr_for_issue("owner/repo", 42) is None
+
+    def test_returns_none_when_no_prs(self) -> None:
+        with patch("brimstone.cli._gh") as mock_gh:
+            mock_gh.return_value = make_gh_result(stdout="[]")
+            assert _find_pr_for_issue("owner/repo", 42) is None
+
+    def test_matches_by_branch_prefix(self) -> None:
+        prs = [{"number": 77, "headRefName": "42-add-config", "body": ""}]
+        with patch("brimstone.cli._gh") as mock_gh:
+            mock_gh.return_value = make_gh_result(stdout=self._prs(prs))
+            result = _find_pr_for_issue("owner/repo", 42)
+        assert result == (77, "42-add-config")
+
+    def test_matches_by_closes_in_body(self) -> None:
+        prs = [{"number": 88, "headRefName": "some-other-branch", "body": "Closes #42\nDetails."}]
+        with patch("brimstone.cli._gh") as mock_gh:
+            mock_gh.return_value = make_gh_result(stdout=self._prs(prs))
+            result = _find_pr_for_issue("owner/repo", 42)
+        assert result == (88, "some-other-branch")
+
+    def test_ignores_non_matching_prs(self) -> None:
+        prs = [
+            {"number": 10, "headRefName": "99-unrelated", "body": "Closes #99"},
+        ]
+        with patch("brimstone.cli._gh") as mock_gh:
+            mock_gh.return_value = make_gh_result(stdout=self._prs(prs))
+            assert _find_pr_for_issue("owner/repo", 42) is None
+
+
+# ---------------------------------------------------------------------------
+# _triage_review_comments — fix agent dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestTriageReviewComments:
+    def test_dispatches_fix_agent_when_comments_exist(self) -> None:
+        comments = [
+            {"path": "src/foo.py", "line": 10, "body": "Please fix this."},
+        ]
+
+        with (
+            patch("brimstone.cli._gh") as mock_gh,
+            patch("brimstone.cli.runner.run") as mock_run,
+            patch("brimstone.cli.build_subprocess_env", return_value={}),
+        ):
+            mock_gh.return_value = make_gh_result(stdout=json.dumps(comments))
+            mock_run.return_value = make_run_result()
+
+            _triage_review_comments(
+                pr_number=99,
+                branch="42-add-config",
+                repo="owner/repo",
+                config=make_config(),
+                checkpoint=make_checkpoint(),
+                issue_number=42,
+            )
+
+        mock_run.assert_called_once()
+        prompt = mock_run.call_args[1]["prompt"]
+        assert "PR #99" in prompt
+        assert "42-add-config" in prompt
+        assert "src/foo.py" in prompt
+
+    def test_does_nothing_when_no_comments(self) -> None:
+        with (
+            patch("brimstone.cli._gh") as mock_gh,
+            patch("brimstone.cli.runner.run") as mock_run,
+        ):
+            mock_gh.return_value = make_gh_result(stdout="[]")
+            _triage_review_comments(
+                pr_number=99,
+                branch="42-add-config",
+                repo="owner/repo",
+                config=make_config(),
+                checkpoint=make_checkpoint(),
+                issue_number=42,
+            )
+        mock_run.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -510,9 +606,9 @@ class TestMonitorPr:
             return make_gh_result()
 
         with (
-            patch("composer.cli._gh", side_effect=gh_side_effect),
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
+            patch("brimstone.cli._gh", side_effect=gh_side_effect),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
         ):
             result = _monitor_pr(**self._make_monitor_kwargs())
 
@@ -523,8 +619,8 @@ class TestMonitorPr:
         checks = [{"name": "ci", "status": "in_progress", "conclusion": None}]
 
         with (
-            patch("composer.cli._gh") as mock_gh,
-            patch("composer.cli.logger.log_conductor_event"),
+            patch("brimstone.cli._gh") as mock_gh,
+            patch("brimstone.cli.logger.log_conductor_event"),
         ):
             mock_gh.return_value = make_gh_result(stdout=json.dumps(checks))
             result = _monitor_pr(**self._make_monitor_kwargs(max_polls=2))
@@ -547,8 +643,8 @@ class TestMonitorPr:
             return make_gh_result()
 
         with (
-            patch("composer.cli._gh", side_effect=gh_side_effect),
-            patch("composer.cli.logger.log_conductor_event"),
+            patch("brimstone.cli._gh", side_effect=gh_side_effect),
+            patch("brimstone.cli.logger.log_conductor_event"),
         ):
             # MAX_RETRIES = 3, so we need 3 fail polls
             _monitor_pr(**self._make_monitor_kwargs(max_polls=10))
@@ -579,10 +675,10 @@ class TestMonitorPr:
             return make_gh_result()
 
         with (
-            patch("composer.cli._gh", side_effect=gh_side_effect),
-            patch("composer.cli._rebase_branch", return_value=True) as mock_rebase,
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
+            patch("brimstone.cli._gh", side_effect=gh_side_effect),
+            patch("brimstone.cli._rebase_branch", return_value=True) as mock_rebase,
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
         ):
             _monitor_pr(**self._make_monitor_kwargs(max_polls=10))
 
@@ -603,9 +699,9 @@ class TestMonitorPr:
             return make_gh_result()
 
         with (
-            patch("composer.cli._gh", side_effect=gh_side_effect),
-            patch("composer.cli._rebase_branch", return_value=True),
-            patch("composer.cli.logger.log_conductor_event"),
+            patch("brimstone.cli._gh", side_effect=gh_side_effect),
+            patch("brimstone.cli._rebase_branch", return_value=True),
+            patch("brimstone.cli.logger.log_conductor_event"),
         ):
             result = _monitor_pr(**self._make_monitor_kwargs(max_polls=20))
 
@@ -627,12 +723,59 @@ class TestMonitorPr:
             return make_gh_result()
 
         with (
-            patch("composer.cli._gh", side_effect=gh_side_effect),
-            patch("composer.cli.logger.log_conductor_event"),
+            patch("brimstone.cli._gh", side_effect=gh_side_effect),
+            patch("brimstone.cli.logger.log_conductor_event"),
         ):
             result = _monitor_pr(**self._make_monitor_kwargs())
 
         assert result is False
+
+    def test_escalates_immediately_on_conflict_without_worktree(self) -> None:
+        """When worktree_path is empty and conflict detected, escalates without rebase."""
+        fail_checks = [{"name": "ci", "status": "completed", "conclusion": "failure"}]
+
+        def gh_side_effect(args, **kwargs):
+            args_str = " ".join(str(a) for a in args)
+            if "checks" in args_str:
+                return make_gh_result(stdout=json.dumps(fail_checks))
+            elif "mergeable" in args_str:
+                return make_gh_result(
+                    stdout=json.dumps({"mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"})
+                )
+            return make_gh_result()
+
+        with (
+            patch("brimstone.cli._gh", side_effect=gh_side_effect),
+            patch("brimstone.cli._rebase_branch") as mock_rebase,
+            patch("brimstone.cli.logger.log_conductor_event"),
+        ):
+            result = _monitor_pr(**self._make_monitor_kwargs(worktree_path="", max_polls=5))
+
+        assert result is False
+        mock_rebase.assert_not_called()
+
+    def test_merges_immediately_with_no_ci(self) -> None:
+        """When no CI checks are configured, PR should merge without waiting."""
+        reviews = {"reviews": []}
+
+        def gh_side_effect(args, **kwargs):
+            args_str = " ".join(str(a) for a in args)
+            if "checks" in args_str:
+                return make_gh_result(stdout="[]")  # no checks
+            elif "reviews" in args_str:
+                return make_gh_result(stdout=json.dumps(reviews))
+            elif "merge" in args_str:
+                return make_gh_result(returncode=0)
+            return make_gh_result()
+
+        with (
+            patch("brimstone.cli._gh", side_effect=gh_side_effect),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
+        ):
+            result = _monitor_pr(**self._make_monitor_kwargs())
+
+        assert result is True
 
 
 # ---------------------------------------------------------------------------
@@ -649,11 +792,11 @@ class TestRunImplWorkerCompletionGate:
         checkpoint = make_checkpoint(milestone="MVP Implementation")
 
         with (
-            patch("composer.cli._list_open_impl_issues", return_value=[]),
-            patch("composer.cli._gh") as mock_gh,
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
-            patch("composer.cli.click.echo"),
+            patch("brimstone.cli._list_open_impl_issues", return_value=[]),
+            patch("brimstone.cli._gh") as mock_gh,
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
+            patch("brimstone.cli.click.echo"),
         ):
             mock_gh.return_value = make_gh_result(returncode=0)
             _run_impl_worker(
@@ -677,11 +820,11 @@ class TestRunImplWorkerCompletionGate:
         checkpoint = make_checkpoint(milestone="MVP Implementation")
 
         with (
-            patch("composer.cli._list_open_impl_issues", return_value=[]),
-            patch("composer.cli._gh") as mock_gh,
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
-            patch("composer.cli.click.echo") as mock_echo,
+            patch("brimstone.cli._list_open_impl_issues", return_value=[]),
+            patch("brimstone.cli._gh") as mock_gh,
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
+            patch("brimstone.cli.click.echo") as mock_echo,
         ):
             _run_impl_worker(
                 repo="owner/repo",
@@ -721,18 +864,18 @@ class TestRunImplWorkerClaiming:
         ]
 
         with (
-            patch("composer.cli._list_open_impl_issues", side_effect=[issues, []]),
-            patch("composer.cli._claim_issue") as mock_claim,
-            patch("composer.cli._create_worktree", return_value="/tmp/wt"),
-            patch("composer.cli._dispatch_impl_agent") as mock_dispatch,
-            patch("composer.cli._find_pr_for_branch", return_value=None),
-            patch("composer.cli._unclaim_issue"),
-            patch("composer.cli._remove_worktree"),
-            patch("composer.cli._gh") as mock_gh,
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
-            patch("composer.cli.session.record_dispatch"),
-            patch("composer.cli.click.echo"),
+            patch("brimstone.cli._list_open_impl_issues", side_effect=[issues, []]),
+            patch("brimstone.cli._claim_issue") as mock_claim,
+            patch("brimstone.cli._create_worktree", return_value="/tmp/wt"),
+            patch("brimstone.cli._dispatch_impl_agent") as mock_dispatch,
+            patch("brimstone.cli._find_pr_for_branch", return_value=None),
+            patch("brimstone.cli._unclaim_issue"),
+            patch("brimstone.cli._remove_worktree"),
+            patch("brimstone.cli._gh") as mock_gh,
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
+            patch("brimstone.cli.session.record_dispatch"),
+            patch("brimstone.cli.click.echo"),
         ):
             mock_gh.return_value = make_gh_result(returncode=0)
             mock_dispatch.return_value = (
@@ -763,14 +906,14 @@ class TestRunImplWorkerClaiming:
         ]
 
         with (
-            patch("composer.cli._list_open_impl_issues", return_value=issues),
-            patch("composer.cli._create_worktree") as mock_create,
-            patch("composer.cli._claim_issue"),
-            patch("composer.cli._gh") as mock_gh,
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
-            patch("composer.cli.session.record_dispatch"),
-            patch("composer.cli.click.echo"),
+            patch("brimstone.cli._list_open_impl_issues", return_value=issues),
+            patch("brimstone.cli._create_worktree") as mock_create,
+            patch("brimstone.cli._claim_issue"),
+            patch("brimstone.cli._gh") as mock_gh,
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
+            patch("brimstone.cli.session.record_dispatch"),
+            patch("brimstone.cli.click.echo"),
         ):
             mock_gh.return_value = make_gh_result(returncode=0)
 
@@ -804,17 +947,17 @@ class TestRunImplWorkerRateLimitHandling:
         )
 
         with (
-            patch("composer.cli._list_open_impl_issues", side_effect=[issues, []]),
-            patch("composer.cli._claim_issue"),
-            patch("composer.cli._unclaim_issue") as mock_unclaim,
-            patch("composer.cli._create_worktree", return_value="/tmp/wt"),
-            patch("composer.cli._remove_worktree"),
-            patch("composer.cli._dispatch_impl_agent") as mock_dispatch,
-            patch("composer.cli._gh") as mock_gh,
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
-            patch("composer.cli.session.record_dispatch"),
-            patch("composer.cli.click.echo"),
+            patch("brimstone.cli._list_open_impl_issues", side_effect=[issues, []]),
+            patch("brimstone.cli._claim_issue"),
+            patch("brimstone.cli._unclaim_issue") as mock_unclaim,
+            patch("brimstone.cli._create_worktree", return_value="/tmp/wt"),
+            patch("brimstone.cli._remove_worktree"),
+            patch("brimstone.cli._dispatch_impl_agent") as mock_dispatch,
+            patch("brimstone.cli._gh") as mock_gh,
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
+            patch("brimstone.cli.session.record_dispatch"),
+            patch("brimstone.cli.click.echo"),
         ):
             mock_gh.return_value = make_gh_result(returncode=0)
             mock_dispatch.return_value = (

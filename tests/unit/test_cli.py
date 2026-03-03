@@ -1,4 +1,4 @@
-"""Unit tests for src/composer/cli.py."""
+"""Unit tests for src/brimstone/cli.py."""
 
 from __future__ import annotations
 
@@ -7,16 +7,16 @@ from unittest.mock import patch
 
 import pytest
 
-from composer import session
-from composer.cli import (
+from brimstone import session
+from brimstone.cli import (
     UsageGovernor,
     _apply_headless_policy,
     inject_skill,
     startup_sequence,
 )
-from composer.config import Config, OrchestratorNestingError
-from composer.health import FatalHealthCheckError
-from composer.session import Checkpoint
+from brimstone.config import Config, OrchestratorNestingError
+from brimstone.health import FatalHealthCheckError
+from brimstone.session import Checkpoint
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -24,7 +24,7 @@ from composer.session import Checkpoint
 
 MINIMAL_ENV = {
     "ANTHROPIC_API_KEY": "sk-ant-test-key",
-    "GITHUB_TOKEN": "ghp-test-token",
+    "BRIMSTONE_GH_TOKEN": "ghp-test-token",
 }
 
 
@@ -35,7 +35,7 @@ def make_config(**overrides) -> Config:
     with patch.dict("os.environ", env, clear=False):
         return Config(
             anthropic_api_key=env["ANTHROPIC_API_KEY"],
-            github_token=env["GITHUB_TOKEN"],
+            github_token=env["BRIMSTONE_GH_TOKEN"],
         )
 
 
@@ -250,7 +250,7 @@ class TestUsageGovernorRecord429:
         assert checkpoint.rate_limit_backoff_until is not None
 
     def test_record_429_checkpoint_is_in_backoff_after_call(self) -> None:
-        from composer.session import is_backing_off
+        from brimstone.session import is_backing_off
 
         config = make_config()
         checkpoint = make_checkpoint()
@@ -288,7 +288,7 @@ class TestUsageGovernorRecord429:
 class TestStartupSequence:
     def test_aborts_on_fatal_health_check(self, tmp_path: Path) -> None:
         """startup_sequence raises FatalHealthCheckError when health check is fatal."""
-        from composer.health import CheckResult, HealthReport
+        from brimstone.health import CheckResult, HealthReport
 
         fatal_report = HealthReport(
             checks=[
@@ -308,9 +308,9 @@ class TestStartupSequence:
 
         with (
             patch.dict("os.environ", {"CLAUDECODE": ""}, clear=False),
-            patch("composer.cli.health.check_all", return_value=fatal_report),
-            patch("composer.cli.health.format_report", return_value="FATAL"),
-            patch("composer.cli.click.echo"),
+            patch("brimstone.cli.health.check_all", return_value=fatal_report),
+            patch("brimstone.cli.health.format_report", return_value="FATAL"),
+            patch("brimstone.cli.click.echo"),
         ):
             with pytest.raises(FatalHealthCheckError):
                 startup_sequence(
@@ -322,7 +322,7 @@ class TestStartupSequence:
 
     def test_proceeds_with_warning_health_check(self, tmp_path: Path) -> None:
         """startup_sequence continues (and prints) when health check has only warnings."""
-        from composer.health import CheckResult, HealthReport
+        from brimstone.health import CheckResult, HealthReport
 
         warn_report = HealthReport(
             checks=[
@@ -341,11 +341,11 @@ class TestStartupSequence:
 
         with (
             patch.dict("os.environ", {"CLAUDECODE": ""}, clear=False),
-            patch("composer.cli.health.check_all", return_value=warn_report),
-            patch("composer.cli.health.format_report", return_value="WARN"),
-            patch("composer.cli.health.acquire_orchestrator_lock"),
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.click.echo") as mock_echo,
+            patch("brimstone.cli.health.check_all", return_value=warn_report),
+            patch("brimstone.cli.health.format_report", return_value="WARN"),
+            patch("brimstone.cli.health.acquire_orchestrator_lock"),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.click.echo") as mock_echo,
         ):
             _cfg, _chk = startup_sequence(
                 config=config,
@@ -375,7 +375,7 @@ class TestStartupSequence:
 
     def test_raises_value_error_on_run_id_mismatch(self, tmp_path: Path) -> None:
         """startup_sequence raises ValueError when resume_run_id doesn't match checkpoint."""
-        from composer.health import CheckResult, HealthReport
+        from brimstone.health import CheckResult, HealthReport
 
         pass_report = HealthReport(
             checks=[CheckResult(name="Git repo present", status="pass", message="ok")],
@@ -392,9 +392,9 @@ class TestStartupSequence:
 
         with (
             patch.dict("os.environ", {"CLAUDECODE": ""}, clear=False),
-            patch("composer.cli.health.check_all", return_value=pass_report),
-            patch("composer.cli.health.acquire_orchestrator_lock"),
-            patch("composer.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.health.check_all", return_value=pass_report),
+            patch("brimstone.cli.health.acquire_orchestrator_lock"),
+            patch("brimstone.cli.logger.log_conductor_event"),
         ):
             with pytest.raises(ValueError, match="run_id mismatch"):
                 startup_sequence(
@@ -407,7 +407,7 @@ class TestStartupSequence:
 
     def test_creates_new_checkpoint_when_none_exists(self, tmp_path: Path) -> None:
         """startup_sequence creates a new checkpoint when file does not exist."""
-        from composer.health import CheckResult, HealthReport
+        from brimstone.health import CheckResult, HealthReport
 
         pass_report = HealthReport(
             checks=[CheckResult(name="Git repo present", status="pass", message="ok")],
@@ -421,9 +421,9 @@ class TestStartupSequence:
 
         with (
             patch.dict("os.environ", {"CLAUDECODE": ""}, clear=False),
-            patch("composer.cli.health.check_all", return_value=pass_report),
-            patch("composer.cli.health.acquire_orchestrator_lock"),
-            patch("composer.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.health.check_all", return_value=pass_report),
+            patch("brimstone.cli.health.acquire_orchestrator_lock"),
+            patch("brimstone.cli.logger.log_conductor_event"),
         ):
             _cfg, chk = startup_sequence(
                 config=config,
@@ -438,7 +438,7 @@ class TestStartupSequence:
 
     def test_loads_existing_checkpoint(self, tmp_path: Path) -> None:
         """startup_sequence loads an existing checkpoint from disk."""
-        from composer.health import CheckResult, HealthReport
+        from brimstone.health import CheckResult, HealthReport
 
         pass_report = HealthReport(
             checks=[CheckResult(name="Git repo present", status="pass", message="ok")],
@@ -454,9 +454,9 @@ class TestStartupSequence:
 
         with (
             patch.dict("os.environ", {"CLAUDECODE": ""}, clear=False),
-            patch("composer.cli.health.check_all", return_value=pass_report),
-            patch("composer.cli.health.acquire_orchestrator_lock"),
-            patch("composer.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.health.check_all", return_value=pass_report),
+            patch("brimstone.cli.health.acquire_orchestrator_lock"),
+            patch("brimstone.cli.logger.log_conductor_event"),
         ):
             _cfg, chk = startup_sequence(
                 config=config,
@@ -470,16 +470,16 @@ class TestStartupSequence:
 
 
 # ---------------------------------------------------------------------------
-# composer --help lists all subcommands
+# brimstone --help lists all subcommands
 # ---------------------------------------------------------------------------
 
 
 class TestComposerHelp:
     def test_composer_help_lists_all_subcommands(self) -> None:
-        """composer --help must list all pipeline subcommands with descriptions."""
+        """composer --help must list all subcommands with descriptions."""
         from click.testing import CliRunner
 
-        from composer.cli import composer
+        from brimstone.cli import composer
 
         runner = CliRunner()
         result = runner.invoke(composer, ["--help"])
@@ -487,11 +487,9 @@ class TestComposerHelp:
         assert result.exit_code == 0
         output = result.output
 
-        # All seven subcommands must appear in the help output
-        assert "plan-milestones" in output
-        assert "research-worker" in output
-        assert "design-worker" in output
-        assert "plan-issues" in output
-        assert "impl-worker" in output
+        # New unified interface subcommands
+        assert "run" in output
+        assert "init" in output
+        assert "adopt" in output
         assert "health" in output
         assert "cost" in output

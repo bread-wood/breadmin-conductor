@@ -1,4 +1,4 @@
-"""Unit tests for --repo argument resolution in src/composer/cli.py."""
+"""Unit tests for --repo argument resolution in src/brimstone/cli.py."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import click
 import pytest
 
-from composer.cli import (
+from brimstone.cli import (
     _ensure_remote,
     _is_git_repo,
     _parse_github_owner_name,
@@ -78,7 +78,7 @@ class TestResolveRepoCwdMode:
         """No --repo flag succeeds when cwd is a git repo."""
         subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
         with patch("os.getcwd", return_value=str(tmp_path)):
-            with patch("composer.cli._infer_github_repo_from_path", return_value="owner/repo"):
+            with patch("brimstone.cli._infer_github_repo_from_path", return_value="owner/repo"):
                 repo_ref, local_path = _resolve_repo(None)
         assert repo_ref == "owner/repo"
         assert local_path == str(tmp_path)
@@ -120,7 +120,7 @@ class TestResolveRepoRemoteMode:
 
     def test_owner_name_does_not_call_scaffold(self) -> None:
         """owner/name format does NOT trigger _scaffold_new_repo."""
-        with patch("composer.cli._scaffold_new_repo") as mock_scaffold:
+        with patch("brimstone.cli._scaffold_new_repo") as mock_scaffold:
             _resolve_repo("owner/name")
         mock_scaffold.assert_not_called()
 
@@ -130,44 +130,92 @@ class TestResolveRepoRemoteMode:
 # ---------------------------------------------------------------------------
 
 
+def _gh_not_found() -> MagicMock:
+    """Fake subprocess result for 'gh repo view' when the repo does not exist."""
+    m = MagicMock()
+    m.returncode = 1
+    m.stdout = ""
+    return m
+
+
+def _gh_found(name_with_owner: str) -> MagicMock:
+    """Fake subprocess result for 'gh repo view' when the repo exists."""
+    m = MagicMock()
+    m.returncode = 0
+    m.stdout = name_with_owner + "\n"
+    return m
+
+
 class TestResolveRepoScaffoldMode:
-    def test_plain_name_triggers_scaffold(self, tmp_path: Path) -> None:
-        """Plain name (no slash) triggers _scaffold_new_repo."""
+    def test_plain_name_triggers_scaffold_when_repo_not_on_github(self, tmp_path: Path) -> None:
+        """Plain name (no slash) triggers _scaffold_new_repo when repo doesn't exist on GitHub."""
         fake_path = str(tmp_path / "mynewrepo")
-        with patch("composer.cli._scaffold_new_repo", return_value=fake_path) as mock_scaffold:
-            with patch(
-                "composer.cli._infer_github_repo_from_path",
-                return_value="myuser/mynewrepo",
-            ):
-                repo_ref, local_path = _resolve_repo("mynewrepo")
+        with patch("brimstone.cli.subprocess.run", return_value=_gh_not_found()):
+            with patch("brimstone.cli._scaffold_new_repo", return_value=fake_path) as mock_scaffold:
+                with patch(
+                    "brimstone.cli._infer_github_repo_from_path",
+                    return_value="myuser/mynewrepo",
+                ):
+                    repo_ref, local_path = _resolve_repo("mynewrepo")
         mock_scaffold.assert_called_once_with("mynewrepo")
         assert local_path == fake_path
+
+    def test_plain_name_uses_existing_remote_repo(self) -> None:
+        """Plain name returns (owner/name, None) when the repo already exists on GitHub."""
+        with patch(
+            "brimstone.cli.subprocess.run", return_value=_gh_found("bread-wood/calculator-cli")
+        ):
+            repo_ref, local_path = _resolve_repo("calculator-cli")
+        assert repo_ref == "bread-wood/calculator-cli"
+        assert local_path is None
+
+    def test_plain_name_matches_cwd_repo_name_uses_cwd(self, tmp_path: Path) -> None:
+        """Plain name matching cwd git repo's remote name uses cwd — no scaffold or gh call."""
+        subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+        # cwd remote is "bread-wood/calculator-cli"; repo_arg is "calculator-cli" (matches suffix).
+        # We patch _infer_github_repo_from_path so the remote lookup returns a known value.
+        # subprocess.run is NOT mocked — _is_git_repo must run for real against tmp_path.
+        with (
+            patch("os.getcwd", return_value=str(tmp_path)),
+            patch(
+                "brimstone.cli._infer_github_repo_from_path",
+                return_value="bread-wood/calculator-cli",
+            ),
+            patch("brimstone.cli._scaffold_new_repo") as mock_scaffold,
+        ):
+            repo_ref, local_path = _resolve_repo("calculator-cli")
+        mock_scaffold.assert_not_called()
+        assert repo_ref == "bread-wood/calculator-cli"
+        assert local_path == str(tmp_path)
 
     def test_scaffold_called_with_correct_name(self, tmp_path: Path) -> None:
         """The name passed to _scaffold_new_repo matches the CLI argument."""
         fake_path = str(tmp_path / "calculator-cli")
-        with patch("composer.cli._scaffold_new_repo", return_value=fake_path) as mock_scaffold:
-            with patch("composer.cli._infer_github_repo_from_path", return_value=None):
-                _resolve_repo("calculator-cli")
+        with patch("brimstone.cli.subprocess.run", return_value=_gh_not_found()):
+            with patch("brimstone.cli._scaffold_new_repo", return_value=fake_path) as mock_scaffold:
+                with patch("brimstone.cli._infer_github_repo_from_path", return_value=None):
+                    _resolve_repo("calculator-cli")
         mock_scaffold.assert_called_once_with("calculator-cli")
 
     def test_scaffold_returns_repo_ref_from_infer(self, tmp_path: Path) -> None:
         """When _infer_github_repo_from_path succeeds, repo_ref is owner/name."""
         fake_path = str(tmp_path / "testapp")
-        with patch("composer.cli._scaffold_new_repo", return_value=fake_path):
-            with patch(
-                "composer.cli._infer_github_repo_from_path",
-                return_value="bread-wood/testapp",
-            ):
-                repo_ref, _ = _resolve_repo("testapp")
+        with patch("brimstone.cli.subprocess.run", return_value=_gh_not_found()):
+            with patch("brimstone.cli._scaffold_new_repo", return_value=fake_path):
+                with patch(
+                    "brimstone.cli._infer_github_repo_from_path",
+                    return_value="bread-wood/testapp",
+                ):
+                    repo_ref, _ = _resolve_repo("testapp")
         assert repo_ref == "bread-wood/testapp"
 
     def test_scaffold_falls_back_to_name_when_infer_fails(self, tmp_path: Path) -> None:
         """When _infer_github_repo_from_path returns None, repo_ref is the name."""
         fake_path = str(tmp_path / "testapp")
-        with patch("composer.cli._scaffold_new_repo", return_value=fake_path):
-            with patch("composer.cli._infer_github_repo_from_path", return_value=None):
-                repo_ref, _ = _resolve_repo("testapp")
+        with patch("brimstone.cli.subprocess.run", return_value=_gh_not_found()):
+            with patch("brimstone.cli._scaffold_new_repo", return_value=fake_path):
+                with patch("brimstone.cli._infer_github_repo_from_path", return_value=None):
+                    repo_ref, _ = _resolve_repo("testapp")
         assert repo_ref == "testapp"
 
 
@@ -181,7 +229,7 @@ class TestResolveRepoLocalPathMode:
         """Local path that is a git repo returns (inferred_ref, abs_path)."""
         subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
         with patch(
-            "composer.cli._infer_github_repo_from_path",
+            "brimstone.cli._infer_github_repo_from_path",
             return_value="owner/mylocal",
         ):
             repo_ref, local_path = _resolve_repo(str(tmp_path))
@@ -203,7 +251,7 @@ class TestResolveRepoLocalPathMode:
         try:
             os.chdir(str(tmp_path))
             with patch(
-                "composer.cli._infer_github_repo_from_path",
+                "brimstone.cli._infer_github_repo_from_path",
                 return_value=None,
             ):
                 repo_ref, local_path = _resolve_repo(".")
@@ -311,7 +359,7 @@ class TestScaffoldNewRepo:
 
         with (
             patch("os.path.abspath", side_effect=fake_abspath),
-            patch("composer.cli._ensure_remote") as mock_ensure,
+            patch("brimstone.cli._ensure_remote") as mock_ensure,
         ):
             result = _scaffold_new_repo("myrepo")
 
@@ -335,7 +383,7 @@ class TestScaffoldNewRepo:
 
         with (
             patch("os.path.abspath", side_effect=fake_abspath),
-            patch("composer.cli._ensure_remote") as mock_ensure,
+            patch("brimstone.cli._ensure_remote") as mock_ensure,
         ):
             _scaffold_new_repo("myrepo")
 
@@ -363,7 +411,7 @@ class TestScaffoldNewRepo:
         with (
             patch("os.path.abspath", side_effect=fake_abspath),
             patch("subprocess.run", side_effect=mock_run),
-            patch("composer.cli._ensure_remote") as mock_ensure,
+            patch("brimstone.cli._ensure_remote") as mock_ensure,
         ):
             result = _scaffold_new_repo("alreadyrepo")
 

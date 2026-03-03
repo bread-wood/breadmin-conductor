@@ -1,4 +1,4 @@
-"""Unit tests for src/composer/config.py."""
+"""Unit tests for src/brimstone/config.py."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from composer.config import (
+from brimstone.config import (
     Config,
     ConfigurationError,
     OrchestratorNestingError,
@@ -22,7 +22,7 @@ from composer.config import (
 
 MINIMAL_ENV = {
     "ANTHROPIC_API_KEY": "sk-ant-test-key",
-    "GITHUB_TOKEN": "ghp-test-token",
+    "BRIMSTONE_GH_TOKEN": "ghp-test-token",
 }
 
 
@@ -74,24 +74,24 @@ def test_config_defaults_are_applied(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.api_key_helper is None
 
 
-def test_config_paths_default_to_home_composer(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Default log_dir and checkpoint_dir point to ~/.composer/*."""
+def test_config_paths_default_to_home_brimstone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default log_dir and checkpoint_dir point to ~/.brimstone/*."""
     for key, val in make_env().items():
         monkeypatch.setenv(key, val)
 
     config = Config()
-    assert config.log_dir == Path("~/.composer/logs")
-    assert config.checkpoint_dir == Path("~/.composer/checkpoints")
+    assert config.log_dir == Path("~/.brimstone/logs")
+    assert config.checkpoint_dir == Path("~/.brimstone/checkpoints")
 
 
 # ---------------------------------------------------------------------------
-# Config loading — COMPOSER_* overrides
+# Config loading — BRIMSTONE_* overrides
 # ---------------------------------------------------------------------------
 
 
 def test_conductor_max_concurrency_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
-    """COMPOSER_MAX_CONCURRENCY overrides the default."""
-    for key, val in make_env(COMPOSER_MAX_CONCURRENCY="5").items():
+    """BRIMSTONE_MAX_CONCURRENCY overrides the default."""
+    for key, val in make_env(BRIMSTONE_MAX_CONCURRENCY="5").items():
         monkeypatch.setenv(key, val)
 
     config = Config()
@@ -99,8 +99,8 @@ def test_conductor_max_concurrency_env_var(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_conductor_max_concurrency_custom_value(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A custom COMPOSER_MAX_CONCURRENCY value is reflected in the config."""
-    for key, val in make_env(COMPOSER_MAX_CONCURRENCY="8").items():
+    """A custom BRIMSTONE_MAX_CONCURRENCY value is reflected in the config."""
+    for key, val in make_env(BRIMSTONE_MAX_CONCURRENCY="8").items():
         monkeypatch.setenv(key, val)
 
     config = Config()
@@ -108,8 +108,8 @@ def test_conductor_max_concurrency_custom_value(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_conductor_subscription_tier_max(monkeypatch: pytest.MonkeyPatch) -> None:
-    """COMPOSER_SUBSCRIPTION_TIER=max is accepted."""
-    for key, val in make_env(COMPOSER_SUBSCRIPTION_TIER="max").items():
+    """BRIMSTONE_SUBSCRIPTION_TIER=max is accepted."""
+    for key, val in make_env(BRIMSTONE_SUBSCRIPTION_TIER="max").items():
         monkeypatch.setenv(key, val)
 
     config = Config()
@@ -117,8 +117,8 @@ def test_conductor_subscription_tier_max(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_conductor_subscription_tier_max20x(monkeypatch: pytest.MonkeyPatch) -> None:
-    """COMPOSER_SUBSCRIPTION_TIER=max20x is accepted."""
-    for key, val in make_env(COMPOSER_SUBSCRIPTION_TIER="max20x").items():
+    """BRIMSTONE_SUBSCRIPTION_TIER=max20x is accepted."""
+    for key, val in make_env(BRIMSTONE_SUBSCRIPTION_TIER="max20x").items():
         monkeypatch.setenv(key, val)
 
     config = Config()
@@ -135,7 +135,7 @@ def test_missing_anthropic_api_key_raises_configuration_error(
 ) -> None:
     """load_config() raises ConfigurationError when ANTHROPIC_API_KEY is absent."""
     monkeypatch.delenv("CLAUDECODE", raising=False)
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test-token")
+    monkeypatch.setenv("BRIMSTONE_GH_TOKEN", "ghp-test-token")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
     with pytest.raises(ConfigurationError) as exc_info:
@@ -147,23 +147,24 @@ def test_missing_anthropic_api_key_raises_configuration_error(
 def test_missing_github_token_raises_configuration_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """load_config() raises ConfigurationError when GITHUB_TOKEN is absent."""
+    """load_config() raises ConfigurationError when BRIMSTONE_GH_TOKEN is absent."""
     monkeypatch.delenv("CLAUDECODE", raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key")
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("BRIMSTONE_GH_TOKEN", raising=False)
 
     with pytest.raises(ConfigurationError) as exc_info:
         load_config()
 
-    assert "GITHUB_TOKEN" in str(exc_info.value)
+    assert "BRIMSTONE_GH_TOKEN" in str(exc_info.value)
 
 
 def test_invalid_subscription_tier_raises_configuration_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An unrecognised COMPOSER_SUBSCRIPTION_TIER raises ConfigurationError."""
+    """An unrecognised BRIMSTONE_SUBSCRIPTION_TIER raises ConfigurationError."""
     monkeypatch.delenv("CLAUDECODE", raising=False)
-    for key, val in make_env(COMPOSER_SUBSCRIPTION_TIER="enterprise").items():
+    for key, val in make_env(BRIMSTONE_SUBSCRIPTION_TIER="enterprise").items():
         monkeypatch.setenv(key, val)
 
     with pytest.raises(ConfigurationError):
@@ -173,9 +174,9 @@ def test_invalid_subscription_tier_raises_configuration_error(
 def test_invalid_max_budget_type_raises_configuration_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A non-numeric COMPOSER_MAX_BUDGET_USD raises ConfigurationError."""
+    """A non-numeric BRIMSTONE_MAX_BUDGET_USD raises ConfigurationError."""
     monkeypatch.delenv("CLAUDECODE", raising=False)
-    for key, val in make_env(COMPOSER_MAX_BUDGET_USD="not-a-number").items():
+    for key, val in make_env(BRIMSTONE_MAX_BUDGET_USD="not-a-number").items():
         monkeypatch.setenv(key, val)
 
     with pytest.raises(ConfigurationError):
@@ -244,7 +245,7 @@ def test_build_subprocess_env_does_not_include_parent_env_secrets() -> None:
             "AWS_SECRET_ACCESS_KEY": "top-secret",
             "DATABASE_URL": "postgres://user:pass@host/db",
             "GOOGLE_API_KEY": "google-key",
-            "COMPOSER_SOME_INTERNAL": "internal-value",
+            "BRIMSTONE_SOME_INTERNAL": "internal-value",
             "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
         },
     ):
@@ -253,7 +254,7 @@ def test_build_subprocess_env_does_not_include_parent_env_secrets() -> None:
     assert "AWS_SECRET_ACCESS_KEY" not in env
     assert "DATABASE_URL" not in env
     assert "GOOGLE_API_KEY" not in env
-    assert "COMPOSER_SOME_INTERNAL" not in env
+    assert "BRIMSTONE_SOME_INTERNAL" not in env
     assert "SSH_AUTH_SOCK" not in env
 
 
@@ -267,12 +268,12 @@ def test_build_subprocess_env_excludes_claudecode() -> None:
     assert "CLAUDECODE" not in env
 
 
-def test_build_subprocess_env_excludes_github_token_by_default() -> None:
-    """GITHUB_TOKEN is not in the base dict (injected via extra by the runner)."""
+def test_build_subprocess_env_includes_gh_token() -> None:
+    """GH_TOKEN is set so worker agents can use gh CLI as yeast-bot."""
     config = _make_config()
     env = build_subprocess_env(config)
     assert "GITHUB_TOKEN" not in env
-    assert "GH_TOKEN" not in env
+    assert env.get("GH_TOKEN") == config.github_token
 
 
 def test_build_subprocess_env_includes_required_keys() -> None:
@@ -347,7 +348,7 @@ def test_build_subprocess_env_includes_anthropic_api_key() -> None:
 
 def test_sessions_dir_derived_from_log_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     """sessions_dir is log_dir.expanduser() / 'sessions'."""
-    for key, val in make_env(COMPOSER_LOG_DIR="/tmp/test-logs").items():
+    for key, val in make_env(BRIMSTONE_LOG_DIR="/tmp/test-logs").items():
         monkeypatch.setenv(key, val)
 
     config = Config()
@@ -356,7 +357,7 @@ def test_sessions_dir_derived_from_log_dir(monkeypatch: pytest.MonkeyPatch) -> N
 
 def test_cost_ledger_derived_from_log_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     """cost_ledger is log_dir.expanduser() / 'cost.jsonl'."""
-    for key, val in make_env(COMPOSER_LOG_DIR="/tmp/test-logs").items():
+    for key, val in make_env(BRIMSTONE_LOG_DIR="/tmp/test-logs").items():
         monkeypatch.setenv(key, val)
 
     config = Config()

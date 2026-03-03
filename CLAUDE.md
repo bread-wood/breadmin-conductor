@@ -1,71 +1,109 @@
-# breadmin-composer — Orchestration Rules
+# brimstone — Orchestration Rules
 
 This repo follows the Orchestrator-Dispatch Protocol defined in `~/.claude/CLAUDE.md`.
 The rules below are repo-specific additions and overrides.
 
 ## Repo Context
 
-`breadmin-composer` is a Python CLI package. Source lives in `src/composer/`.
-Tests live in `tests/`. The package provides five entry points:
-- `research-worker` — headless research processing loop
-- `design-worker` — reads research docs, produces HLD and LLD design documents
-- `plan-issues` — reads design docs (HLD/LLD), breaks them into scoped impl issues
-- `impl-worker` — headless implementation issue processing loop
-- `composer` — admin commands (health, cost)
+`brimstone` is a Python CLI package. Source lives in `src/brimstone/`.
+Tests live in `tests/`. The package provides one entry point (`brimstone`) with these
+subcommands:
+- `brimstone run` — run one or more pipeline stages for a milestone
+- `brimstone init` — upload spec + seed milestone and research issues
+- `brimstone adopt` — adopt an existing repo (stub, not yet implemented)
+- `brimstone health` — preflight health checks
+- `brimstone cost` — cost ledger summary
 
 ## Worker Pipeline
 
-Each product version follows this six-stage pipeline:
+Each product version follows this eight-stage pipeline:
 
 ```
-spec              ← human: write a product spec (docs/specs/<version>.md) defining
-     |              scope, success criteria, and key constraints for this version
+spec            ← human: write a product spec (docs/specs/<version>.md) defining
+     |            scope, success criteria, and key constraints for this version
      ↓
-plan-milestones   ← human + orchestrator: read the spec, create milestone pair
-     |              (Research + Implementation), file seed research issues
+init            ← human + orchestrator: read the spec, create milestone, file seed
+     |            research issues
      ↓
-research-worker   ← dispatches research agents, fires completion gate when done,
-     |              migrates non-blocking issues to the next research milestone
+research        ← dispatches research agents, fires completion gate when done,
+     |            migrates non-blocking issues to the next version's research
      ↓
-design-worker     ← reads merged research docs, produces HLD (docs/design/HLD.md)
-     |              and per-module LLD docs (docs/design/lld/<module>.md)
+design          ← reads merged research docs, produces HLD (docs/design/HLD.md)
+     |            and per-module LLD docs (docs/design/lld/<module>.md)
      ↓
-plan-issues       ← reads HLD + LLD docs, produces fully-specified impl issues
-     |              with acceptance criteria, file scope, test requirements, dep graph
+scoping         ← reads HLD + LLD docs, produces fully-specified implementation issues
+     |            with acceptance criteria, file scope, test requirements, dep graph
      ↓
-impl-worker       ← claims impl issues, dispatches sub-agents, monitors CI, merges PRs
+implementation  ← claims implementation issues, dispatches sub-agents, monitors CI,
+     |            merges PRs
+     ↓
+qa              ← runs full test suite + exercises product against spec acceptance
+     |            criteria; files bug issues; loops with implementation until clean
+     ↓
+release         ← creates git tag on mainline, publishes GitHub release, files
+                  init issue for next version
 ```
 
 **No stage is skipped.**
-- `research-worker` must complete before `design-worker` begins
-- `design-worker` must produce and merge all design docs before `plan-issues` begins
-- `plan-issues` must file all impl issues before `impl-worker` begins
+- `research` must complete before `design` begins
+- `design` must produce and merge all design docs before `scoping` begins
+- `scoping` must file all implementation issues before `implementation` begins
+- `implementation` must close all implementation issues before `qa` begins
+- `qa` must pass clean before `release` runs
 
 ### Stage responsibilities
 
 | Stage | Produces | Does NOT produce |
 |-------|----------|-----------------|
 | `spec` | `docs/specs/<version>.md` | milestones, issues |
-| `plan-milestones` | GitHub milestone pair, seed research issues | design docs, impl issues |
-| `research-worker` | `docs/research/<N>-<slug>.md` per issue | design docs, impl issues |
-| `design-worker` | `docs/design/HLD.md`, `docs/design/lld/<module>.md` | impl issues, code |
-| `plan-issues` | GitHub impl issues with acceptance criteria and dep graph | design docs, code |
-| `impl-worker` | merged PRs, working code | anything in prior stages |
+| `init` | GitHub milestone, seed research issues | design docs, impl issues |
+| `research` | `docs/research/<N>-<slug>.md` per issue | design docs, impl issues |
+| `design` | `docs/design/HLD.md`, `docs/design/lld/<module>.md` | impl issues, code |
+| `scoping` | GitHub implementation issues with acceptance criteria and dep graph | design docs, code |
+| `implementation` | merged PRs, working code | anything in prior stages |
+| `qa` | bug issues (if any); clean bill of health | code, design docs |
+| `release` | git tag, GitHub release, init issue for next version | code, design docs |
 
 ## Milestone Model
 
-Milestones come in ordered pairs — Research and Implementation — one pair per version.
-The system always plans **at most one version ahead** of the current active pair.
+One milestone per version. All issues for a version — across all stages — belong to the
+same milestone. Stage labels (`stage/research`, `stage/design`, `stage/impl`) filter by
+stage within the milestone.
 
-**Naming convention**: `<Version> Research` and `<Version> Implementation` (or `Impl`).
-Use meaningful version identifiers (MVP, v1.1, v2 …) rather than opaque numbers.
-Workers identify milestone type by looking for the word "Research" or "Impl" in the title.
-
-**Always-one-ahead rule**: when the implementation phase of version N begins,
-run `plan-milestones` to create the research phase for version N+1.
+The system always plans **at most one version ahead** — when `implementation` begins for
+version N, run `init` to create the milestone for version N+1 and seed its research issues.
 
 **Never plan more than two versions out.** Research findings change scope; over-planning
 is waste.
+
+## Branch Strategy
+
+Trunk-based: all implementation PRs target `mainline` directly. The milestone is a GitHub
+milestone label, not a git branch. Release = git tag on mainline when `release` stage
+completes (e.g. `v0.1.0`).
+
+## Priority Labels
+
+Every issue must carry exactly one priority label:
+
+| Label | Meaning |
+|-------|---------|
+| `P0` | Release blocker — drop everything, must fix before any other progress |
+| `P1` | High — fix before the current stage completes |
+| `P2` | Normal — standard priority (default for new issues) |
+| `P3` | Low — fix if time allows, can slip to next version |
+| `P4` | Backlog — acknowledged but not scheduled |
+
+**Who sets priority:**
+- `init` seeds research issues at `P2` unless the spec flags a topic as critical (`P1`)
+- `scoping` assigns priority to implementation issues based on the dependency graph —
+  blockers get `P1`, leaf nodes get `P2`
+- `qa` files bugs at `P0` (crash / data loss) or `P1` (wrong output / spec violation)
+- Humans may override any priority at any time
+
+**How workers respect priority:**
+- Dispatch queue sorted by priority ascending (P0 first) before claiming the next issue
+- Within the same priority, oldest issue (lowest number) first
 
 ## Module Isolation
 
@@ -73,11 +111,11 @@ Agents are scoped to these modules. One agent per module at a time:
 
 | Module | Scope |
 |--------|-------|
-| `config` | `src/composer/config.py` |
-| `runner` | `src/composer/runner.py`, `src/composer/session.py` |
-| `health` | `src/composer/health.py` |
-| `logging` | `src/composer/logger.py` |
-| `cli` | `src/composer/cli.py`, `src/composer/skills/` (all skill files) |
+| `config` | `src/brimstone/config.py` |
+| `runner` | `src/brimstone/runner.py`, `src/brimstone/session.py` |
+| `health` | `src/brimstone/health.py` |
+| `logging` | `src/brimstone/logger.py` |
+| `cli` | `src/brimstone/cli.py`, `src/brimstone/skills/` (all skill files) |
 | `infra` | `pyproject.toml`, `.github/`, `CLAUDE.md`, `README.md` |
 | `docs` | `docs/` |
 
@@ -120,43 +158,47 @@ phase is always visible from the issue tracker.
 
 ### Issue format
 
-Title: `Run <worker> for <milestone or version>`
+Title: `<stage>: <version>`
 
 Examples:
-- `Run research-worker for MVP Research`
-- `Run design-worker for MVP Research`
-- `Run impl-worker for MVP Implementation`
-- `Run plan-milestones for v2`
+- `research: v0.1.0`
+- `design: v0.1.0`
+- `implementation: v0.1.0`
+- `qa: v0.1.0`
+- `release: v0.1.0`
+- `init: v0.2.0`
 
 ### Lifecycle
 
 1. **Filed** — when the previous stage completes, the worker files the next stage's issue
 2. **`in-progress`** — added when the stage begins (same as any other issue)
-3. **Closed** — when the stage completes; the closing comment links to the Notion session report
+3. **Closed** — when the stage completes; the closing comment links to the session report
 
 ### Who files what
 
 | Stage completes | Files next issue |
 |----------------|-----------------|
-| `plan-milestones` | `Run research-worker for <milestone>` |
-| `research-worker` | `Run design-worker for <milestone>` |
-| `design-worker` | `Run plan-issues for <milestone>` |
-| `plan-issues` | `Run impl-worker for <milestone>` |
-| `impl-worker` | `Run plan-milestones for <next version>` |
+| `init` | `research: <version>` |
+| `research` | `design: <version>` |
+| `design` | `scoping: <version>` |
+| `scoping` | `implementation: <version>` |
+| `implementation` | `qa: <version>` |
+| `qa` | `release: <version>` (if clean) or loops back to `implementation: <version>` (if bugs filed) |
+| `release` | `init: <next version>` |
 
 ```bash
 gh issue create \
   --repo <owner>/<repo> \
-  --title "Run <worker> for <milestone>" \
+  --title "<stage>: <version>" \
   --label "pipeline" \
-  --milestone "<relevant milestone>"
+  --milestone "<version>"
 ```
 
 ## Research Issue Triage
 
 Every research issue — including follow-ups created by agents — **must pass the triage rubric
 before being dispatched**. Apply it immediately after an agent creates follow-up issues (Step 3
-of the research-worker loop), not at dispatch time.
+of the research loop), not at dispatch time.
 
 ### Rubric
 
@@ -191,9 +233,8 @@ gh issue edit <N> --add-label "wont-research"
 
 ## Research Completion Gate
 
-Research for a milestone is **done enough to begin implementation** when all remaining open
-research issues are non-blocking — i.e., none of them would require a significant rewrite of
-an implementation issue in the current milestone if answered later.
+Research for a milestone is **done enough to begin design** when all remaining open
+research issues are non-blocking.
 
 ### Blocking vs. non-blocking test
 
@@ -206,19 +247,19 @@ A research issue is **blocking** if answering it would change the *design* (not 
 
 ### Gate procedure
 
-Before each research-worker dispatch batch, the orchestrator checks:
+Before each research dispatch batch, the orchestrator checks:
 
 ```
 For each open research issue in the active milestone:
   Is there a specific current-milestone implementation issue that cannot be
   designed without this answer?
-    YES → blocking, must dispatch before M_impl starts
-    NO  → non-blocking, migrate to the next research milestone
+    YES → blocking, must dispatch before design starts
+    NO  → non-blocking, migrate to the next version's research milestone
 ```
 
-If **zero blocking issues remain**, declare research complete for this milestone:
-1. Migrate all remaining non-blocking open research issues to the next research milestone
-2. Post the session report (Step 5)
+If **zero blocking issues remain**, declare research complete:
+1. Migrate all remaining non-blocking open research issues to the next version milestone
+2. Post the session report
 3. STOP — do not create more research issues just to fill the queue
 
 ## Follow-Up Milestone Assignment
@@ -229,12 +270,9 @@ milestone — **do not default to the parent's milestone**.
 ### Decision tree
 
 ```
-Is this follow-up needed to design a v1 implementation issue?
-  YES → same milestone as the current research milestone (M1 if in M1 research)
-  NO  →
-    Is it needed for a v2 feature already scoped?
-      YES → M3: v2 Research
-      NO  → M3: v2 Research (default for anything non-blocking)
+Is this follow-up needed to design a current-version implementation issue?
+  YES → current milestone
+  NO  → next version milestone (default for anything non-blocking)
 ```
 
 ### Practical guidance for agents
@@ -242,7 +280,7 @@ Is this follow-up needed to design a v1 implementation issue?
 When writing the "Follow-Up Research Recommendations" section of a doc, tag each item:
 
 - `[BLOCKS_IMPL]` — must be researched before the current implementation milestone
-- `[V2_RESEARCH]` — useful but doesn't block v1; file under the next research milestone
+- `[V2_RESEARCH]` — useful but doesn't block current version; file under the next milestone
 - `[WONT_RESEARCH]` — not worth a standalone doc; note inline
 
 Only create GitHub issues for `[BLOCKS_IMPL]` and `[V2_RESEARCH]` items.
@@ -251,22 +289,41 @@ To find the correct milestone, inspect what exists and pick by purpose — do no
 ```bash
 gh milestone list --repo <owner>/<repo>
 ```
-`[BLOCKS_IMPL]` → current research milestone.
-`[V2_RESEARCH]` → the lowest-numbered research milestone beyond the current one.
 
 ## Issue Labels
 
+### Stage
 | Label | Purpose |
 |-------|---------|
-| `research` | Research/investigation tasks |
-| `build` | Design and build planning tasks (HLD, LLD, impl issue decomposition) |
-| `infra` | Repo scaffolding, CI, pyproject |
+| `stage/research` | Research and investigation tasks |
+| `stage/design` | Design tasks (HLD, LLD) |
+| `stage/impl` | Implementation tasks (code + tests) |
+
+### Priority
+| Label | Purpose |
+|-------|---------|
+| `P0` | Release blocker |
+| `P1` | High priority |
+| `P2` | Normal (default) |
+| `P3` | Low priority |
+| `P4` | Backlog |
+
+### Status
+| Label | Purpose |
+|-------|---------|
+| `in-progress` | Currently being worked on (managed by orchestrator) |
+| `triage` | Follow-up issues pending triage decision (applied by research agents) |
+| `wont-research` | Closed by triage gate — below threshold for standalone research |
+| `pipeline` | Pipeline stage transition tracking issues |
+| `bug` | Defect filed by qa or reported post-release |
+
+### Feature / domain
+| Label | Purpose |
+|-------|---------|
 | `feat:config` | Config dataclass + env resolution |
 | `feat:runner` | Headless claude -p runner |
 | `feat:health` | Preflight health checks |
 | `feat:logging` | JSONL logging + cost ledger |
 | `feat:cli` | CLI wiring + skill files |
-| `in-progress` | Currently being worked on (managed by orchestrator) |
-| `triage` | Follow-up issues pending triage decision (applied by research agents) |
-| `wont-research` | Closed by triage gate — below threshold for standalone research |
-| `pipeline` | Pipeline stage transition tracking issues |
+| `infra` | Repo scaffolding, CI, pyproject |
+| `core` | Core pipeline plumbing |

@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "breadmin-composer"
+name = "brimstone"
 version = "0.1.0"
 description = "Headless Claude Code orchestrator CLI"
 readme = "README.md"
@@ -15,10 +15,10 @@ dependencies = [
 ]
 
 [project.scripts]
-composer         = "composer.cli:composer"
+brimstone        = "brimstone.cli:composer"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/composer"]
+packages = ["src/brimstone"]
 
 [dependency-groups]
 dev = [

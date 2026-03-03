@@ -1,4 +1,4 @@
-"""Configuration model for breadmin-composer.
+"""Configuration model for brimstone.
 
 Resolves settings from environment variables and CLI flags.
 CLI flags take precedence over env vars; env vars take precedence over defaults.
@@ -23,15 +23,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # ---------------------------------------------------------------------------
 
 
-class ComposerError(Exception):
-    """Base exception for all composer errors."""
+class BrimstoneError(Exception):
+    """Base exception for all brimstone errors."""
 
 
-class ConfigurationError(ComposerError):
+class ConfigurationError(BrimstoneError):
     """Missing or invalid configuration value."""
 
 
-class OrchestratorNestingError(ComposerError):
+class OrchestratorNestingError(BrimstoneError):
     """Raised when the conductor is launched inside a Claude Code session."""
 
 
@@ -41,24 +41,33 @@ class OrchestratorNestingError(ComposerError):
 
 
 class Config(BaseSettings):
-    """Runtime configuration for composer commands."""
+    """Runtime configuration for brimstone commands."""
 
     model_config = SettingsConfigDict(
-        env_prefix="COMPOSER_",
+        env_prefix="BRIMSTONE_",
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
         populate_by_name=True,
     )
 
-    # --- Required credentials (no COMPOSER_ prefix) ---
+    # --- Required credentials (no BRIMSTONE_ prefix) ---
     anthropic_api_key: str = Field(
-        validation_alias=AliasChoices("ANTHROPIC_API_KEY", "anthropic_api_key"),
-        description="Anthropic API key",
+        validation_alias=AliasChoices(
+            "BRIMSTONE_ANTHROPIC_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "anthropic_api_key",
+        ),
+        description="Anthropic API key (ANTHROPIC_API_KEY or BRIMSTONE_ANTHROPIC_API_KEY)",
     )
     github_token: str = Field(
-        validation_alias=AliasChoices("GITHUB_TOKEN", "github_token"),
-        description="GitHub personal access token",
+        validation_alias=AliasChoices(
+            "BRIMSTONE_GH_TOKEN",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "github_token",
+        ),
+        description="GitHub token (BRIMSTONE_GH_TOKEN, GH_TOKEN, or GITHUB_TOKEN)",
     )
 
     # --- Behaviour control ---
@@ -99,11 +108,11 @@ class Config(BaseSettings):
 
     # --- Paths ---
     log_dir: Path = Field(
-        default=Path("~/.composer/logs"),
+        default=Path("~/.brimstone/logs"),
         description="Directory for session logs and cost ledger",
     )
     checkpoint_dir: Path = Field(
-        default=Path("~/.composer/checkpoints"),
+        default=Path("~/.brimstone/checkpoints"),
         description="Directory for session checkpoints",
     )
 
@@ -153,7 +162,7 @@ class Config(BaseSettings):
     max_orphaned_issues: int = Field(
         default=5,
         ge=0,
-        validation_alias=AliasChoices("COMPOSER_MAX_ORPHANED_ISSUES", "max_orphaned_issues"),
+        validation_alias=AliasChoices("BRIMSTONE_MAX_ORPHANED_ISSUES", "max_orphaned_issues"),
         description="Maximum number of orphaned in-progress issues before health check fails",
     )
 
@@ -203,7 +212,7 @@ def load_config(**cli_overrides: Any) -> Config:
             "To run the conductor, open a plain terminal (not a Claude Code session) and\n"
             "invoke it from there. If you need to test the conductor from within Claude\n"
             "Code, use a sub-shell that unsets CLAUDECODE:\n\n"
-            "    (unset CLAUDECODE && composer impl-worker)"
+            "    (unset CLAUDECODE && brimstone impl-worker)"
         )
 
     try:
@@ -250,14 +259,20 @@ def _reraise_validation_error(exc: Exception) -> None:
 
 def _field_to_env_var(field_name: str) -> str:
     """Convert a Config field name to its corresponding environment variable name."""
-    # Fields with custom aliases (no COMPOSER_ prefix)
-    no_prefix = {
+    # Fields with custom aliases — maps both the Python field name and the alias
+    # (pydantic-settings may put either in errors()[0]["loc"]).
+    lookup = {
         "anthropic_api_key": "ANTHROPIC_API_KEY",
-        "github_token": "GITHUB_TOKEN",
+        "ANTHROPIC_API_KEY": "ANTHROPIC_API_KEY",
+        "BRIMSTONE_ANTHROPIC_API_KEY": "ANTHROPIC_API_KEY",
+        "github_token": "BRIMSTONE_GH_TOKEN",
+        "BRIMSTONE_GH_TOKEN": "BRIMSTONE_GH_TOKEN",
+        "GH_TOKEN": "BRIMSTONE_GH_TOKEN",
+        "GITHUB_TOKEN": "BRIMSTONE_GH_TOKEN",
     }
-    if field_name in no_prefix:
-        return no_prefix[field_name]
-    return "COMPOSER_" + field_name.upper()
+    if field_name in lookup:
+        return lookup[field_name]
+    return "BRIMSTONE_" + field_name.upper()
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +313,7 @@ def build_subprocess_env(
     api_key = _resolve_api_key(config)
 
     # Create a temp dir for Claude's config isolation.
-    claude_config_dir = tempfile.mkdtemp(prefix="composer-claude-config-")
+    claude_config_dir = tempfile.mkdtemp(prefix="brimstone-claude-config-")
     claude_home = Path(os.environ.get("HOME", "~")).expanduser() / ".claude"
 
     # Seed the statsig cache so the SDK doesn't hang on a cold-start network
@@ -356,6 +371,10 @@ def build_subprocess_env(
     # Include the resolved API key if available
     if api_key:
         env["ANTHROPIC_API_KEY"] = api_key
+
+    # Include the GitHub token so worker agents can use gh CLI as yeast-bot
+    if config.github_token:
+        env["GH_TOKEN"] = config.github_token
 
     # Merge caller-supplied overrides last
     env.update(extra)

@@ -1,4 +1,4 @@
-"""Unit tests for src/composer/logger.py."""
+"""Unit tests for src/brimstone/logger.py."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from composer.logger import (
-    COMPOSER_EVENT_TYPES,
+from brimstone.logger import (
+    BRIMSTONE_EVENT_TYPES,
     LogContext,
     _append_locked,
     _estimate_cost_usd,
@@ -666,12 +666,12 @@ def test_log_conductor_event_appends_multiple_events(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# COMPOSER_EVENT_TYPES constant
+# BRIMSTONE_EVENT_TYPES constant
 # ---------------------------------------------------------------------------
 
 
 def test_conductor_event_types_contains_all_11() -> None:
-    """COMPOSER_EVENT_TYPES contains exactly the 11 documented event types."""
+    """BRIMSTONE_EVENT_TYPES contains exactly the 11 documented event types."""
     expected = {
         "stage_start",
         "issue_claimed",
@@ -686,4 +686,4 @@ def test_conductor_event_types_contains_all_11() -> None:
         "checkpoint_write",
         "stage_complete",
     }
-    assert COMPOSER_EVENT_TYPES == expected
+    assert BRIMSTONE_EVENT_TYPES == expected

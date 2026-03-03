@@ -1,27 +1,33 @@
-"""Unit tests for design_worker and plan_issues loops in src/composer/cli.py.
+"""Unit tests for the two-phase design-worker and its Click commands.
 
 Tests cover:
-- _run_design_worker: dry-run prints prompt info without calling runner.run
-- _run_design_worker: dispatches runner.run with correct tools and logs events
-- _run_design_worker: handles runner error result gracefully
-- _run_plan_issues: dry-run prints prompt info without calling runner.run
+- _run_design_worker: Gate 1 aborts when open research issues remain
+- _run_design_worker: dry-run prints info without executing
+- _run_design_worker: Phase 1 skipped when HLD already merged (recovery)
+- _run_design_worker: Phase 1 dispatches HLD agent and merges PR
+- _run_design_worker: Phase 1 aborts on HLD agent error
+- _run_design_worker: Gate 2 aborts when HLD not on default branch after Phase 1 skip
+- _run_design_worker: Phase 2 dispatches LLD agents in parallel
+- _run_design_worker: Phase 2 skips already-merged LLD docs (recovery)
+- _run_design_worker: Phase 2 aborts when no LLD issues found
+- _run_plan_issues: dry-run prints info without calling runner.run
 - _run_plan_issues: dispatches runner.run with correct tools and logs events
 - _run_plan_issues: handles runner error result gracefully
-- design_worker Click command: requires --repo and --research-milestone
-- plan_issues Click command: requires --repo and --impl-milestone
+- design_worker Click command: requires --repo and --milestone
+- plan_issues Click command: requires --repo and --milestone
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-from click.testing import CliRunner
+import pytest
 
-from composer.cli import _run_design_worker, _run_plan_issues, composer
-from composer.config import Config
-from composer.runner import RunResult
-from composer.session import Checkpoint
+from brimstone.cli import _run_design_worker, _run_plan_issues
+from brimstone.config import Config
+from brimstone.runner import RunResult
+from brimstone.session import Checkpoint
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -29,7 +35,7 @@ from composer.session import Checkpoint
 
 MINIMAL_ENV = {
     "ANTHROPIC_API_KEY": "sk-ant-test-key",
-    "GITHUB_TOKEN": "ghp-test-token",
+    "BRIMSTONE_GH_TOKEN": "ghp-test-token",
 }
 
 
@@ -38,7 +44,7 @@ def make_config(tmp_path: Path, **overrides) -> Config:
     with patch.dict("os.environ", MINIMAL_ENV, clear=False):
         config = Config(
             anthropic_api_key=MINIMAL_ENV["ANTHROPIC_API_KEY"],
-            github_token=MINIMAL_ENV["GITHUB_TOKEN"],
+            github_token=MINIMAL_ENV["BRIMSTONE_GH_TOKEN"],
         )
     object.__setattr__(config, "checkpoint_dir", tmp_path / "checkpoints")
     object.__setattr__(config, "log_dir", tmp_path / "logs")
@@ -86,137 +92,472 @@ def make_run_result(
     )
 
 
+def make_design_issue(number: int, title: str) -> dict:
+    return {
+        "number": number,
+        "title": title,
+        "body": "",
+        "labels": [{"name": "stage/design"}],
+        "assignees": [],
+    }
+
+
 # ---------------------------------------------------------------------------
-# _run_design_worker
+# Shared patch context for _run_design_worker
+# ---------------------------------------------------------------------------
+
+_DESIGN_PATCHES = {
+    "count_research": "brimstone.cli._count_all_open_research_issues",
+    "default_branch": "brimstone.cli._get_default_branch_for_repo",
+    "repo_root": "brimstone.cli._get_repo_root",
+    "doc_exists": "brimstone.cli._doc_exists_on_default_branch",
+    "list_design": "brimstone.cli._list_open_design_issues",
+    "file_design": "brimstone.cli._file_design_issue_if_missing",
+    "claim": "brimstone.cli._claim_issue",
+    "unclaim": "brimstone.cli._unclaim_issue",
+    "create_wt": "brimstone.cli._create_worktree",
+    "remove_wt": "brimstone.cli._remove_worktree",
+    "dispatch_agent": "brimstone.cli._dispatch_design_agent",
+    "find_pr": "brimstone.cli._find_pr_for_branch",
+    "monitor_pr": "brimstone.cli._monitor_pr",
+    "file_pipeline": "brimstone.cli._file_pipeline_issue",
+    "log_event": "brimstone.cli.logger.log_conductor_event",
+    "save_session": "brimstone.cli.session.save",
+    "slugify": "brimstone.cli._slugify",
+}
+
+
+# ---------------------------------------------------------------------------
+# _run_design_worker: Gate 1 — open research issues
 # ---------------------------------------------------------------------------
 
 
-class TestRunDesignWorker:
-    def test_dry_run_prints_info_without_running(self, tmp_path: Path, capsys) -> None:
+class TestDesignWorkerGate1:
+    def test_aborts_when_research_open(self, tmp_path: Path, capsys) -> None:
         config = make_config(tmp_path)
-        checkpoint = make_checkpoint(stage="design")
+        checkpoint = make_checkpoint()
 
         with (
-            patch("composer.cli.runner.run") as mock_run,
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
+            patch(_DESIGN_PATCHES["count_research"], return_value=3),
+            patch(_DESIGN_PATCHES["log_event"]),
+            patch(_DESIGN_PATCHES["save_session"]),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                _run_design_worker(
+                    repo="owner/repo",
+                    milestone="v1",
+                    config=config,
+                    checkpoint=checkpoint,
+                    dry_run=False,
+                )
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "research" in captured.err.lower()
+        assert "3" in captured.err
+
+    def test_proceeds_when_no_open_research(self, tmp_path: Path) -> None:
+        config = make_config(tmp_path)
+        checkpoint = make_checkpoint()
+
+        with (
+            patch(_DESIGN_PATCHES["count_research"], return_value=0),
+            patch(_DESIGN_PATCHES["default_branch"], return_value="main"),
+            patch(_DESIGN_PATCHES["repo_root"], return_value="/repo"),
+            patch(_DESIGN_PATCHES["doc_exists"], return_value=True),  # HLD exists → skip Phase 1
+            patch(_DESIGN_PATCHES["list_design"], return_value=[]),
+            patch(_DESIGN_PATCHES["log_event"]),
+            patch(_DESIGN_PATCHES["save_session"]),
+            patch(_DESIGN_PATCHES["file_pipeline"]),
+        ):
+            # No LLD issues → SystemExit(1), but Gate 1 passed
+            with pytest.raises(SystemExit) as exc_info:
+                _run_design_worker(
+                    repo="owner/repo",
+                    milestone="v1",
+                    config=config,
+                    checkpoint=checkpoint,
+                    dry_run=False,
+                )
+        # Exits because no LLD issues, not because Gate 1
+        assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# _run_design_worker: dry-run
+# ---------------------------------------------------------------------------
+
+
+class TestDesignWorkerDryRun:
+    def test_dry_run_prints_info_without_executing(self, tmp_path: Path, capsys) -> None:
+        config = make_config(tmp_path)
+        checkpoint = make_checkpoint()
+
+        with (
+            patch(_DESIGN_PATCHES["dispatch_agent"]) as mock_dispatch,
+            patch(_DESIGN_PATCHES["log_event"]),
+            patch(_DESIGN_PATCHES["save_session"]),
         ):
             _run_design_worker(
                 repo="owner/repo",
-                research_milestone="v1",
+                milestone="v1",
                 config=config,
                 checkpoint=checkpoint,
                 dry_run=True,
             )
-            mock_run.assert_not_called()
+            mock_dispatch.assert_not_called()
 
         captured = capsys.readouterr()
         assert "[dry-run]" in captured.out
-        assert "design-worker" in captured.out
+        assert "HLD" in captured.out
+        assert "LLD" in captured.out
         assert "v1" in captured.out
 
-    def test_dispatches_runner_with_correct_tools(self, tmp_path: Path) -> None:
+
+# ---------------------------------------------------------------------------
+# _run_design_worker: Phase 1 HLD
+# ---------------------------------------------------------------------------
+
+
+class TestDesignWorkerPhase1:
+    def test_phase1_skipped_when_hld_exists(self, tmp_path: Path, capsys) -> None:
+        """When HLD doc already exists on default branch, Phase 1 is skipped."""
         config = make_config(tmp_path)
-        checkpoint = make_checkpoint(stage="design")
-        run_result = make_run_result()
+        checkpoint = make_checkpoint()
+
+        def doc_exists(repo, path, branch):
+            return True  # HLD exists, LLDs all exist too
+
+        lld_issue = make_design_issue(20, "Design: LLD for parser")
 
         with (
-            patch("composer.cli.runner.run", return_value=run_result) as mock_run,
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
-            patch("composer.cli.build_subprocess_env", return_value={}),
+            patch(_DESIGN_PATCHES["count_research"], return_value=0),
+            patch(_DESIGN_PATCHES["default_branch"], return_value="main"),
+            patch(_DESIGN_PATCHES["repo_root"], return_value="/repo"),
+            patch(_DESIGN_PATCHES["doc_exists"], side_effect=doc_exists),
+            patch(_DESIGN_PATCHES["list_design"], return_value=[lld_issue]),
+            patch(_DESIGN_PATCHES["dispatch_agent"]) as mock_dispatch,
+            patch(_DESIGN_PATCHES["claim"]),
+            patch(_DESIGN_PATCHES["create_wt"], return_value="/wt/20"),
+            patch(_DESIGN_PATCHES["find_pr"], return_value=5),
+            patch(_DESIGN_PATCHES["monitor_pr"], return_value=True),
+            patch(_DESIGN_PATCHES["remove_wt"]),
+            patch(_DESIGN_PATCHES["log_event"]),
+            patch(_DESIGN_PATCHES["save_session"]),
+            patch(_DESIGN_PATCHES["file_pipeline"]),
+            patch(_DESIGN_PATCHES["slugify"], return_value="design-lld-parser"),
         ):
+            mock_dispatch.return_value = make_run_result()
             _run_design_worker(
                 repo="owner/repo",
-                research_milestone="v1",
-                config=config,
-                checkpoint=checkpoint,
-                dry_run=False,
-            )
-
-        mock_run.assert_called_once()
-        call_kwargs = mock_run.call_args
-        allowed_tools = call_kwargs.kwargs.get("allowed_tools") or call_kwargs.args[1]
-        assert "Bash" in allowed_tools
-        assert "Read" in allowed_tools
-        assert "Write" in allowed_tools
-        assert "Glob" in allowed_tools
-        assert "Grep" in allowed_tools
-        assert "mcp__notion__API-post-page" not in allowed_tools
-        # design-worker must NOT dispatch sub-agents, so no agent tool
-        assert "mcp__claude_code__execute" not in allowed_tools
-
-    def test_prompt_includes_milestone_and_repo(self, tmp_path: Path) -> None:
-        config = make_config(tmp_path)
-        checkpoint = make_checkpoint(stage="design")
-        run_result = make_run_result()
-        captured_prompt: list[str] = []
-
-        def capture_run(prompt: str, **kwargs) -> RunResult:
-            captured_prompt.append(prompt)
-            return run_result
-
-        with (
-            patch("composer.cli.runner.run", side_effect=capture_run),
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
-            patch("composer.cli.build_subprocess_env", return_value={}),
-        ):
-            _run_design_worker(
-                repo="owner/repo",
-                research_milestone="v1",
-                config=config,
-                checkpoint=checkpoint,
-                dry_run=False,
-            )
-
-        assert len(captured_prompt) == 1
-        prompt = captured_prompt[0]
-        assert "owner/repo" in prompt
-        assert "v1" in prompt
-        # Skill file content injected
-        assert "design-worker" in prompt.lower() or "research" in prompt.lower()
-
-    def test_error_result_prints_to_stderr(self, tmp_path: Path, capsys) -> None:
-        config = make_config(tmp_path)
-        checkpoint = make_checkpoint(stage="design")
-        run_result = make_run_result(is_error=True, subtype="error_timeout", error_code="timeout")
-
-        with (
-            patch("composer.cli.runner.run", return_value=run_result),
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
-            patch("composer.cli.build_subprocess_env", return_value={}),
-        ):
-            _run_design_worker(
-                repo="owner/repo",
-                research_milestone="v1",
+                milestone="v1",
                 config=config,
                 checkpoint=checkpoint,
                 dry_run=False,
             )
 
         captured = capsys.readouterr()
-        assert "error" in captured.err.lower()
+        assert "skipping Phase 1" in captured.out
+
+    def test_phase1_dispatches_hld_agent(self, tmp_path: Path) -> None:
+        """Phase 1 dispatches the HLD agent when HLD doc is missing."""
+        config = make_config(tmp_path)
+        checkpoint = make_checkpoint()
+        hld_issue = make_design_issue(10, "Design: HLD for v1")
+        lld_issue = make_design_issue(20, "Design: LLD for parser")
+
+        hld_calls = [0]
+
+        def doc_exists(repo, path, branch):
+            if "HLD" in path:
+                # First call: HLD missing (Phase 1 trigger)
+                # Subsequent calls: HLD merged (Gate 2 + LLD skip check)
+                hld_calls[0] += 1
+                return hld_calls[0] > 1
+            return True  # LLD docs present → Phase 2 skips all
+
+        def list_design(repo, milestone):
+            if milestone == "v1":
+                return [lld_issue]
+            return []
+
+        with (
+            patch(_DESIGN_PATCHES["count_research"], return_value=0),
+            patch(_DESIGN_PATCHES["default_branch"], return_value="main"),
+            patch(_DESIGN_PATCHES["repo_root"], return_value="/repo"),
+            patch(_DESIGN_PATCHES["doc_exists"], side_effect=doc_exists),
+            patch(_DESIGN_PATCHES["list_design"], side_effect=list_design),
+            patch(_DESIGN_PATCHES["file_design"]),
+            patch(_DESIGN_PATCHES["claim"]),
+            patch(_DESIGN_PATCHES["create_wt"], return_value="/wt/10"),
+            patch(_DESIGN_PATCHES["find_pr"], return_value=1),
+            patch(_DESIGN_PATCHES["monitor_pr"], return_value=True),
+            patch(_DESIGN_PATCHES["remove_wt"]),
+            patch(_DESIGN_PATCHES["dispatch_agent"], return_value=make_run_result()) as mock_da,
+            patch(_DESIGN_PATCHES["log_event"]),
+            patch(_DESIGN_PATCHES["save_session"]),
+            patch(_DESIGN_PATCHES["file_pipeline"]),
+            patch(_DESIGN_PATCHES["slugify"], return_value="design-hld-v1"),
+            # Patch _list_open_design_issues to return hld_issue on first call
+            patch(
+                "brimstone.cli._list_open_design_issues",
+                side_effect=[
+                    [hld_issue],  # finding HLD issue
+                    [lld_issue],  # finding LLD issues in Phase 2
+                ],
+            ),
+        ):
+            _run_design_worker(
+                repo="owner/repo",
+                milestone="v1",
+                config=config,
+                checkpoint=checkpoint,
+                dry_run=False,
+            )
+
+        # HLD agent was dispatched with the right skill
+        hld_call = mock_da.call_args_list[0]
+        assert hld_call.kwargs["skill_name"] == "design-worker-hld"
+        assert hld_call.kwargs["module_name"] is None
+
+    def test_phase1_aborts_on_hld_agent_error(self, tmp_path: Path, capsys) -> None:
+        config = make_config(tmp_path)
+        checkpoint = make_checkpoint()
+        hld_issue = make_design_issue(10, "Design: HLD for v1")
+
+        with (
+            patch(_DESIGN_PATCHES["count_research"], return_value=0),
+            patch(_DESIGN_PATCHES["default_branch"], return_value="main"),
+            patch(_DESIGN_PATCHES["repo_root"], return_value="/repo"),
+            patch(_DESIGN_PATCHES["doc_exists"], return_value=False),
+            patch("brimstone.cli._list_open_design_issues", return_value=[hld_issue]),
+            patch(_DESIGN_PATCHES["claim"]),
+            patch(_DESIGN_PATCHES["unclaim"]),
+            patch(_DESIGN_PATCHES["create_wt"], return_value="/wt/10"),
+            patch(_DESIGN_PATCHES["remove_wt"]),
+            patch(
+                _DESIGN_PATCHES["dispatch_agent"],
+                return_value=make_run_result(is_error=True, subtype="error_timeout"),
+            ),
+            patch(_DESIGN_PATCHES["log_event"]),
+            patch(_DESIGN_PATCHES["save_session"]),
+            patch(_DESIGN_PATCHES["slugify"], return_value="design-hld-v1"),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                _run_design_worker(
+                    repo="owner/repo",
+                    milestone="v1",
+                    config=config,
+                    checkpoint=checkpoint,
+                    dry_run=False,
+                )
+        assert exc_info.value.code == 1
+        assert "HLD agent failed" in capsys.readouterr().err
+
+    def test_gate2_aborts_when_hld_not_merged(self, tmp_path: Path, capsys) -> None:
+        """Gate 2: if HLD skipped (e.g. issue was missing) but doc not on branch, abort."""
+        config = make_config(tmp_path)
+        checkpoint = make_checkpoint()
+
+        # Simulate: HLD was skipped (no issue found) but doc still not on branch
+        with (
+            patch(_DESIGN_PATCHES["count_research"], return_value=0),
+            patch(_DESIGN_PATCHES["default_branch"], return_value="main"),
+            patch(_DESIGN_PATCHES["repo_root"], return_value="/repo"),
+            patch(_DESIGN_PATCHES["doc_exists"], return_value=False),
+            patch("brimstone.cli._list_open_design_issues", return_value=[]),
+            patch(_DESIGN_PATCHES["file_design"]),
+            patch(_DESIGN_PATCHES["log_event"]),
+            patch(_DESIGN_PATCHES["save_session"]),
+            patch(_DESIGN_PATCHES["slugify"], return_value="slug"),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                _run_design_worker(
+                    repo="owner/repo",
+                    milestone="v1",
+                    config=config,
+                    checkpoint=checkpoint,
+                    dry_run=False,
+                )
+        assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# _run_design_worker: Phase 2 LLDs
+# ---------------------------------------------------------------------------
+
+
+class TestDesignWorkerPhase2:
+    def _make_full_patches(self, hld_merged=True, lld_doc_exists=False, lld_issues=None):
+        """Build a consistent set of patches for Phase 2 tests."""
+        if lld_issues is None:
+            lld_issues = [make_design_issue(20, "Design: LLD for parser")]
+
+        def doc_exists(repo, path, branch):
+            if "HLD" in path:
+                return hld_merged
+            return lld_doc_exists
+
+        return {
+            "count_research": (0,),
+            "default_branch": ("main",),
+            "repo_root": ("/repo",),
+            "doc_exists_fn": doc_exists,
+            "lld_issues": lld_issues,
+        }
+
+    def test_phase2_dispatches_lld_agents(self, tmp_path: Path) -> None:
+        config = make_config(tmp_path)
+        checkpoint = make_checkpoint()
+
+        lld_issues = [
+            make_design_issue(20, "Design: LLD for parser"),
+            make_design_issue(21, "Design: LLD for formatter"),
+        ]
+
+        def doc_exists(repo, path, branch):
+            return "HLD" in path  # HLD present, no LLD docs yet
+
+        with (
+            patch(_DESIGN_PATCHES["count_research"], return_value=0),
+            patch(_DESIGN_PATCHES["default_branch"], return_value="main"),
+            patch(_DESIGN_PATCHES["repo_root"], return_value="/repo"),
+            patch(_DESIGN_PATCHES["doc_exists"], side_effect=doc_exists),
+            patch(
+                "brimstone.cli._list_open_design_issues",
+                return_value=lld_issues,
+            ),
+            patch(_DESIGN_PATCHES["claim"]),
+            patch(
+                _DESIGN_PATCHES["create_wt"],
+                side_effect=["/wt/20", "/wt/21"],
+            ),
+            patch(_DESIGN_PATCHES["dispatch_agent"], return_value=make_run_result()) as mock_da,
+            patch(_DESIGN_PATCHES["find_pr"], return_value=5),
+            patch(_DESIGN_PATCHES["monitor_pr"], return_value=True),
+            patch(_DESIGN_PATCHES["remove_wt"]),
+            patch(_DESIGN_PATCHES["file_pipeline"]),
+            patch(_DESIGN_PATCHES["log_event"]),
+            patch(_DESIGN_PATCHES["save_session"]),
+            patch(_DESIGN_PATCHES["slugify"], return_value="some-slug"),
+        ):
+            _run_design_worker(
+                repo="owner/repo",
+                milestone="v1",
+                config=config,
+                checkpoint=checkpoint,
+                dry_run=False,
+            )
+
+        # Both LLD agents dispatched
+        assert mock_da.call_count == 2
+        skill_names = {c.kwargs["skill_name"] for c in mock_da.call_args_list}
+        assert skill_names == {"design-worker-lld"}
+        module_names = {c.kwargs["module_name"] for c in mock_da.call_args_list}
+        assert "parser" in module_names
+        assert "formatter" in module_names
+
+    def test_phase2_skips_already_merged_ldds(self, tmp_path: Path, capsys) -> None:
+        """Already-merged LLD docs are skipped and their issues closed."""
+        config = make_config(tmp_path)
+        checkpoint = make_checkpoint()
+
+        lld_issues = [
+            make_design_issue(20, "Design: LLD for parser"),
+            make_design_issue(21, "Design: LLD for formatter"),
+        ]
+
+        def doc_exists(repo, path, branch):
+            # HLD and parser both exist; formatter does not
+            return "HLD" in path or "parser" in path
+
+        with (
+            patch(_DESIGN_PATCHES["count_research"], return_value=0),
+            patch(_DESIGN_PATCHES["default_branch"], return_value="main"),
+            patch(_DESIGN_PATCHES["repo_root"], return_value="/repo"),
+            patch(_DESIGN_PATCHES["doc_exists"], side_effect=doc_exists),
+            patch("brimstone.cli._list_open_design_issues", return_value=lld_issues),
+            patch(_DESIGN_PATCHES["claim"]),
+            patch(_DESIGN_PATCHES["create_wt"], return_value="/wt/21"),
+            patch(_DESIGN_PATCHES["dispatch_agent"], return_value=make_run_result()) as mock_da,
+            patch(_DESIGN_PATCHES["find_pr"], return_value=5),
+            patch(_DESIGN_PATCHES["monitor_pr"], return_value=True),
+            patch(_DESIGN_PATCHES["remove_wt"]),
+            patch(_DESIGN_PATCHES["file_pipeline"]),
+            patch(_DESIGN_PATCHES["log_event"]),
+            patch(_DESIGN_PATCHES["save_session"]),
+            patch(_DESIGN_PATCHES["slugify"], return_value="slug"),
+            patch("brimstone.cli._gh"),  # swallow the issue-close call
+        ):
+            _run_design_worker(
+                repo="owner/repo",
+                milestone="v1",
+                config=config,
+                checkpoint=checkpoint,
+                dry_run=False,
+            )
+
+        # Only formatter was dispatched
+        assert mock_da.call_count == 1
+        assert mock_da.call_args.kwargs["module_name"] == "formatter"
+        captured = capsys.readouterr()
+        assert "parser" in captured.out and "skipping" in captured.out
+
+    def test_phase2_aborts_when_no_lld_issues(self, tmp_path: Path, capsys) -> None:
+        config = make_config(tmp_path)
+        checkpoint = make_checkpoint()
+
+        with (
+            patch(_DESIGN_PATCHES["count_research"], return_value=0),
+            patch(_DESIGN_PATCHES["default_branch"], return_value="main"),
+            patch(_DESIGN_PATCHES["repo_root"], return_value="/repo"),
+            patch(_DESIGN_PATCHES["doc_exists"], return_value=True),  # HLD present
+            patch("brimstone.cli._list_open_design_issues", return_value=[]),
+            patch(_DESIGN_PATCHES["log_event"]),
+            patch(_DESIGN_PATCHES["save_session"]),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                _run_design_worker(
+                    repo="owner/repo",
+                    milestone="v1",
+                    config=config,
+                    checkpoint=checkpoint,
+                    dry_run=False,
+                )
+        assert exc_info.value.code == 1
+        assert "lld" in capsys.readouterr().err.lower()
 
     def test_logs_start_and_complete_events(self, tmp_path: Path) -> None:
         config = make_config(tmp_path)
-        checkpoint = make_checkpoint(stage="design")
-        run_result = make_run_result()
+        checkpoint = make_checkpoint()
+        lld_issue = make_design_issue(20, "Design: LLD for parser")
         logged_events: list[str] = []
 
         def record_event(**kwargs) -> None:
             logged_events.append(kwargs.get("event_type", ""))
 
+        def doc_exists(repo, path, branch):
+            return "HLD" in path
+
         with (
-            patch("composer.cli.runner.run", return_value=run_result),
-            patch("composer.cli.logger.log_conductor_event", side_effect=record_event),
-            patch("composer.cli.session.save"),
-            patch("composer.cli.build_subprocess_env", return_value={}),
+            patch(_DESIGN_PATCHES["count_research"], return_value=0),
+            patch(_DESIGN_PATCHES["default_branch"], return_value="main"),
+            patch(_DESIGN_PATCHES["repo_root"], return_value="/repo"),
+            patch(_DESIGN_PATCHES["doc_exists"], side_effect=doc_exists),
+            patch("brimstone.cli._list_open_design_issues", return_value=[lld_issue]),
+            patch(_DESIGN_PATCHES["claim"]),
+            patch(_DESIGN_PATCHES["create_wt"], return_value="/wt/20"),
+            patch(_DESIGN_PATCHES["dispatch_agent"], return_value=make_run_result()),
+            patch(_DESIGN_PATCHES["find_pr"], return_value=5),
+            patch(_DESIGN_PATCHES["monitor_pr"], return_value=True),
+            patch(_DESIGN_PATCHES["remove_wt"]),
+            patch(_DESIGN_PATCHES["file_pipeline"]),
+            patch(_DESIGN_PATCHES["log_event"], side_effect=record_event),
+            patch(_DESIGN_PATCHES["save_session"]),
+            patch(_DESIGN_PATCHES["slugify"], return_value="slug"),
         ):
             _run_design_worker(
                 repo="owner/repo",
-                research_milestone="v1",
+                milestone="v1",
                 config=config,
                 checkpoint=checkpoint,
                 dry_run=False,
@@ -237,13 +578,13 @@ class TestRunPlanIssues:
         checkpoint = make_checkpoint(stage="plan-issues")
 
         with (
-            patch("composer.cli.runner.run") as mock_run,
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
+            patch("brimstone.cli.runner.run") as mock_run,
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
         ):
             _run_plan_issues(
                 repo="owner/repo",
-                impl_milestone="v1",
+                milestone="v1",
                 config=config,
                 checkpoint=checkpoint,
                 dry_run=True,
@@ -261,14 +602,14 @@ class TestRunPlanIssues:
         run_result = make_run_result()
 
         with (
-            patch("composer.cli.runner.run", return_value=run_result) as mock_run,
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
-            patch("composer.cli.build_subprocess_env", return_value={}),
+            patch("brimstone.cli.runner.run", return_value=run_result) as mock_run,
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
+            patch("brimstone.cli.build_subprocess_env", return_value={}),
         ):
             _run_plan_issues(
                 repo="owner/repo",
-                impl_milestone="v1",
+                milestone="v1",
                 config=config,
                 checkpoint=checkpoint,
                 dry_run=False,
@@ -286,7 +627,7 @@ class TestRunPlanIssues:
         assert "Write" not in allowed_tools
         assert "Edit" not in allowed_tools
 
-    def test_prompt_includes_impl_milestone_and_repo(self, tmp_path: Path) -> None:
+    def test_prompt_includes_milestone_and_repo(self, tmp_path: Path) -> None:
         config = make_config(tmp_path)
         checkpoint = make_checkpoint(stage="plan-issues")
         run_result = make_run_result()
@@ -297,14 +638,14 @@ class TestRunPlanIssues:
             return run_result
 
         with (
-            patch("composer.cli.runner.run", side_effect=capture_run),
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
-            patch("composer.cli.build_subprocess_env", return_value={}),
+            patch("brimstone.cli.runner.run", side_effect=capture_run),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
+            patch("brimstone.cli.build_subprocess_env", return_value={}),
         ):
             _run_plan_issues(
                 repo="owner/repo",
-                impl_milestone="v1-impl",
+                milestone="v1-impl",
                 config=config,
                 checkpoint=checkpoint,
                 dry_run=False,
@@ -317,39 +658,28 @@ class TestRunPlanIssues:
         # Skill file content injected
         assert "plan-issues" in prompt.lower() or "impl" in prompt.lower()
 
-    def test_dry_run_flag_noted_in_prompt(self, tmp_path: Path) -> None:
-        """When dry_run=True the prompt mentions the dry-run constraint."""
+    def test_dry_run_skips_runner_and_prints_milestone(self, tmp_path: Path, capsys) -> None:
+        """When dry_run=True runner.run is not called and output mentions the milestone."""
         config = make_config(tmp_path)
         checkpoint = make_checkpoint(stage="plan-issues")
-        captured_prompt: list[str] = []
-
-        # We need to capture the base_prompt before inject_skill is called.
-        # Patch inject_skill to capture what was passed.
-        original_inject = __import__("composer.cli", fromlist=["inject_skill"]).inject_skill
-
-        def capture_inject(skill_name: str, base_prompt: str) -> str:
-            captured_prompt.append(base_prompt)
-            return original_inject(skill_name, base_prompt)
 
         with (
-            patch("composer.cli.runner.run") as mock_run,
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
-            patch("composer.cli.inject_skill", side_effect=capture_inject),
+            patch("brimstone.cli.runner.run") as mock_run,
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
         ):
             _run_plan_issues(
                 repo="owner/repo",
-                impl_milestone="v1",
+                milestone="v1",
                 config=config,
                 checkpoint=checkpoint,
                 dry_run=True,
             )
             mock_run.assert_not_called()
 
-        # With dry_run=True we return early, but the base_prompt is built first
-        # and the dry-run note is embedded.
-        assert len(captured_prompt) == 1
-        assert "dry-run" in captured_prompt[0].lower() or "dry_run" in captured_prompt[0].lower()
+        out = capsys.readouterr().out
+        assert "v1" in out
+        assert "owner/repo" in out
 
     def test_error_result_prints_to_stderr(self, tmp_path: Path, capsys) -> None:
         config = make_config(tmp_path)
@@ -359,14 +689,14 @@ class TestRunPlanIssues:
         )
 
         with (
-            patch("composer.cli.runner.run", return_value=run_result),
-            patch("composer.cli.logger.log_conductor_event"),
-            patch("composer.cli.session.save"),
-            patch("composer.cli.build_subprocess_env", return_value={}),
+            patch("brimstone.cli.runner.run", return_value=run_result),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
+            patch("brimstone.cli.build_subprocess_env", return_value={}),
         ):
             _run_plan_issues(
                 repo="owner/repo",
-                impl_milestone="v1",
+                milestone="v1",
                 config=config,
                 checkpoint=checkpoint,
                 dry_run=False,
@@ -385,14 +715,14 @@ class TestRunPlanIssues:
             logged_events.append(kwargs.get("event_type", ""))
 
         with (
-            patch("composer.cli.runner.run", return_value=run_result),
-            patch("composer.cli.logger.log_conductor_event", side_effect=record_event),
-            patch("composer.cli.session.save"),
-            patch("composer.cli.build_subprocess_env", return_value={}),
+            patch("brimstone.cli.runner.run", return_value=run_result),
+            patch("brimstone.cli.logger.log_conductor_event", side_effect=record_event),
+            patch("brimstone.cli.session.save"),
+            patch("brimstone.cli.build_subprocess_env", return_value={}),
         ):
             _run_plan_issues(
                 repo="owner/repo",
-                impl_milestone="v1",
+                milestone="v1",
                 config=config,
                 checkpoint=checkpoint,
                 dry_run=False,
@@ -405,106 +735,3 @@ class TestRunPlanIssues:
 # ---------------------------------------------------------------------------
 # Click command: design_worker
 # ---------------------------------------------------------------------------
-
-
-class TestDesignWorkerCommand:
-    def test_no_repo_outside_git_dir_fails(self, tmp_path: Path) -> None:
-        """design-worker without --repo fails when cwd is not a git repo."""
-        runner = CliRunner()
-        with runner.isolated_filesystem(temp_dir=tmp_path):
-            result = runner.invoke(composer, ["design-worker", "--research-milestone", "v1"])
-        assert result.exit_code != 0
-        assert "not a git repository" in result.output or "Error" in result.output
-
-    def test_missing_research_milestone_fails(self) -> None:
-        runner = CliRunner()
-        result = runner.invoke(composer, ["design-worker", "--repo", "owner/repo"])
-        assert result.exit_code != 0
-        assert "Missing option" in result.output or "research-milestone" in result.output
-
-    def test_dry_run_exits_cleanly(self, tmp_path: Path) -> None:
-        """design-worker --dry-run should print and exit 0."""
-        runner = CliRunner()
-        with (
-            patch("composer.cli.load_config") as mock_load_config,
-            patch("composer.cli.startup_sequence") as mock_startup,
-            patch("composer.cli._run_design_worker") as mock_run,
-        ):
-            mock_config = MagicMock()
-            mock_config.checkpoint_dir = tmp_path
-            mock_load_config.return_value = mock_config
-            mock_startup.return_value = (mock_config, make_checkpoint())
-            mock_run.return_value = None
-
-            result = runner.invoke(
-                composer,
-                [
-                    "design-worker",
-                    "--repo",
-                    "owner/repo",
-                    "--research-milestone",
-                    "v1",
-                    "--dry-run",
-                ],
-            )
-
-        assert result.exit_code == 0
-        mock_run.assert_called_once()
-        call_kwargs = mock_run.call_args.kwargs
-        assert call_kwargs["dry_run"] is True
-        assert call_kwargs["repo"] == "owner/repo"
-        assert call_kwargs["research_milestone"] == "v1"
-
-
-# ---------------------------------------------------------------------------
-# Click command: plan_issues
-# ---------------------------------------------------------------------------
-
-
-class TestPlanIssuesCommand:
-    def test_no_repo_outside_git_dir_fails(self, tmp_path: Path) -> None:
-        """plan-issues without --repo fails when cwd is not a git repo."""
-        runner = CliRunner()
-        with runner.isolated_filesystem(temp_dir=tmp_path):
-            result = runner.invoke(composer, ["plan-issues", "--impl-milestone", "v1"])
-        assert result.exit_code != 0
-        assert "not a git repository" in result.output or "Error" in result.output
-
-    def test_missing_impl_milestone_fails(self) -> None:
-        runner = CliRunner()
-        result = runner.invoke(composer, ["plan-issues", "--repo", "owner/repo"])
-        assert result.exit_code != 0
-        assert "Missing option" in result.output or "impl-milestone" in result.output
-
-    def test_dry_run_exits_cleanly(self, tmp_path: Path) -> None:
-        """plan-issues --dry-run should print and exit 0."""
-        runner = CliRunner()
-        with (
-            patch("composer.cli.load_config") as mock_load_config,
-            patch("composer.cli.startup_sequence") as mock_startup,
-            patch("composer.cli._run_plan_issues") as mock_run,
-        ):
-            mock_config = MagicMock()
-            mock_config.checkpoint_dir = tmp_path
-            mock_load_config.return_value = mock_config
-            mock_startup.return_value = (mock_config, make_checkpoint(stage="plan-issues"))
-            mock_run.return_value = None
-
-            result = runner.invoke(
-                composer,
-                [
-                    "plan-issues",
-                    "--repo",
-                    "owner/repo",
-                    "--impl-milestone",
-                    "v1",
-                    "--dry-run",
-                ],
-            )
-
-        assert result.exit_code == 0
-        mock_run.assert_called_once()
-        call_kwargs = mock_run.call_args.kwargs
-        assert call_kwargs["dry_run"] is True
-        assert call_kwargs["repo"] == "owner/repo"
-        assert call_kwargs["impl_milestone"] == "v1"

@@ -124,7 +124,7 @@ def load(path: Path) -> Checkpoint | None:
     Raises:
         CheckpointVersionError: When ``schema_version`` in the file is greater
             than :data:`SCHEMA_VERSION`.  The caller should instruct the user to
-            upgrade ``breadmin-composer``.
+            upgrade ``brimstone``.
         CheckpointCorruptError: When the file cannot be parsed as JSON.  The
             caller must prompt the user to inspect the file before deleting it;
             do *not* silently overwrite — it may represent unrecovered
@@ -153,7 +153,7 @@ def load(path: Path) -> Checkpoint | None:
         raise CheckpointVersionError(
             f"Checkpoint at {path} has schema_version={file_version}, "
             f"but this installation only understands up to version {SCHEMA_VERSION}. "
-            "Upgrade breadmin-composer to continue."
+            "Upgrade brimstone to continue."
         )
 
     if file_version < SCHEMA_VERSION:

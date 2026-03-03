@@ -67,7 +67,7 @@ drains:
 ## Research-Specific Rules
 
 ### Research Label
-All research issues MUST have the `research` label. Only process issues with this label.
+All research issues MUST have the `stage/research` label. Only process issues with this label.
 
 ### Follow-Up Issue Policy
 
@@ -91,7 +91,7 @@ will be dispatched. Issues scoring < 2/3 are closed with `wont-research`.
 
 Research agents are dispatched with `Agent(isolation: "worktree")` and given:
 - A specific research topic and detailed scope
-- Instructions to write a comprehensive markdown document in `docs/research/`
+- Instructions to write a comprehensive markdown document in `docs/research/<milestone>/`
 - Instructions to include a **"Follow-Up Research Recommendations"** section
 - Instructions to cross-reference existing research docs
 - Instructions to flag contradictions with other docs
@@ -106,7 +106,7 @@ Operate as a pipeline until the active milestone's research queue is empty:
 
 List all open research issues for the active milestone:
 ```bash
-gh issue list --state open --label research --assignee "" --limit 200 \
+gh issue list --state open --label stage/research --assignee "" --limit 200 \
   --json number,title,labels,body,milestone
 ```
 
@@ -132,22 +132,22 @@ Launch sub-agents in parallel using `Agent(isolation: "worktree")`.
 > You are implementing research issue #N on branch `<branch-name>`.
 > Your task: <research topic and scope from issue body>.
 > Milestone: <milestone name>
-> Allowed scope: `docs/research/`
+> Allowed scope: `docs/research/<milestone>/`
 >
 > Steps:
 > 1. `git checkout <branch-name>`
 > 2. Read the issue in full: `gh issue view <N>`
 > 3. Read all related existing research docs referenced in the issue body
-> 4. Read ALL existing docs in `docs/research/` to understand what's already covered
+> 4. Read ALL existing docs in `docs/research/<milestone>/` to understand what's already covered
 > 5. Research the topic extensively using web search
-> 6. Write a comprehensive document at `docs/research/<NN>-<slug>.md`:
+> 6. Write a comprehensive document at `docs/research/<milestone>/<NN>-<slug>.md`:
 >    - MUST include a "Follow-Up Research Recommendations" section
 >    - MUST include a "Sources" section with full citations
 >    - MUST cross-reference related research docs
 >    - MUST flag any contradictions with other docs
 > 7. **Create follow-up GitHub issues** for each recommendation in the doc that:
 >    - Represents a genuinely new architectural/research question
->    - Is NOT already covered by an existing issue (check: `gh issue list --state all --label research --limit 300 --json number,title`)
+>    - Is NOT already covered by an existing issue (check: `gh issue list --state all --label stage/research --limit 300 --json number,title`)
 >    - Would require a standalone research document to answer
 >    - Tag each recommendation in the doc's "Follow-Up Research Recommendations" section:
 >      - `[BLOCKS_IMPL]` — needed before the current implementation milestone can be designed
@@ -158,43 +158,28 @@ Launch sub-agents in parallel using `Agent(isolation: "worktree")`.
 >      `gh milestone list --repo <owner>/<repo>`
 >      Pick the lowest-numbered *research* milestone beyond the current one for `[V2_RESEARCH]` items.
 >      Use the current research milestone for `[BLOCKS_IMPL]` items.
->    - Use: `gh issue create --title "Research: <topic>" --label "research,triage" --milestone "<resolved milestone name>" --body "..."`
+>    - Use: `gh issue create --title "<topic>" --label "stage/research,triage" --milestone "<resolved milestone name>" --body "..."`
 >    - Body MUST include: `## Spawned From`, `## Research Areas`, `## Deliverable`, `## Dependencies`
 >    - DO NOT create issues for: implementation tasks, data collection scripts, narrow empirical measurements, things already covered in existing docs
 >    - Add `triage` label to ALL follow-up issues — the orchestrator will score them; don't pre-filter, but be conservative
-> 8. Commit with message referencing the issue: `git commit -m "docs: add <topic> research (Closes #<N>)"`
+> 8. Commit with message referencing the issue: `git commit -m "docs: add <topic> research (Closes #<N>) [skip ci]"`
 > 9. `git push -u origin <branch-name>`
-> 10. Create PR with a full description:
->     ```
->     gh pr create \
->       --title "docs: add <descriptive title of what was researched>" \
->       --label "research" \
->       --body "$(cat <<'EOF'
->     ## Summary
->     <2-3 sentence summary of key findings>
->
->     ## Key Findings
->     - <bullet 1>
->     - <bullet 2>
->     - <bullet 3>
->
->     ## Follow-Up Issues Spawned
->     <list of issues created, or "None — existing issues cover all follow-up topics">
->
->     Closes #<N>
->     EOF
->     )"
->     ```
-> 11. STOP. Do not merge. Do not comment on the parent issue (orchestrator does this after merge).
+> 10. STOP. Do NOT create a PR. The orchestrator merges the branch directly.
 
-### Step 3 — Merge, Review & Requeue
+### Step 3 — Merge & Requeue
 
 As **each agent completes** (do not wait for the entire batch):
 
 1. **Clean up** its worktree: `git worktree remove --force <path>`
-2. **Merge the PR**: `gh pr merge <PR-number> --squash --delete-branch`
+2. **Merge the branch directly** (no PR): the brimstone orchestrator does this automatically via the GitHub API. If running this skill manually, merge with:
+   ```bash
+   gh api repos/{owner}/{repo}/merges --method POST \
+     -f base=$DEFAULT_BRANCH -f head=<branch-name> \
+     -f commit_message="docs: merge <branch-name>"
+   gh api repos/{owner}/{repo}/git/refs/heads/<branch-name> --method DELETE
+   ```
 3. **Pull**: `git pull origin $DEFAULT_BRANCH`
-4. **Verify follow-ups were created**: check PR body for "Follow-Up Issues Spawned" section
+4. **Verify follow-ups were created**: read the research doc's "Follow-Up Issues Spawned" section
    - If the agent created follow-ups, apply the **triage rubric** to each one immediately:
      ```bash
      gh issue list --state open --label triage --limit 50

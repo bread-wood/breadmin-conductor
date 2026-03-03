@@ -1,4 +1,4 @@
-"""Unit tests for src/composer/session.py."""
+"""Unit tests for src/brimstone/session.py."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from composer.session import (
+from brimstone.session import (
     SCHEMA_VERSION,
     Checkpoint,  # noqa: F401
     CheckpointCorruptError,

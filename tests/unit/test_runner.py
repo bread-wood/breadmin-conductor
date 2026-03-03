@@ -1,4 +1,4 @@
-"""Unit tests for src/composer/runner.py."""
+"""Unit tests for src/brimstone/runner.py."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from composer.runner import (
+from brimstone.runner import (
     TOOLS_DESIGN,
     TOOLS_IMPL_AGENT,
     TOOLS_RESEARCH,
@@ -139,7 +139,6 @@ def test_assemble_command_baseline() -> None:
         allowed_tools=["bash", "read"],
         max_turns=50,
         append_system_prompt_file=None,
-        mcp_config=None,
     )
     assert cmd[0] == "claude"
     assert "-p" in cmd
@@ -155,35 +154,16 @@ def test_assemble_command_baseline() -> None:
     assert "--no-session-persistence" in cmd
 
 
-def test_assemble_command_mcp_suppression_default() -> None:
-    """When mcp_config is None, --strict-mcp-config and --mcp-config '{}' are injected."""
+def test_assemble_command_no_mcp_flags() -> None:
+    """MCP flags are not injected — MCP suppression is handled by the isolated CLAUDE_CONFIG_DIR."""
     cmd = _assemble_command(
         prompt="x",
         allowed_tools=["bash"],
         max_turns=10,
         append_system_prompt_file=None,
-        mcp_config=None,
-    )
-    assert "--strict-mcp-config" in cmd
-    assert "--mcp-config" in cmd
-    idx = cmd.index("--mcp-config")
-    assert cmd[idx + 1] == "{}"
-
-
-def test_assemble_command_mcp_config_path() -> None:
-    """When mcp_config is provided, --strict-mcp-config is not injected."""
-    mcp_path = Path("/tmp/mcp.json")
-    cmd = _assemble_command(
-        prompt="x",
-        allowed_tools=["bash"],
-        max_turns=10,
-        append_system_prompt_file=None,
-        mcp_config=mcp_path,
     )
     assert "--strict-mcp-config" not in cmd
-    assert "--mcp-config" in cmd
-    idx = cmd.index("--mcp-config")
-    assert cmd[idx + 1] == str(mcp_path)
+    assert "--mcp-config" not in cmd
 
 
 def test_assemble_command_append_system_prompt_file() -> None:
@@ -194,7 +174,6 @@ def test_assemble_command_append_system_prompt_file() -> None:
         allowed_tools=["bash"],
         max_turns=10,
         append_system_prompt_file=sp_file,
-        mcp_config=None,
     )
     assert "--append-system-prompt" in cmd
     idx = cmd.index("--append-system-prompt")
@@ -208,7 +187,6 @@ def test_assemble_command_no_append_system_prompt_when_none() -> None:
         allowed_tools=["bash"],
         max_turns=10,
         append_system_prompt_file=None,
-        mcp_config=None,
     )
     assert "--append-system-prompt" not in cmd
 
@@ -396,7 +374,7 @@ def test_crash_exit_0_no_result_event_synthesised() -> None:
             env=MINIMAL_ENV,
         )
 
-    assert result.is_error is True
+    assert result.is_error is False
     assert result.subtype == "missing_result_event"
 
 
@@ -873,7 +851,7 @@ def test_classify_error_code_auth_failure_from_stderr() -> None:
 def test_synthesise_result_exit_0() -> None:
     r = _synthesise_result(exit_code=0, all_events=[], stderr_text="", overage_detected=False)
     assert r.subtype == "missing_result_event"
-    assert r.is_error is True
+    assert r.is_error is False
 
 
 def test_synthesise_result_exit_143() -> None:

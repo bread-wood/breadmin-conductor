@@ -1,4 +1,4 @@
-"""Unit tests for src/composer/health.py."""
+"""Unit tests for src/brimstone/health.py."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from composer.config import Config
-from composer.health import (
+from brimstone.config import Config
+from brimstone.health import (
     CheckResult,
     FatalHealthCheckError,
     HealthReport,
@@ -31,7 +31,7 @@ from composer.health import (
     format_report,
     release_orchestrator_lock,
 )
-from composer.session import Checkpoint
+from brimstone.session import Checkpoint
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -83,45 +83,45 @@ def _pass(name: str) -> CheckResult:
 def _all_pass_patches() -> list:
     """Return a list of patch context managers for all 11 checks returning pass."""
     return [
-        patch("composer.health._check_git_repo", return_value=_pass("Git repo present")),
+        patch("brimstone.health._check_git_repo", return_value=_pass("Git repo present")),
         patch(
-            "composer.health._check_default_branch",
+            "brimstone.health._check_default_branch",
             return_value=_pass("Default branch matches config"),
         ),
         patch(
-            "composer.health._check_gh_auth",
+            "brimstone.health._check_gh_auth",
             return_value=_pass("gh CLI authenticated"),
         ),
         patch(
-            "composer.health._check_api_key",
+            "brimstone.health._check_api_key",
             return_value=_pass("ANTHROPIC_API_KEY present"),
         ),
         patch(
-            "composer.health._check_worktrees",
+            "brimstone.health._check_worktrees",
             return_value=_pass("No active worktrees"),
         ),
         patch(
-            "composer.health._check_orphaned_issues",
+            "brimstone.health._check_orphaned_issues",
             return_value=_pass("No stale in-progress issues"),
         ),
         patch(
-            "composer.health._check_open_prs",
+            "brimstone.health._check_open_prs",
             return_value=_pass("Open PRs needing attention"),
         ),
         patch(
-            "composer.health._check_backoff",
+            "brimstone.health._check_backoff",
             return_value=_pass("Rate limit backoff active"),
         ),
         patch(
-            "composer.health._check_orchestrator_lock",
+            "brimstone.health._check_orchestrator_lock",
             return_value=_pass("Single orchestrator guard"),
         ),
         patch(
-            "composer.health._check_checkpoint_dir_writable",
+            "brimstone.health._check_checkpoint_dir_writable",
             return_value=_pass("Checkpoint dir writable"),
         ),
         patch(
-            "composer.health._check_log_dir_writable",
+            "brimstone.health._check_log_dir_writable",
             return_value=_pass("Log dir writable"),
         ),
     ]
@@ -216,7 +216,7 @@ def test_check_all_overall_warn_with_warn_check(tmp_path: Path) -> None:
     warn_result = CheckResult("No active worktrees", "warn", "2 found", "Remove them")
     patches = _all_pass_patches()
     # Override check 5 (worktrees) with a warn
-    patches[4] = patch("composer.health._check_worktrees", return_value=warn_result)
+    patches[4] = patch("brimstone.health._check_worktrees", return_value=warn_result)
     with (
         patches[0],
         patches[1],
@@ -241,7 +241,7 @@ def test_check_all_short_circuits_on_fail(tmp_path: Path) -> None:
     fail_result = CheckResult("ANTHROPIC_API_KEY present", "fail", "Missing key", "Set it")
     patches = _all_pass_patches()
     # Override check 4 (api_key) with a fail
-    patches[3] = patch("composer.health._check_api_key", return_value=fail_result)
+    patches[3] = patch("brimstone.health._check_api_key", return_value=fail_result)
     with (
         patches[0],
         patches[1],
@@ -269,7 +269,7 @@ def test_check_all_fatal_true_on_fail(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     fail_result = CheckResult("Git repo present", "fail", "Not a repo", "Fix it")
     patches = _all_pass_patches()
-    patches[0] = patch("composer.health._check_git_repo", return_value=fail_result)
+    patches[0] = patch("brimstone.health._check_git_repo", return_value=fail_result)
     with (
         patches[0],
         patches[1],
@@ -387,7 +387,7 @@ def test_check_api_key_fail_makes_report_fatal(tmp_path: Path) -> None:
     patches = _all_pass_patches()
     # Remove api_key patch (index 3) so the real function runs
     patches[3] = patch(
-        "composer.health._check_api_key",
+        "brimstone.health._check_api_key",
         side_effect=lambda c: CheckResult("ANTHROPIC_API_KEY present", "fail", "Missing", "Set it"),
     )
     with (

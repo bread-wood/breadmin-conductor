@@ -79,22 +79,19 @@ If `docs/design/HLD.md` doesn't exist or is outdated relative to the research fi
 2. Commit:
    ```bash
    git add docs/design/HLD.md
-   git commit -m "docs: add HLD for <research-milestone>"
+   git commit -m "docs: add HLD for <research-milestone> [skip ci]"
    ```
 
-3. Push and open PR:
+3. Push branch — do NOT create a PR. The orchestrator merges directly:
    ```bash
    git push -u origin <branch-name>
-   gh pr create \
-     --title "docs: HLD for <research-milestone>" \
-     --label "build" \
-     --milestone "<research-milestone>"
    ```
-
-4. Wait for CI to pass; merge:
+   Then merge via GitHub API (no PR):
    ```bash
-   gh pr checks <pr-number> --watch
-   gh pr merge <pr-number> --squash --delete-branch
+   gh api repos/<owner>/<repo>/merges --method POST \
+     -f base=$DEFAULT_BRANCH -f head=<branch-name> \
+     -f commit_message="docs: merge HLD for <research-milestone> [skip ci]"
+   gh api repos/<owner>/<repo>/git/refs/heads/<branch-name> --method DELETE
    git checkout $DEFAULT_BRANCH && git pull origin $DEFAULT_BRANCH
    ```
 
@@ -123,22 +120,16 @@ For each module in the CLAUDE.md module isolation table that needs a design doc:
 4. Commit:
    ```bash
    git add docs/design/lld/<module>.md
-   git commit -m "docs: add LLD for <module> (<research-milestone>)"
+   git commit -m "docs: add LLD for <module> (<research-milestone>) [skip ci]"
    ```
 
-5. Push and open PR:
+5. Push branch — do NOT create a PR. Merge directly:
    ```bash
    git push -u origin lld-<module>-<research-milestone-slug>
-   gh pr create \
-     --title "docs: LLD for <module> (<research-milestone>)" \
-     --label "build" \
-     --milestone "<research-milestone>"
-   ```
-
-6. Wait for CI to pass; merge before writing the next LLD:
-   ```bash
-   gh pr checks <pr-number> --watch
-   gh pr merge <pr-number> --squash --delete-branch
+   gh api repos/<owner>/<repo>/merges --method POST \
+     -f base=$DEFAULT_BRANCH -f head=lld-<module>-<research-milestone-slug> \
+     -f commit_message="docs: merge LLD for <module> (<research-milestone>) [skip ci]"
+   gh api repos/<owner>/<repo>/git/refs/heads/lld-<module>-<research-milestone-slug> --method DELETE
    git checkout $DEFAULT_BRANCH && git pull origin $DEFAULT_BRANCH
    ```
 
