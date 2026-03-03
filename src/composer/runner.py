@@ -13,8 +13,10 @@ from __future__ import annotations
 import json
 import select
 import shlex
+import signal
 import subprocess
 import sys
+import time
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -127,6 +129,7 @@ def run(
     append_system_prompt_file: Path | None = None,
     mcp_config: Path | None = None,
     verbose: bool = True,
+    timeout_seconds: float | None = None,
 ) -> RunResult:
     """Invoke ``claude -p`` as a subprocess and return a structured result.
 
@@ -158,6 +161,11 @@ def run(
     verbose:
         If True (default), print tool invocations and brief output to stderr
         as they occur so the operator can see progress in real time.
+    timeout_seconds:
+        Wall-clock deadline for the entire subprocess. If the process is still
+        running after this many seconds it receives SIGTERM; if it does not exit
+        within 5 seconds it is SIGKILLed. The returned RunResult will have
+        ``subtype="timeout"`` and ``is_error=True``. None means no limit.
 
     Returns
     -------
@@ -210,9 +218,14 @@ def run(
         text=False,  # binary mode; we decode manually
     )
 
-    result_event, all_events, stderr_text, overage_detected = _parse_stream(proc, verbose=verbose)
+    result_event, all_events, stderr_text, overage_detected, timed_out = _parse_stream(
+        proc, verbose=verbose, timeout_seconds=timeout_seconds
+    )
     proc.wait()
     exit_code = proc.returncode
+
+    if timed_out:
+        return _synthesise_result(124, all_events, stderr_text, overage_detected)
 
     if result_event is not None:
         return _build_result_from_event(
@@ -345,8 +358,9 @@ def _print_progress(event: dict) -> None:
 def _parse_stream(
     proc: subprocess.Popen,
     verbose: bool = True,
-) -> tuple[dict | None, list[dict], str, bool]:
-    """Read stream-json events from proc.stdout until EOF.
+    timeout_seconds: float | None = None,
+) -> tuple[dict | None, list[dict], str, bool, bool]:
+    """Read stream-json events from proc.stdout until EOF or timeout.
 
     Uses ``select()`` to multiplex stdout and stderr concurrently, preventing
     pipe deadlock when the subprocess writes large volumes to either fd.
@@ -361,16 +375,21 @@ def _parse_stream(
         Full stderr captured.
     overage_detected : bool
         True if any rate_limit_event with isUsingOverage=True was observed.
+    timed_out : bool
+        True if the subprocess was killed due to exceeding ``timeout_seconds``.
     """
     result_event: dict | None = None
     all_events: list[dict] = []
     overage_detected: bool = False
     read_buffer: str = ""
+    timed_out: bool = False
 
     stderr_chunks: list[bytes] = []
 
     stdout_done = False
     stderr_done = False
+
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
     while not (stdout_done and stderr_done):
         readable_fds = []
@@ -438,6 +457,17 @@ def _parse_stream(
         # If select() returned nothing and fds are still open, loop back
         # (timeout=1.0 prevents busy-spinning)
 
+        # Deadline check — after each select cycle
+        if deadline is not None and time.monotonic() >= deadline:
+            timed_out = True
+            try:
+                proc.send_signal(signal.SIGTERM)
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            break
+
     # Flush any remaining partial line from buffer (rare: incomplete last line)
     if read_buffer.strip():
         try:
@@ -449,7 +479,7 @@ def _parse_stream(
             pass  # Incomplete fragment — discard
 
     stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
-    return result_event, all_events, stderr_text, overage_detected
+    return result_event, all_events, stderr_text, overage_detected, timed_out
 
 
 # ---------------------------------------------------------------------------

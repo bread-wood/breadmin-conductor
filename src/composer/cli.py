@@ -1072,6 +1072,7 @@ def _score_triage_issue(
         allowed_tools=["Bash"],
         env=env,
         max_turns=5,
+        timeout_seconds=config.agent_timeout_minutes * 60,
     )
 
     if result.is_error:
@@ -1238,6 +1239,7 @@ def _classify_blocking_issues(
             allowed_tools=["Bash"],
             env=env,
             max_turns=5,
+            timeout_seconds=config.agent_timeout_minutes * 60,
         )
 
         if result.is_error:
@@ -1450,6 +1452,7 @@ def _run_research_worker(
             ],
             env=env,
             max_turns=100,
+            timeout_seconds=config.agent_timeout_minutes * 60,
         )
 
         # ------------------------------------------------------------------
@@ -2353,6 +2356,7 @@ def _dispatch_impl_agent(
         allowed_tools=runner.TOOLS_IMPL_AGENT,
         env=env,
         max_turns=max_turns,
+        timeout_seconds=config.agent_timeout_minutes * 60,
     )
     return issue, branch, worktree_path, result
 
@@ -2795,6 +2799,7 @@ def _run_design_worker(
         allowed_tools=["Bash", "Read", "Edit", "Write", "Glob", "Grep"],
         env=env,
         max_turns=200,
+        timeout_seconds=config.agent_timeout_minutes * 60,
     )
 
     logger.log_conductor_event(
@@ -2890,6 +2895,7 @@ def _run_plan_issues(
         allowed_tools=["Bash", "Read", "Glob", "Grep"],
         env=env,
         max_turns=200,
+        timeout_seconds=config.agent_timeout_minutes * 60,
     )
 
     logger.log_conductor_event(
@@ -3055,6 +3061,7 @@ def _run_plan_milestones(
         allowed_tools=["Bash", "Read", "Glob", "Grep"],
         env=env,
         max_turns=200,
+        timeout_seconds=config.agent_timeout_minutes * 60,
     )
 
     logger.log_conductor_event(
