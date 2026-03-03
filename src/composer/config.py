@@ -105,6 +105,12 @@ class Config(BaseSettings):
         description="Directory for session checkpoints",
     )
 
+    # --- Model ---
+    model: str = Field(
+        default="claude-opus-4-6",
+        description="Claude model ID passed to claude -p via --model",
+    )
+
     # --- Git / GitHub ---
     default_branch: str = Field(
         default="main",

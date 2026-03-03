@@ -1073,6 +1073,7 @@ def _score_triage_issue(
         env=env,
         max_turns=5,
         timeout_seconds=config.agent_timeout_minutes * 60,
+        model=config.model,
     )
 
     if result.is_error:
@@ -1240,6 +1241,7 @@ def _classify_blocking_issues(
             env=env,
             max_turns=5,
             timeout_seconds=config.agent_timeout_minutes * 60,
+            model=config.model,
         )
 
         if result.is_error:
@@ -1453,6 +1455,7 @@ def _run_research_worker(
             env=env,
             max_turns=100,
             timeout_seconds=config.agent_timeout_minutes * 60,
+            model=config.model,
         )
 
         # ------------------------------------------------------------------
@@ -2357,6 +2360,7 @@ def _dispatch_impl_agent(
         env=env,
         max_turns=max_turns,
         timeout_seconds=config.agent_timeout_minutes * 60,
+        model=config.model,
     )
     return issue, branch, worktree_path, result
 
@@ -2800,6 +2804,7 @@ def _run_design_worker(
         env=env,
         max_turns=200,
         timeout_seconds=config.agent_timeout_minutes * 60,
+        model=config.model,
     )
 
     logger.log_conductor_event(
@@ -2896,6 +2901,7 @@ def _run_plan_issues(
         env=env,
         max_turns=200,
         timeout_seconds=config.agent_timeout_minutes * 60,
+        model=config.model,
     )
 
     logger.log_conductor_event(
@@ -3062,6 +3068,7 @@ def _run_plan_milestones(
         env=env,
         max_turns=200,
         timeout_seconds=config.agent_timeout_minutes * 60,
+        model=config.model,
     )
 
     logger.log_conductor_event(

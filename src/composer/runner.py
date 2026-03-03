@@ -130,6 +130,7 @@ def run(
     mcp_config: Path | None = None,
     verbose: bool = True,
     timeout_seconds: float | None = None,
+    model: str | None = None,
 ) -> RunResult:
     """Invoke ``claude -p`` as a subprocess and return a structured result.
 
@@ -166,6 +167,9 @@ def run(
         running after this many seconds it receives SIGTERM; if it does not exit
         within 5 seconds it is SIGKILLed. The returned RunResult will have
         ``subtype="timeout"`` and ``is_error=True``. None means no limit.
+    model:
+        Claude model ID to pass via ``--model``. When None, claude uses its
+        default. Typically sourced from ``config.model``.
 
     Returns
     -------
@@ -188,6 +192,7 @@ def run(
         max_turns=max_turns,
         append_system_prompt_file=append_system_prompt_file,
         mcp_config=mcp_config,
+        model=model,
     )
 
     if dry_run:
@@ -256,9 +261,14 @@ def _assemble_command(
     max_turns: int,
     append_system_prompt_file: Path | None,
     mcp_config: Path | None,
+    model: str | None = None,
 ) -> list[str]:
     """Assemble the ``claude`` command list."""
     cmd: list[str] = ["claude", "-p", prompt]
+
+    # Model selection
+    if model:
+        cmd += ["--model", model]
 
     # Output format — always stream-json
     cmd += ["--output-format", "stream-json"]
