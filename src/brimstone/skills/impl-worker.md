@@ -110,12 +110,12 @@ As **each agent completes** (do not wait for the entire batch):
      gh issue edit <N> --remove-assignee @me --remove-label in-progress
      git push origin --delete <branch-name>
      ```
-   - If the agent left a comment saying CI/reviews still failing → abandon the issue:
+   - If the agent left a comment saying CI/reviews still failing → escalate to human:
      ```bash
      gh issue edit <N> --remove-assignee @me --remove-label in-progress
-     gh pr close <PR-number>
-     git push origin --delete <branch-name>
+     gh pr comment <PR-number> --body "Orchestrator: agent exhausted CI/review fix attempts. Needs human attention."
      ```
+     Leave the PR open and the branch intact — do NOT close the PR or delete the branch.
 
 3. **Re-survey**: Check for newly unblocked issues.
 
