@@ -5209,15 +5209,22 @@ def _run_plan(
     checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
     today = date.today().isoformat()
 
-    # Skip plan if research beads already exist — BeadStore is source of truth.
-    if not dry_run and store is not None:
-        existing_beads = store.list_work_beads(milestone=version, stage="research")
-        if existing_beads:
-            click.echo(
-                f"[plan] {len(existing_beads)} research bead(s) already exist for {version!r}"
-                " — plan stage skipped (already seeded)."
-            )
-            return
+    # Skip plan if the milestone already exists with research issues — plan already ran.
+    # Plan's output is a GitHub milestone + seed issues; BeadStore is populated later
+    # by the research stage dispatcher. Use milestone + issue count as the idempotency
+    # signal here.
+    if not dry_run:
+        try:
+            if _milestone_exists(repo, version):
+                existing = _count_open_issues_by_label(repo, version, RESEARCH_LABEL)
+                if existing > 0:
+                    click.echo(
+                        f"[plan] milestone {version!r} exists with {existing} open research"
+                        " issue(s) — plan stage skipped (already seeded)."
+                    )
+                    return
+        except Exception:
+            pass  # If the check fails, fall through and let the agent run normally
 
     # Skip plan if design is already underway (HLD merged → research issues
     # seeded in a prior run; re-filing them would block design with new research).
