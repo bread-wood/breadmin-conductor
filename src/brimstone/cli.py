@@ -6284,7 +6284,15 @@ def init(
         else:
             click.echo(f"Warning: could not create {repo_ref}: {stderr}", err=True)
 
-    # ── 1a. Rename default branch to mainline (idempotent) ──────────────────
+    # ── 2. Add yeast-bot as collaborator ────────────────────────────────────
+    _add_brimstone_bot_collaborator(repo_ref)
+
+    # ── 3. Install CI workflow via GitHub Contents API (no local clone needed) ──
+    # This creates the first commit on `main`, establishing the branch.
+    _setup_ci(repo_ref, _config, dry_run=False)
+
+    # ── 3a. Rename default branch to mainline (idempotent) ──────────────────
+    # Must run AFTER _setup_ci so that the `main` branch exists (first commit).
     default_branch = _config.default_branch  # "mainline"
     rename_result = subprocess.run(
         [
@@ -6307,12 +6315,6 @@ def init(
             pass  # already on mainline or rename not needed
         else:
             click.echo(f"Warning: could not rename default branch: {stderr}", err=True)
-
-    # ── 2. Add yeast-bot as collaborator ────────────────────────────────────
-    _add_brimstone_bot_collaborator(repo_ref)
-
-    # ── 3. Install CI workflow via GitHub Contents API (no local clone needed) ──
-    _setup_ci(repo_ref, _config, dry_run=False)
 
     # ── 4. Create issue labels ───────────────────────────────────────────────
     _ensure_labels(repo_ref)

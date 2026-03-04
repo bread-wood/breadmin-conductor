@@ -72,7 +72,62 @@ gh issue list --state closed --milestone "<milestone>" --label "stage/impl" --li
 
 Build a set of normalized titles to skip during Step 3.
 
-### Step 3 — Plan Implementation Issues
+### Step 3 — File Scaffold Issue First
+
+Before planning any module-level impl issues, always file a project scaffold issue that
+covers shared project-wide files. This **must** be filed as the very first issue and all
+other impl issues must depend on it.
+
+**Why:** Impl workers run in parallel. If each worker independently creates `pyproject.toml`
+or `src/<pkg>/__init__.py`, every PR will have merge conflicts. The scaffold issue claims
+these shared files so parallel workers never touch them.
+
+File the scaffold issue:
+```bash
+gh issue create \
+  --repo <owner>/<repo> \
+  --title "impl: project scaffold — pyproject.toml, package init, CI baseline" \
+  --label "infra,stage/impl,P1" \
+  --milestone "<milestone>" \
+  --body "$(cat <<'EOF'
+## Context
+Establishes the project scaffold so parallel module impl workers never conflict on shared files.
+Must merge before any other impl issue begins.
+
+## Acceptance Criteria
+- [ ] `pyproject.toml` exists with correct package name, dependencies, and dev extras
+- [ ] `src/<pkg>/__init__.py` exists (may be empty)
+- [ ] `Makefile` (or equivalent) exists with `test` and `lint` targets
+- [ ] `make test && make lint` pass on a clean checkout
+- [ ] README exists with package name, one-line description, and basic usage
+
+## Scope
+Files to create or modify:
+- `pyproject.toml` — package metadata, dependencies, dev tooling
+- `src/<pkg>/__init__.py` — package init
+- `Makefile` — test and lint targets
+- `README.md` — minimal project readme
+- `.github/` (if CI not yet configured)
+
+## Test Requirements
+- `make test` exits 0
+- `make lint` exits 0
+
+## Dependencies
+None — this is the foundation issue.
+
+## Key Design Decisions
+- Parallel impl workers are forbidden from touching `pyproject.toml` or `src/<pkg>/__init__.py`
+  after this issue merges; they add dependencies or exports to these files only via their own
+  module-scoped files.
+EOF
+)"
+```
+
+Record the scaffold issue number. **Every other impl issue filed in Step 3 must include
+`Depends on: #<scaffold-issue>` in its body.**
+
+### Step 3b — Plan Module Implementation Issues
 
 For each logical unit of work needed to implement what the design docs specify:
 
@@ -89,6 +144,7 @@ For each logical unit of work needed to implement what the design docs specify:
 
 4. **Identify dependencies** — which other impl issues (by title or anticipated number)
    must complete before this one can start?
+   **Every module issue must depend on the scaffold issue filed in Step 3 at minimum.**
    Check for circular dependencies before proceeding.
 
 5. **Assign label** — use the appropriate `feat:*` label from CLAUDE.md:
