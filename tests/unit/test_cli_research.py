@@ -47,6 +47,16 @@ def mock_milestone_exists():
         yield
 
 
+@pytest.fixture(autouse=True)
+def mock_ensure_worktree_repo(tmp_path):
+    """Patch _ensure_worktree_repo to return a tmp dir without cloning."""
+    with patch(
+        "brimstone.cli._ensure_worktree_repo",
+        return_value=(str(tmp_path), None),
+    ):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

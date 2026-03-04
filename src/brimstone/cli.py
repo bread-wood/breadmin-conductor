@@ -17,6 +17,7 @@ import concurrent.futures
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -1587,7 +1588,7 @@ def _run_research_worker(
     checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
     retry_counts: dict[int, int] = {}
     stall_count: int = 0
-    repo_root = _get_repo_root()
+    repo_root, _clone_dir = _ensure_worktree_repo(repo)
 
     # Pre-check: the milestone must exist before we can do anything useful.
     if not dry_run and not _milestone_exists(repo, milestone):
@@ -1913,6 +1914,9 @@ def _run_research_worker(
                 session.save(checkpoint, checkpoint_path)
 
             _fill_research_pool()
+
+    if _clone_dir:
+        shutil.rmtree(_clone_dir, ignore_errors=True)
 
 
 def _find_next_milestone(repo: str, current_milestone: str) -> str | None:
@@ -2798,6 +2802,43 @@ def _get_repo_root() -> str:
     return os.getcwd()
 
 
+def _ensure_worktree_repo(repo: str) -> tuple[str, str | None]:
+    """Return (repo_root, tmp_parent_to_cleanup) for worktree operations.
+
+    For remote repos (owner/name), clones the repo to a fresh temp directory
+    so that worktrees are created inside the correct repository.  The caller
+    must delete ``tmp_parent_to_cleanup`` when done.
+
+    For local paths the existing git root is used (no cloning).
+
+    Args:
+        repo: Repository reference — either ``owner/name`` (remote) or a
+              local path that is already a git repo.
+
+    Returns:
+        ``(repo_root, tmp_parent)`` where ``tmp_parent`` is the temp directory
+        to remove after the caller is done, or ``None`` for local repos.
+    """
+    if "/" in repo and not os.path.isabs(repo):
+        # Remote GitHub repo in owner/name format — clone to temp dir.
+        parent = tempfile.mkdtemp(prefix="brimstone-")
+        repo_name = repo.split("/")[-1]
+        clone_path = os.path.join(parent, repo_name)
+        result = subprocess.run(
+            ["gh", "repo", "clone", repo, clone_path],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            shutil.rmtree(parent, ignore_errors=True)
+            raise click.ClickException(
+                f"Failed to clone {repo} for worktree operations: {result.stderr.strip()}"
+            )
+        return clone_path, parent
+    # Local path or already inside the target repo.
+    return _get_repo_root(), None
+
+
 def _dispatch_design_agent(
     issue: dict[str, Any],
     branch: str,
@@ -2916,38 +2957,41 @@ def _dispatch_impl_agent(
     raw_body = issue.get("body") or ""
     body = _sanitize_issue_body(raw_body)
 
-    # Determine scope path from module name
-    if module == "none":
-        scope = "src/brimstone/"
-    elif module == "cli":
-        scope = "src/brimstone/cli.py, src/brimstone/skills/"
-    else:
-        scope = f"src/brimstone/{module}.py"
-
-    # Get the feat label to use for the PR
-    feat_label = f"feat:{module}" if module != "none" else "feat:cli"
+    # Get the feat label to use for the PR (module-agnostic; target repo may have
+    # different module names than brimstone — the issue body's Scope section is
+    # the authoritative list of files to touch).
+    feat_label = f"feat:{module},stage/impl" if module != "none" else "stage/impl"
 
     # Build the agent prompt
     base_prompt = (
+        f"## Working directory\n"
+        f"Your isolated worktree is already checked out at:\n"
+        f"  {worktree_path}\n\n"
+        f"Your FIRST action must be:\n"
+        f"  cd {worktree_path}\n\n"
+        f"ALL file writes and git operations must happen inside that directory.\n"
+        f"Do NOT write to /tmp, ~/, or the main repo checkout.\n\n"
+        f"## Task\n"
         f"You are implementing issue #{issue_number} on branch `{branch}`.\n"
-        f"Your task: {issue_title}\n"
-        f"Allowed scope: {scope}\n\n"
-        f"Steps:\n"
-        f"1. git checkout {branch}\n"
-        f"2. Read the issue: gh issue view {issue_number}\n"
-        f"3. Implement the changes within the allowed scope\n"
+        f"Repository: {repo}\n"
+        f"Task: {issue_title}\n"
+        f"Allowed scope: see ## Scope in the issue body below.\n\n"
+        f"## Steps\n"
+        f"1. cd {worktree_path}   (branch `{branch}` is already checked out)\n"
+        f"2. Read the issue: gh issue view {issue_number} --repo {repo}\n"
+        f"3. Implement the changes within the scope listed in the issue body\n"
         f"4. Update README if it exists at the package/module root\n"
         f"5. Run tests — all tests must pass\n"
         f"6. Run lint — must be clean\n"
         f"7. Commit with message referencing the issue\n"
         f"8. git push -u origin {branch}\n"
-        f'9. Create PR: gh pr create --title "{issue_title}" '
+        f'9. Create PR: gh pr create --repo {repo} --title "{issue_title}" '
         f'--label "{feat_label}" --body "Closes #{issue_number}"\n'
-        f"10. Wait for CI: gh pr checks <PR-number> --watch\n"
+        f"10. Wait for CI: gh pr checks <PR-number> --repo {repo} --watch\n"
         f"11. Read all CI and review feedback\n"
         f"12. Triage each piece of feedback (fix now / file issue / skip)\n"
         f"13. STOP. Do not merge.\n\n"
-        f"Issue body:\n{body}"
+        f"## Issue body\n{body}"
     )
     skill_tmp = write_skill_tmp("impl-worker")
 
@@ -3024,7 +3068,7 @@ def _run_impl_worker(
     checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
     retry_counts: dict[int, int] = {}
     active_modules: set[str] = set()  # module isolation tracker
-    repo_root = _get_repo_root()
+    repo_root, _clone_dir = _ensure_worktree_repo(repo)
     default_branch = _get_default_branch_for_repo(repo) if not dry_run else config.default_branch
 
     impl_limits: dict[str, int] = {"pro": 2, "max": 3, "max20x": 5}
@@ -3343,6 +3387,9 @@ def _run_impl_worker(
 
             _fill_impl_pool()
 
+    if _clone_dir:
+        shutil.rmtree(_clone_dir, ignore_errors=True)
+
 
 # ---------------------------------------------------------------------------
 # Design-worker helpers
@@ -3393,7 +3440,9 @@ def _run_design_worker(
             raise SystemExit(1)
 
         default_branch = _get_default_branch_for_repo(repo)
-        repo_root = _get_repo_root()
+        repo_root, _clone_dir = _ensure_worktree_repo(repo)
+    else:
+        _clone_dir = None
 
     logger.log_conductor_event(
         run_id=checkpoint.run_id,
@@ -3663,6 +3712,9 @@ def _run_design_worker(
         log_dir=config.log_dir.expanduser(),
     )
     click.echo(f"Design-worker complete for milestone '{milestone}'.")
+
+    if _clone_dir:
+        shutil.rmtree(_clone_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

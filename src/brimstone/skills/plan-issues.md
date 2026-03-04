@@ -36,34 +36,37 @@ All `git` commands must be run with `-C <local_path>` (or inside the cloned dire
 
 The plan-issues orchestrator requires:
 - `--repo` — the target repository (optional; defaults to cwd)
-- `--impl-milestone` — the implementation milestone to file issues against
+- `--milestone` — the milestone to file impl issues against (e.g. `v0.1.0`)
 
-Verify the impl milestone exists:
+Verify the milestone exists:
 ```bash
 gh milestone list --repo <owner>/<repo>
-```
-Look for a milestone whose title contains "Impl" or "Implementation". If it does not exist,
-create it:
-```bash
-gh api repos/<owner>/<repo>/milestones \
-  -f title="<Version> Implementation" \
-  -f description="Implementation phase for <version>"
 ```
 
 ## Execution
 
 ### Step 1 — Read Design Documents
 
+**The design documents are the sole source of truth for scoping. Do not read research
+issues, design issues, or any other issue history when planning impl issues.**
+
+Design docs live under `docs/design/<milestone>/`:
+
 Read the high-level design document:
 ```bash
-cat docs/design/HLD.md
+gh api repos/<owner>/<repo>/contents/docs/design/<milestone>/HLD.md -q '.content' | base64 -d
 ```
 
-Read all low-level design documents:
+List and read all low-level design documents:
 ```bash
-ls docs/design/lld/
+gh api repos/<owner>/<repo>/contents/docs/design/<milestone>/lld
 ```
-For each file in `docs/design/lld/`, read it in full. Build a complete picture of:
+For each file in `docs/design/<milestone>/lld/`, read it in full:
+```bash
+gh api repos/<owner>/<repo>/contents/docs/design/<milestone>/lld/<module>.md -q '.content' | base64 -d
+```
+
+Build a complete picture of:
 - Every module's responsibility and file scope
 - Key design decisions already made (do not re-litigate)
 - Interfaces between modules
@@ -72,16 +75,18 @@ For each file in `docs/design/lld/`, read it in full. Build a complete picture o
 
 ### Step 2 — Audit Existing Impl Issues
 
-Check what implementation issues already exist for the impl milestone to avoid duplication:
+Check only what `stage/impl` issues already exist for the milestone — to avoid duplication.
+**Do not look at any other issues (research, design, pipeline, etc.).**
+
 ```bash
-gh issue list --state open --milestone "<impl-milestone>" --limit 200 \
-  --json number,title,labels,body
+gh issue list --state open --milestone "<milestone>" --label "stage/impl" --limit 200 \
+  --json number,title,labels,body --repo <owner>/<repo>
 ```
 
-Also check closed issues (in case some were previously filed and closed in error):
+Also check closed `stage/impl` issues in case some were previously filed and closed in error:
 ```bash
-gh issue list --state closed --milestone "<impl-milestone>" --limit 200 \
-  --json number,title,labels
+gh issue list --state closed --milestone "<milestone>" --label "stage/impl" --limit 200 \
+  --json number,title,labels --repo <owner>/<repo>
 ```
 
 Build a set of normalized titles to skip during Step 3.
@@ -124,8 +129,8 @@ Otherwise, file each issue:
 gh issue create \
   --repo <owner>/<repo> \
   --title "<imperative verb phrase>" \
-  --label "<feat:*>" \
-  --milestone "<impl-milestone>" \
+  --label "<feat:*>,stage/impl,P2" \
+  --milestone "<milestone>" \
   --body "$(cat <<'EOF'
 ## Context
 <1-2 sentences: what design doc section this implements and why it is needed>
@@ -176,7 +181,7 @@ impl milestone. If it is closed or missing, remove the dependency and note the c
 ### Step 5 — Print Summary
 
 Print a full summary to stdout:
-- Implementation milestone name
+- Milestone name
 - Total issues filed (number, title, label, deps for each)
 - Topological execution order
 - Any design gaps that prevented full specification (note these as potential follow-up
@@ -188,9 +193,9 @@ Print a full summary to stdout:
 ```bash
 gh issue create \
   --repo <owner>/<repo> \
-  --title "Run impl-worker for <impl-milestone>" \
+  --title "implementation: <milestone>" \
   --label "pipeline" \
-  --milestone "<impl-milestone>"
+  --milestone "<milestone>"
 ```
 
 ## Constraints
