@@ -32,7 +32,6 @@ from brimstone.cli import (
     _find_pr_for_issue,
     _get_pr_checks_status,
     _get_review_status,
-    _handle_pr_review_feedback,
     _list_open_issues_by_label,
     _monitor_pr,
     _rebase_branch,
@@ -520,95 +519,6 @@ class TestFindPrForIssue:
         with patch("brimstone.cli._gh") as mock_gh:
             mock_gh.return_value = make_gh_result(stdout=self._prs(prs))
             assert _find_pr_for_issue("owner/repo", 42) is None
-
-
-# ---------------------------------------------------------------------------
-# _handle_pr_review_feedback — comprehensive review handler
-# ---------------------------------------------------------------------------
-
-
-class TestHandlePrReviewFeedback:
-    def _make_gh_side_effect(self, reviews, inline, thread):
-        """Return a side_effect callable that returns different payloads per call."""
-        calls = iter(
-            [
-                make_gh_result(stdout=json.dumps({"reviews": reviews})),  # pr view --json reviews
-                make_gh_result(stdout=json.dumps(inline)),  # api pulls/comments
-                make_gh_result(stdout=json.dumps({"comments": thread})),  # pr view --json comments
-            ]
-        )
-
-        def _side_effect(*args, **kwargs):
-            try:
-                return next(calls)
-            except StopIteration:
-                return make_gh_result(stdout="{}")
-
-        return _side_effect
-
-    def test_dispatches_fix_agent_when_changes_requested(self) -> None:
-        reviews = [
-            {
-                "author": {"login": "claude[bot]"},
-                "state": "CHANGES_REQUESTED",
-                "body": "Please rename this variable.",
-            }
-        ]
-        inline = [
-            {
-                "user": {"login": "claude[bot]"},
-                "path": "src/foo.py",
-                "line": 10,
-                "body": "Rename x to config.",
-            }
-        ]
-        thread = []
-
-        gh_side_effect = self._make_gh_side_effect(reviews, inline, thread)
-        with (
-            patch("brimstone.cli._gh", side_effect=gh_side_effect),
-            patch("brimstone.cli.runner.run") as mock_run,
-            patch("brimstone.cli.build_subprocess_env", return_value={}),
-            patch("brimstone.cli._dismiss_stale_change_requests"),
-        ):
-            mock_run.return_value = make_run_result()
-            result = _handle_pr_review_feedback(
-                pr_number=99,
-                branch="42-add-config",
-                repo="owner/repo",
-                config=make_config(),
-                checkpoint=make_checkpoint(),
-                issue_number=42,
-            )
-
-        assert result == "fixed"
-        mock_run.assert_called_once()
-        prompt = mock_run.call_args[1]["prompt"]
-        assert "PR #99" in prompt
-        assert "42-add-config" in prompt
-        assert "rename" in prompt.lower()
-
-    def test_returns_no_feedback_when_nothing_actionable(self) -> None:
-        reviews = [{"author": {"login": "claude[bot]"}, "state": "APPROVED", "body": ""}]
-        inline = []
-        thread = []
-
-        gh_side_effect2 = self._make_gh_side_effect(reviews, inline, thread)
-        with (
-            patch("brimstone.cli._gh", side_effect=gh_side_effect2),
-            patch("brimstone.cli.runner.run") as mock_run,
-        ):
-            result = _handle_pr_review_feedback(
-                pr_number=99,
-                branch="42-add-config",
-                repo="owner/repo",
-                config=make_config(),
-                checkpoint=make_checkpoint(),
-                issue_number=42,
-            )
-
-        assert result == "no_feedback"
-        mock_run.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1254,8 +1164,8 @@ class TestMonitorPrPrBeadWrites:
         assert first_call_bead.pr_number == 99
         assert first_call_bead.issue_number == 42
 
-    def test_does_not_dispatch_ci_fix(self) -> None:
-        """_dispatch_ci_fix_agent must NOT be called even when CI fails persistently."""
+    def test_returns_false_on_persistent_ci_failure(self) -> None:
+        """_monitor_pr returns False when CI fails persistently without recovery."""
         store = self._make_store()
         fail_checks = [{"name": "ci", "status": "completed", "conclusion": "failure"}]
 
@@ -1272,12 +1182,10 @@ class TestMonitorPrPrBeadWrites:
             patch("brimstone.cli._is_conflict_failure", return_value=False),
             patch("brimstone.cli._gh", side_effect=gh_side_effect),
             patch("brimstone.cli.logger.log_conductor_event"),
-            patch("brimstone.cli._dispatch_ci_fix_agent") as mock_ci_fix,
             patch("brimstone.cli.session.save"),
         ):
             result = _monitor_pr(**self._make_monitor_kwargs(store, max_polls=10))
 
-        mock_ci_fix.assert_not_called()
         assert result is False
 
     def test_writes_ci_failing_bead_on_persistent_ci_failure(self) -> None:
@@ -1384,17 +1292,36 @@ class TestMonitorPrPrBeadWrites:
 
 
 class TestResumeStaleIssuesWorktree:
-    def _make_stale_issue(self, number: int = 57) -> dict:
-        return {"number": number, "labels": [{"name": "stage/impl"}], "assignees": []}
+    def _make_store(self, issue_number: int = 57, milestone: str = "v1") -> MagicMock:
+        """Return a mock BeadStore with one claimed WorkBead."""
+        from brimstone.beads import WorkBead
+
+        bead = WorkBead(
+            v=1,
+            issue_number=issue_number,
+            title="Stale issue",
+            milestone=milestone,
+            stage="impl",
+            module="cli",
+            priority="P2",
+            state="claimed",
+            branch=f"{issue_number}-add-feature",
+        )
+        store = MagicMock()
+        store.list_work_beads.return_value = [bead]
+        store.read_pr_bead.return_value = None
+        store.write_pr_bead.return_value = None
+        store.read_work_bead.return_value = bead
+        store.write_work_bead.return_value = None
+        return store
 
     def test_creates_worktree_for_pr_when_repo_root_provided(self) -> None:
         """When repo_root is given and PR exists, _checkout_existing_branch_worktree is called."""
-        stale = self._make_stale_issue(57)
+        store = self._make_store(57, "v1")
         config = make_config()
         checkpoint = make_checkpoint()
 
         with (
-            patch("brimstone.cli._list_in_progress_issues", return_value=[stale]),
             patch("brimstone.cli._find_pr_for_issue", return_value=(64, "57-add-feature")),
             patch(
                 "brimstone.cli._checkout_existing_branch_worktree", return_value="/tmp/wt/57"
@@ -1411,6 +1338,7 @@ class TestResumeStaleIssuesWorktree:
                 config=config,
                 checkpoint=checkpoint,
                 repo_root="/repo",
+                store=store,
             )
 
         mock_checkout.assert_called_once_with("57-add-feature", "/repo")
@@ -1421,12 +1349,11 @@ class TestResumeStaleIssuesWorktree:
 
     def test_cleans_up_worktree_after_monitoring_raises(self) -> None:
         """Worktree is removed even if _monitor_pr raises an exception."""
-        stale = self._make_stale_issue(57)
+        store = self._make_store(57, "v1")
         config = make_config()
         checkpoint = make_checkpoint()
 
         with (
-            patch("brimstone.cli._list_in_progress_issues", return_value=[stale]),
             patch("brimstone.cli._find_pr_for_issue", return_value=(64, "57-add-feature")),
             patch("brimstone.cli._checkout_existing_branch_worktree", return_value="/tmp/wt/57"),
             patch("brimstone.cli._monitor_pr", side_effect=RuntimeError("boom")),
@@ -1442,16 +1369,16 @@ class TestResumeStaleIssuesWorktree:
                     config=config,
                     checkpoint=checkpoint,
                     repo_root="/repo",
+                    store=store,
                 )
 
         mock_remove.assert_called_once_with("/tmp/wt/57", "/repo")
 
     def test_no_worktree_when_repo_root_empty(self) -> None:
         """When repo_root is empty, _checkout_existing_branch_worktree is not called."""
-        stale = self._make_stale_issue(57)
+        store = self._make_store(57, "v1")
 
         with (
-            patch("brimstone.cli._list_in_progress_issues", return_value=[stale]),
             patch("brimstone.cli._find_pr_for_issue", return_value=(64, "57-add-feature")),
             patch("brimstone.cli._checkout_existing_branch_worktree") as mock_checkout,
             patch("brimstone.cli._monitor_pr"),
@@ -1466,9 +1393,23 @@ class TestResumeStaleIssuesWorktree:
                 config=make_config(),
                 checkpoint=make_checkpoint(),
                 repo_root="",
+                store=store,
             )
 
         mock_checkout.assert_not_called()
+
+    def test_returns_early_when_store_is_none(self) -> None:
+        """When store is None, _resume_stale_issues returns an empty set immediately."""
+        result = _resume_stale_issues(
+            repo="owner/repo",
+            milestone="v1",
+            label="stage/impl",
+            log_prefix="[test]",
+            config=make_config(),
+            checkpoint=make_checkpoint(),
+            store=None,
+        )
+        assert result == set()
 
 
 # ---------------------------------------------------------------------------

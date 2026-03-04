@@ -1037,20 +1037,47 @@ class TestRunResearchWorkerDryRun:
 class TestResumeUnclaim:
     """Verify the resume block correctly handles stale in-progress issues."""
 
+    def _make_store(self, issue_numbers: list[int], milestone: str = "MVP Research") -> MagicMock:
+        """Return a mock BeadStore with claimed WorkBeads for each issue number."""
+        from brimstone.beads import WorkBead
+
+        beads = [
+            WorkBead(
+                v=1,
+                issue_number=n,
+                title=f"Issue {n}",
+                milestone=milestone,
+                stage="research",
+                module="cli",
+                priority="P2",
+                state="claimed",
+                branch=f"{n}-stale-branch",
+            )
+            for n in issue_numbers
+        ]
+        store = MagicMock()
+        store.list_work_beads.return_value = beads
+        store.read_pr_bead.return_value = None
+        store.write_pr_bead.return_value = None
+        store.read_work_bead.return_value = beads[0] if beads else None
+        store.write_work_bead.return_value = None
+        store.read_merge_queue.return_value = MagicMock(queue=[])
+        store.write_merge_queue.return_value = None
+        store.flush.return_value = None
+        return store
+
     def test_stale_issue_with_pr_is_monitored(self, tmp_path: Path) -> None:
         """In-progress issue that already has an open PR is resumed via _monitor_pr."""
         config = make_config()
         object.__setattr__(config, "checkpoint_dir", tmp_path)
         object.__setattr__(config, "log_dir", tmp_path / "logs")
         checkpoint = make_checkpoint()
-
-        stale = make_issue(42, title="Stale with PR")
+        store = self._make_store([42])
 
         monitor_calls: list[int] = []
         unclaim_calls: list[int] = []
 
         with (
-            patch("brimstone.cli._list_in_progress_issues", return_value=[stale]),
             patch("brimstone.cli._find_pr_for_issue", return_value=(99, "42-stale-branch")),
             patch(
                 "brimstone.cli._monitor_pr",
@@ -1073,6 +1100,7 @@ class TestResumeUnclaim:
                 config=config,
                 checkpoint=checkpoint,
                 dry_run=False,
+                store=store,
             )
 
         assert 99 in monitor_calls, "_monitor_pr should be called for issue with PR"
@@ -1084,15 +1112,14 @@ class TestResumeUnclaim:
         object.__setattr__(config, "checkpoint_dir", tmp_path)
         object.__setattr__(config, "log_dir", tmp_path / "logs")
         checkpoint = make_checkpoint()
-
-        stale = make_issue(77, title="Stale no PR")
+        store = self._make_store([77])
 
         unclaim_calls: list[int] = []
         monitor_calls: list[int] = []
 
         with (
-            patch("brimstone.cli._list_in_progress_issues", return_value=[stale]),
             patch("brimstone.cli._find_pr_for_issue", return_value=None),
+            patch("brimstone.cli._pr_merged_for_issue", return_value=False),
             patch(
                 "brimstone.cli._unclaim_issue",
                 side_effect=lambda repo, issue_number, **kw: unclaim_calls.append(issue_number),
@@ -1114,6 +1141,7 @@ class TestResumeUnclaim:
                 config=config,
                 checkpoint=checkpoint,
                 dry_run=False,
+                store=store,
             )
 
         assert 77 in unclaim_calls, "_unclaim_issue must be called for stale issue with no PR"
@@ -1125,9 +1153,7 @@ class TestResumeUnclaim:
         object.__setattr__(config, "checkpoint_dir", tmp_path)
         object.__setattr__(config, "log_dir", tmp_path / "logs")
         checkpoint = make_checkpoint()
-
-        stale_with_pr = make_issue(10, title="Has PR")
-        stale_no_pr = make_issue(20, title="No PR")
+        store = self._make_store([10, 20])
 
         def fake_find_pr(repo: str, issue_number: int):
             if issue_number == 10:
@@ -1138,11 +1164,8 @@ class TestResumeUnclaim:
         unclaim_calls: list[int] = []
 
         with (
-            patch(
-                "brimstone.cli._list_in_progress_issues",
-                return_value=[stale_with_pr, stale_no_pr],
-            ),
             patch("brimstone.cli._find_pr_for_issue", side_effect=fake_find_pr),
+            patch("brimstone.cli._pr_merged_for_issue", return_value=False),
             patch(
                 "brimstone.cli._monitor_pr",
                 side_effect=lambda pr_number, **kw: monitor_calls.append(pr_number),
@@ -1163,6 +1186,7 @@ class TestResumeUnclaim:
                 config=config,
                 checkpoint=checkpoint,
                 dry_run=False,
+                store=store,
             )
 
         assert 55 in monitor_calls, "Issue 10 (has PR) should be monitored"

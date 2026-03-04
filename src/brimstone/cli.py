@@ -618,37 +618,6 @@ def _gh(
     return subprocess.run(cmd, capture_output=True, text=True, check=check)
 
 
-def _list_in_progress_issues(repo: str, milestone: str, label: str) -> list[dict[str, Any]]:
-    """Return open issues with in-progress label for *milestone* scoped to *label*.
-
-    Used at worker startup to resume monitoring PRs from a previous run.
-    """
-    result = _gh(
-        [
-            "issue",
-            "list",
-            "--state",
-            "open",
-            "--label",
-            f"{label},in-progress",
-            "--milestone",
-            milestone,
-            "--json",
-            "number,title",
-            "--limit",
-            "50",
-        ],
-        repo=repo,
-        check=False,
-    )
-    if result.returncode != 0:
-        return []
-    try:
-        return json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return []
-
-
 def _resume_open_prs(
     repo: str,
     milestone: str,
@@ -779,21 +748,20 @@ def _resume_stale_issues(
     Called at the start of research-worker, design-worker, and impl-worker.
     """
     handled: set[int] = set()
-    if store is not None:
-        _LABEL_TO_STAGE = {
-            "stage/research": "research",
-            "stage/impl": "impl",
-            "stage/design": "design",
-        }
-        stage_name = _LABEL_TO_STAGE.get(label, "")
-        claimed_beads = [
-            b
-            for b in store.list_work_beads(state="claimed")
-            if b.milestone == milestone and (not stage_name or b.stage == stage_name)
-        ]
-        stale_iter: list[int] = [b.issue_number for b in claimed_beads]
-    else:
-        stale_iter = [stale["number"] for stale in _list_in_progress_issues(repo, milestone, label)]
+    if store is None:
+        return handled
+    _LABEL_TO_STAGE = {
+        "stage/research": "research",
+        "stage/impl": "impl",
+        "stage/design": "design",
+    }
+    stage_name = _LABEL_TO_STAGE.get(label, "")
+    claimed_beads = [
+        b
+        for b in store.list_work_beads(state="claimed")
+        if b.milestone == milestone and (not stage_name or b.stage == stage_name)
+    ]
+    stale_iter: list[int] = [b.issue_number for b in claimed_beads]
     for stale_number in stale_iter:
         found = _find_pr_for_issue(repo, stale_number)
         if found is not None:
@@ -2914,8 +2882,6 @@ def _process_merge_queue(
                 work_bead.state = "closed"
                 work_bead.closed_at = now_str
                 store.write_work_bead(work_bead)
-            # Keep legacy checkpoint update for backward-compat until PR 7b
-            checkpoint.completed_prs.append(pr_number)
             session.save(checkpoint, checkpoint_path)
             store.flush(f"brimstone: #{issue_number} merged via pr-{pr_number}")
             logger.log_conductor_event(
@@ -3125,332 +3091,6 @@ def _deacon_scan(
             _exhaust_issue(repo, pr_bead.issue_number, reason, store)
         else:
             _dispatch_recovery_agent(pr_bead, work_bead, repo, config, checkpoint, store)
-
-
-def _dispatch_ci_fix_agent(
-    pr_number: int,
-    branch: str,
-    repo: str,
-    config: Config,
-    checkpoint: Checkpoint,
-    issue_number: int,
-) -> None:
-    """Dispatch a fix agent to repair CI failures on a PR branch.
-
-    Reads the latest failing CI run logs, then dispatches a Claude agent that
-    checks out the branch, diagnoses and fixes the failures, and pushes a fix
-    commit. The caller should continue polling after this returns.
-
-    Args:
-        pr_number:    GitHub PR number.
-        branch:       Branch name for the PR.
-        repo:         Repository in ``owner/repo`` format.
-        config:       Config instance (provides model, env, timeouts).
-        checkpoint:   Checkpoint instance for logging.
-        issue_number: Original issue number (for logging).
-    """
-    logger.log_conductor_event(
-        run_id=checkpoint.run_id,
-        phase="ci_check",
-        event_type="ci_fix_dispatched",
-        payload={"pr_number": pr_number, "issue_number": issue_number, "branch": branch},
-        log_dir=config.log_dir.expanduser(),
-    )
-
-    # Fetch failure logs from the most recent CI run on this branch.
-    run_list = _gh(
-        ["run", "list", "--branch", branch, "--limit", "1", "--json", "databaseId"],
-        repo=repo,
-        check=False,
-    )
-    failure_logs = "(could not retrieve CI logs)"
-    try:
-        runs = json.loads(run_list.stdout or "[]")
-        if runs:
-            run_id = runs[0]["databaseId"]
-            log_result = _gh(
-                ["run", "view", str(run_id), "--log-failed"],
-                repo=repo,
-                check=False,
-            )
-            if log_result.returncode == 0 and log_result.stdout:
-                failure_logs = log_result.stdout[:4000]
-    except (json.JSONDecodeError, KeyError, IndexError):
-        pass
-
-    prompt = (
-        f"You are fixing CI failures on PR #{pr_number} in repository `{repo}`.\n"
-        f"Branch: `{branch}`\n\n"
-        f"CI failure logs:\n```\n{failure_logs}\n```\n\n"
-        f"Steps:\n"
-        f"1. Clone the repo into a temp directory:\n"
-        f"   WORK=$(mktemp -d) && gh repo clone {repo} $WORK\n"
-        f"2. cd $WORK && git checkout {branch} && git pull origin {branch}\n"
-        f"3. Diagnose the failure from the logs above. Fix the root cause in the source files.\n"
-        f"   - Lint errors: remove unused imports, fix formatting\n"
-        f"   - Test failures: fix the implementation or correct a wrong test expectation\n"
-        f"   - Type errors: add or fix type annotations\n"
-        f"   Stay within the files already modified on this branch"
-        f" — do not refactor unrelated code.\n"
-        f"4. Run CI locally to verify the fix:\n"
-        f"   make lint && make test   (or uv run ruff check && uv run pytest)\n"
-        f"5. Commit and push:\n"
-        f"   git add -A && git commit -m 'fix: repair CI on PR #{pr_number}' && git push\n"
-        f"6. STOP.\n"
-    )
-
-    env = build_subprocess_env(config)
-    runner.run(
-        prompt=prompt,
-        allowed_tools=["Bash"],
-        env=env,
-        max_turns=40,
-        timeout_seconds=config.agent_timeout_minutes * 60,
-        model=config.model,
-        prefix=f"[ci-fix {branch}] ",
-    )
-
-
-def _collect_pr_review_context(pr_number: int, repo: str) -> dict[str, Any]:
-    """Collect all review feedback from a PR: formal reviews, inline comments, thread comments.
-
-    Returns a dict with keys:
-        ``reviews``        — list of formal review dicts (state, author, body)
-        ``inline``         — list of inline code comment dicts (path, line, body, author)
-        ``thread``         — list of PR thread comment dicts (body, author)
-        ``blocking_logins``— set of reviewer logins whose state is CHANGES_REQUESTED
-    """
-    context: dict[str, Any] = {
-        "reviews": [],
-        "inline": [],
-        "thread": [],
-        "blocking_logins": set(),
-    }
-
-    # Formal reviews (state + body)
-    reviews_result = _gh(
-        ["pr", "view", str(pr_number), "--json", "reviews"],
-        repo=repo,
-        check=False,
-    )
-    if reviews_result.returncode == 0:
-        try:
-            data = json.loads(reviews_result.stdout)
-            raw_reviews = data.get("reviews", [])
-            # Deduplicate: keep the latest review per author
-            latest: dict[str, dict] = {}
-            for r in raw_reviews:
-                login = (r.get("author") or {}).get("login", "unknown")
-                latest[login] = r
-            for login, r in latest.items():
-                state = (r.get("state") or "").upper()
-                entry = {
-                    "author": login,
-                    "state": state,
-                    "body": (r.get("body") or "").strip(),
-                }
-                context["reviews"].append(entry)
-                if state == "CHANGES_REQUESTED":
-                    context["blocking_logins"].add(login)
-        except (json.JSONDecodeError, AttributeError):
-            pass
-
-    # Inline code comments
-    inline_result = _gh(
-        ["api", f"repos/{repo}/pulls/{pr_number}/comments"],
-        repo=None,
-        check=False,
-    )
-    if inline_result.returncode == 0:
-        try:
-            for c in json.loads(inline_result.stdout or "[]")[:30]:
-                context["inline"].append(
-                    {
-                        "author": (c.get("user") or {}).get("login", "?"),
-                        "path": c.get("path") or "?",
-                        "line": c.get("line") or c.get("original_line") or "?",
-                        "body": (c.get("body") or "").strip(),
-                    }
-                )
-        except (json.JSONDecodeError, AttributeError):
-            pass
-
-    # PR thread comments
-    thread_result = _gh(
-        ["pr", "view", str(pr_number), "--json", "comments"],
-        repo=repo,
-        check=False,
-    )
-    if thread_result.returncode == 0:
-        try:
-            data = json.loads(thread_result.stdout)
-            for c in (data.get("comments") or [])[:20]:
-                context["thread"].append(
-                    {
-                        "author": (c.get("author") or {}).get("login", "?"),
-                        "body": (c.get("body") or "").strip(),
-                    }
-                )
-        except (json.JSONDecodeError, AttributeError):
-            pass
-
-    return context
-
-
-def _dismiss_stale_change_requests(pr_number: int, repo: str, logins: set[str]) -> None:
-    """Dismiss CHANGES_REQUESTED reviews for *logins* after fixes have been pushed.
-
-    Called after a review-fix agent pushes changes so the stale blocking reviews
-    don't prevent the squash merge. Only dismisses reviews from *logins* — human
-    reviews that were not specifically addressed are left intact.
-
-    Args:
-        pr_number: GitHub PR number.
-        repo:      Repository in ``owner/repo`` format.
-        logins:    Set of reviewer logins whose CHANGES_REQUESTED reviews to dismiss.
-    """
-    # Fetch current reviews with IDs
-    result = _gh(
-        ["api", f"repos/{repo}/pulls/{pr_number}/reviews"],
-        repo=None,
-        check=False,
-    )
-    if result.returncode != 0:
-        return
-    try:
-        reviews = json.loads(result.stdout or "[]")
-    except json.JSONDecodeError:
-        return
-
-    for review in reviews:
-        state = (review.get("state") or "").upper()
-        login = (review.get("user") or {}).get("login", "")
-        if state == "CHANGES_REQUESTED" and login in logins:
-            review_id = review.get("id")
-            if review_id:
-                _gh(
-                    [
-                        "api",
-                        "--method",
-                        "PUT",
-                        f"repos/{repo}/pulls/{pr_number}/reviews/{review_id}/dismissals",
-                        "-f",
-                        "message=Review feedback addressed in latest commit.",
-                    ],
-                    repo=None,
-                    check=False,
-                )
-
-
-def _handle_pr_review_feedback(
-    pr_number: int,
-    branch: str,
-    repo: str,
-    config: Config,
-    checkpoint: Checkpoint,
-    issue_number: int,
-) -> str:
-    """Collect all PR review feedback, dispatch a fix agent, and dismiss stale reviews.
-
-    Gathers formal review bodies, inline code comments, and PR thread comments from
-    all reviewers (human and automated, including Claude Code). Dispatches a single
-    fix agent with full context. After the agent pushes fixes, dismisses stale
-    CHANGES_REQUESTED reviews so they no longer block the squash merge.
-
-    Returns:
-        ``"fixed"``    — fix agent ran; caller should re-poll CI before merging.
-        ``"no_feedback"`` — no actionable feedback found; caller may merge.
-        ``"error"``    — could not read feedback; caller should escalate.
-    """
-    ctx = _collect_pr_review_context(pr_number, repo)
-
-    # Check if there is any substantive feedback to act on
-    has_formal = any(r["body"] for r in ctx["reviews"])
-    has_inline = bool(ctx["inline"])
-    has_thread = any(c["body"] and not c["author"].endswith("[bot]") for c in ctx["thread"])
-    if not has_formal and not has_inline and not has_thread:
-        return "no_feedback"
-
-    # Format reviews section
-    reviews_text = ""
-    for r in ctx["reviews"]:
-        state_tag = f"[{r['state']}]" if r["state"] else ""
-        body_text = r["body"] or "(no body)"
-        reviews_text += f"- **{r['author']}** {state_tag}:\n  {body_text}\n\n"
-
-    # Format inline comments
-    inline_text = ""
-    for c in ctx["inline"]:
-        inline_text += f"- `{c['path']}` line {c['line']} (@{c['author']}):\n  {c['body']}\n\n"
-
-    # Format thread comments (skip bots and empty)
-    thread_text = ""
-    for c in ctx["thread"]:
-        if c["body"] and not c["author"].endswith("[bot]"):
-            thread_text += f"- **@{c['author']}**: {c['body']}\n\n"
-
-    blocking = sorted(ctx["blocking_logins"])
-    blocking_str = ", ".join(f"@{login}" for login in blocking) or "none"
-
-    logger.log_conductor_event(
-        run_id=checkpoint.run_id,
-        phase="review",
-        event_type="review_feedback_dispatched",
-        payload={
-            "pr_number": pr_number,
-            "issue_number": issue_number,
-            "blocking_reviewers": blocking,
-            "inline_count": len(ctx["inline"]),
-            "thread_comment_count": len(ctx["thread"]),
-        },
-        log_dir=config.log_dir.expanduser(),
-    )
-
-    prompt = (
-        f"You are addressing review feedback on PR #{pr_number} in repository `{repo}`.\n"
-        f"Branch: `{branch}`\n"
-        f"Reviewers requesting changes: {blocking_str}\n\n"
-        f"## Formal Reviews\n{reviews_text or '(none)'}\n"
-        f"## Inline Code Comments\n{inline_text or '(none)'}\n"
-        f"## PR Thread Comments\n{thread_text or '(none)'}\n\n"
-        f"## Instructions\n"
-        f"1. Clone the repo:\n"
-        f"   WORK=$(mktemp -d) && gh repo clone {repo} $WORK\n"
-        f"2. cd $WORK && git checkout {branch} && git pull origin {branch}\n"
-        f"3. Triage every piece of feedback:\n"
-        f"   **Fix now**: correctness bugs, lint/type errors, broken tests, clear API mistakes → "
-        f"fix in the source, run tests to verify.\n"
-        f"   **File issue**: valid feedback that is out of scope for this PR → "
-        f"   `gh issue create --repo {repo} --title '...' --body '...'` "
-        f"   then comment on the PR: `gh pr comment {pr_number} --repo {repo} "
-        f"--body 'Filed as #<N>'`\n"
-        f"   **Skip**: false positives, style nitpicks, subjective preferences → "
-        f"   `gh pr comment {pr_number} --repo {repo} --body 'Skipping: <reason>'`\n"
-        f"4. Run lint and tests locally to confirm no regressions:\n"
-        f"   make lint && make test   (or: uv run ruff check && uv run pytest)\n"
-        f"5. Commit and push ALL fixes in a single commit:\n"
-        f"   git add -A && git commit -m 'fix: address review feedback on PR #{pr_number}' "
-        f"&& git push\n"
-        f"6. STOP — do not merge.\n"
-    )
-
-    env = build_subprocess_env(config)
-    runner.run(
-        prompt=prompt,
-        allowed_tools=["Bash"],
-        env=env,
-        max_turns=50,
-        timeout_seconds=config.agent_timeout_minutes * 60,
-        model=config.model,
-        prefix=f"[review-fix {branch}] ",
-    )
-
-    # Dismiss stale CHANGES_REQUESTED reviews from the reviewers we just addressed.
-    # This unblocks the squash merge; CI will re-run on the new commit.
-    if ctx["blocking_logins"]:
-        _dismiss_stale_change_requests(pr_number, repo, ctx["blocking_logins"])
-
-    return "fixed"
 
 
 def _create_worktree(branch: str, repo_root: str, default_branch: str = "main") -> str | None:
@@ -4042,7 +3682,6 @@ def _run_impl_worker(
                 _unclaim_issue(repo=repo, issue_number=issue_number, store=store)
                 _remove_worktree(worktree_path, repo_root)
                 return
-            checkpoint.open_prs[branch] = pr_number
             session.save(checkpoint, checkpoint_path)
             logger.log_conductor_event(
                 run_id=checkpoint.run_id,

@@ -34,7 +34,6 @@ from tests.integration.conftest import (
 _BASE_PATCHES = {
     "milestone_exists": "brimstone.cli._milestone_exists",
     "default_branch": "brimstone.cli._get_default_branch_for_repo",
-    "in_progress": "brimstone.cli._list_in_progress_issues",
     "claim": "brimstone.cli._claim_issue",
     "unclaim": "brimstone.cli._unclaim_issue",
     "find_pr": "brimstone.cli._find_pr_for_issue",
@@ -73,7 +72,6 @@ class TestResearchWorkerHappyPath:
         with (
             patch(_BASE_PATCHES["milestone_exists"], return_value=True),
             patch(_BASE_PATCHES["default_branch"], return_value="mainline"),
-            patch(_BASE_PATCHES["in_progress"], return_value=[]),
             patch(_BASE_PATCHES["claim"]),
             patch(_BASE_PATCHES["unclaim"]),
             patch(_BASE_PATCHES["find_pr"], return_value=None),
@@ -112,7 +110,6 @@ class TestResearchWorkerHappyPath:
         with (
             patch(_BASE_PATCHES["milestone_exists"], return_value=True),
             patch(_BASE_PATCHES["default_branch"], return_value="mainline"),
-            patch(_BASE_PATCHES["in_progress"], return_value=[]),
             patch(_BASE_PATCHES["claim"]),
             patch(_BASE_PATCHES["unclaim"]),
             patch(_BASE_PATCHES["find_pr"], return_value=None),
@@ -163,7 +160,6 @@ class TestResearchWorkerHappyPath:
         with (
             patch(_BASE_PATCHES["milestone_exists"], return_value=True),
             patch(_BASE_PATCHES["default_branch"], return_value="mainline"),
-            patch(_BASE_PATCHES["in_progress"], return_value=[]),
             patch(_BASE_PATCHES["claim"], side_effect=fake_claim),
             patch(_BASE_PATCHES["unclaim"]),
             patch(_BASE_PATCHES["find_pr"], return_value=None),
@@ -199,7 +195,6 @@ class TestResearchWorkerHappyPath:
         with (
             patch(_BASE_PATCHES["milestone_exists"], return_value=True),
             patch(_BASE_PATCHES["default_branch"], return_value="mainline"),
-            patch(_BASE_PATCHES["in_progress"], return_value=[]),
             patch("brimstone.cli._list_open_issues_by_label", return_value=[]),
             patch("brimstone.cli._run_completion_gate", side_effect=fake_gate),
         ):
@@ -234,7 +229,6 @@ class TestResearchWorkerHappyPath:
         with (
             patch(_BASE_PATCHES["milestone_exists"], return_value=True),
             patch(_BASE_PATCHES["default_branch"], return_value="mainline"),
-            patch(_BASE_PATCHES["in_progress"], return_value=[]),
             patch("brimstone.cli._list_open_issues_by_label", return_value=[issue]),
             # All issues non-blocking
             patch(_BASE_PATCHES["classify"], return_value=([], [issue])),
@@ -271,7 +265,6 @@ class TestResearchWorkerErrorHandling:
         with (
             patch(_BASE_PATCHES["milestone_exists"], return_value=True),
             patch(_BASE_PATCHES["default_branch"], return_value="mainline"),
-            patch(_BASE_PATCHES["in_progress"], return_value=[]),
             patch(_BASE_PATCHES["claim"]),
             patch(_BASE_PATCHES["unclaim"]),
             patch(_BASE_PATCHES["find_pr"], return_value=None),
@@ -315,7 +308,6 @@ class TestResearchWorkerErrorHandling:
         with (
             patch(_BASE_PATCHES["milestone_exists"], return_value=True),
             patch(_BASE_PATCHES["default_branch"], return_value="mainline"),
-            patch(_BASE_PATCHES["in_progress"], return_value=[]),
             patch(_BASE_PATCHES["claim"]),
             patch(_BASE_PATCHES["unclaim"], side_effect=fake_unclaim),
             patch(_BASE_PATCHES["find_pr"], return_value=None),
@@ -343,7 +335,27 @@ class TestResearchWorkerErrorHandling:
         os.chdir(git_repo)
         config = make_config(tmp_path)
         checkpoint = make_checkpoint()
-        stale = make_issue(99, "Stale from crashed session")
+
+        from brimstone.beads import WorkBead
+
+        stale_bead = WorkBead(
+            v=1,
+            issue_number=99,
+            title="Stale from crashed session",
+            milestone="v0.1.0",
+            stage="research",
+            module="cli",
+            priority="P2",
+            state="claimed",
+            branch="99-stale-branch",
+        )
+        store = MagicMock()
+        store.list_work_beads.return_value = [stale_bead]
+        store.read_pr_bead.return_value = None
+        store.write_pr_bead.return_value = None
+        store.read_work_bead.return_value = stale_bead
+        store.write_work_bead.return_value = None
+        store.flush.return_value = None
 
         unclaimed: list[int] = []
 
@@ -353,7 +365,6 @@ class TestResearchWorkerErrorHandling:
         with (
             patch(_BASE_PATCHES["milestone_exists"], return_value=True),
             patch(_BASE_PATCHES["default_branch"], return_value="mainline"),
-            patch(_BASE_PATCHES["in_progress"], return_value=[stale]),
             patch(_BASE_PATCHES["unclaim"], side_effect=fake_unclaim),
             # _find_pr_for_issue returns None → no open PR
             patch(_BASE_PATCHES["find_pr"], return_value=None),
@@ -367,6 +378,7 @@ class TestResearchWorkerErrorHandling:
                 milestone="v0.1.0",
                 config=config,
                 checkpoint=checkpoint,
+                store=store,
             )
 
         assert 99 in unclaimed, "Stale in-progress issue with no PR must be unclaimed"
@@ -413,7 +425,6 @@ class TestResearchWorkerParallelDispatch:
         with (
             patch(_BASE_PATCHES["milestone_exists"], return_value=True),
             patch(_BASE_PATCHES["default_branch"], return_value="mainline"),
-            patch(_BASE_PATCHES["in_progress"], return_value=[]),
             patch(_BASE_PATCHES["claim"]),
             patch(_BASE_PATCHES["unclaim"], side_effect=fake_unclaim),
             patch(_BASE_PATCHES["find_pr"], return_value=None),
