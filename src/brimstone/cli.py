@@ -56,9 +56,9 @@ DESIGN_LABEL: str = "stage/design"
 IMPL_LABEL: str = "stage/impl"
 BACKOFF_SLEEP_SECONDS: int = 30
 STALL_MAX_ITERATIONS: int = 5  # 5 × BACKOFF_SLEEP_SECONDS = 2.5 min before escalation
-DEACON_INTERVAL: int = 5  # run deacon scan every N pool iterations
-DEACON_TIMEOUT_MINUTES: float = 45.0
-DEACON_MAX_FIX_ATTEMPTS: int = 3
+WATCHDOG_INTERVAL: int = 5  # run watchdog scan every N pool iterations
+WATCHDOG_TIMEOUT_MINUTES: float = 45.0
+WATCHDOG_MAX_FIX_ATTEMPTS: int = 3
 
 
 def _auth_mode(config: Config) -> str:
@@ -1557,7 +1557,7 @@ def _run_persistent_pool(
     # In-memory fallback retry tracker used when store is None.
     _retry_counts: dict[int, int] = {}
     stall_count: int = 0
-    _deacon_tick: int = 0
+    _watchdog_tick: int = 0
     active: dict = {}
 
     fill_fn(active)
@@ -1717,10 +1717,10 @@ def _run_persistent_pool(
             on_success(_issue, _branch, _worktree_path)
             session.save(checkpoint, checkpoint_path)
 
-        _deacon_tick += 1
-        if store is not None and _deacon_tick % DEACON_INTERVAL == 0:
+        _watchdog_tick += 1
+        if store is not None and _watchdog_tick % WATCHDOG_INTERVAL == 0:
             active_numbers = {active[f][0]["number"] for f in active}
-            _deacon_scan(
+            _watchdog_scan(
                 repo=repo,
                 config=config,
                 checkpoint=checkpoint,
@@ -2815,7 +2815,7 @@ def _process_merge_queue(
 
     For each entry in the queue:
     1. Attempt rebase onto the default branch (in a temporary worktree).
-    2. If rebase fails, push the entry to the tail and break (Deacon handles
+    2. If rebase fails, push the entry to the tail and break (Watchdog handles
        repeated failures).
     3. If rebase succeeds, squash-merge and write merged bead state.
 
@@ -2909,7 +2909,7 @@ def _process_merge_queue(
                 log_dir=config.log_dir.expanduser(),
             )
             # Remove from queue — won't be retried automatically
-            # (Deacon or human intervention needed)
+            # (Watchdog or human intervention needed)
 
     # Write updated queue (with processed entries removed, remaining intact)
     queue.queue = remaining
@@ -2930,7 +2930,7 @@ def _dispatch_recovery_agent(
     Gathers PR diff, review comments, and latest CI logs, then runs a fix
     agent.  Increments ``pr_bead.fix_attempts`` and writes the updated bead
     before returning so repeated failures are capped by
-    :data:`DEACON_MAX_FIX_ATTEMPTS`.
+    :data:`WATCHDOG_MAX_FIX_ATTEMPTS`.
 
     Args:
         pr_bead:    The PRBead for the stalled PR.
@@ -2999,13 +2999,13 @@ def _dispatch_recovery_agent(
         f"3. Diagnose issues from the diff, reviews, and CI logs above.\n"
         f"4. Fix ALL issues in a single commit. Stay within files already on the branch.\n"
         f"5. Verify: uv run ruff check && uv run pytest\n"
-        f"6. git add -A && git commit -m 'fix: deacon recovery on PR #{pr_number}' && git push\n"
+        f"6. git add -A && git commit -m 'fix: watchdog recovery on PR #{pr_number}' && git push\n"
         f"7. STOP. Output exactly: Done.\n"
     )
 
     logger.log_conductor_event(
         run_id=checkpoint.run_id,
-        phase="deacon",
+        phase="watchdog",
         event_type="recovery_dispatched",
         payload={
             "pr_number": pr_number,
@@ -3024,14 +3024,14 @@ def _dispatch_recovery_agent(
         max_turns=60,
         timeout_seconds=config.agent_timeout_minutes * 60,
         model=config.model,
-        prefix=f"[deacon {branch}] ",
+        prefix=f"[watchdog {branch}] ",
     )
 
     pr_bead.fix_attempts += 1
     store.write_pr_bead(pr_bead)
 
 
-def _deacon_scan(
+def _watchdog_scan(
     repo: str,
     config: Config,
     checkpoint: Checkpoint,
@@ -3042,11 +3042,11 @@ def _deacon_scan(
     """Scan for zombie PRs and dispatch recovery agents or exhaust issues.
 
     A zombie is a WorkBead with ``state="claimed"`` and ``claimed_at`` older
-    than :data:`DEACON_TIMEOUT_MINUTES` whose ``issue_number`` is NOT in the
+    than :data:`WATCHDOG_TIMEOUT_MINUTES` whose ``issue_number`` is NOT in the
     set of currently-active futures.
 
     For each zombie:
-    - If ``pr_bead.fix_attempts >= DEACON_MAX_FIX_ATTEMPTS``: exhaust the issue.
+    - If ``pr_bead.fix_attempts >= WATCHDOG_MAX_FIX_ATTEMPTS``: exhaust the issue.
     - Otherwise: dispatch a recovery agent via :func:`_dispatch_recovery_agent`.
 
     Args:
@@ -3069,13 +3069,13 @@ def _deacon_scan(
 
         claimed_dt = datetime.fromisoformat(work_bead.claimed_at)
         elapsed_min = (datetime.now(UTC) - claimed_dt).total_seconds() / 60
-        if elapsed_min < DEACON_TIMEOUT_MINUTES:
+        if elapsed_min < WATCHDOG_TIMEOUT_MINUTES:
             continue
 
         # Zombie detected
         logger.log_conductor_event(
             run_id=checkpoint.run_id,
-            phase="deacon",
+            phase="watchdog",
             event_type="zombie_detected",
             payload={
                 "issue_number": pr_bead.issue_number,
@@ -3086,8 +3086,8 @@ def _deacon_scan(
             log_dir=config.log_dir.expanduser(),
         )
 
-        if pr_bead.fix_attempts >= DEACON_MAX_FIX_ATTEMPTS:
-            reason = f"deacon: max fix attempts ({DEACON_MAX_FIX_ATTEMPTS}) exceeded"
+        if pr_bead.fix_attempts >= WATCHDOG_MAX_FIX_ATTEMPTS:
+            reason = f"watchdog: max fix attempts ({WATCHDOG_MAX_FIX_ATTEMPTS}) exceeded"
             _exhaust_issue(repo, pr_bead.issue_number, reason, store)
         else:
             _dispatch_recovery_agent(pr_bead, work_bead, repo, config, checkpoint, store)

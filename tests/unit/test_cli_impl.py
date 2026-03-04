@@ -1642,12 +1642,12 @@ class TestProcessMergeQueue:
 
 
 # ---------------------------------------------------------------------------
-# TestDeaconScan
+# TestWatchdogScan
 # ---------------------------------------------------------------------------
 
 
-class TestDeaconScan:
-    """Verify _deacon_scan() zombie detection and recovery/exhaustion logic."""
+class TestWatchdogScan:
+    """Verify _watchdog_scan() zombie detection and recovery/exhaustion logic."""
 
     def _make_pr_bead(self, issue_number: int = 7, fix_attempts: int = 0) -> MagicMock:
         from brimstone.beads import PRBead
@@ -1671,7 +1671,7 @@ class TestDeaconScan:
         from brimstone.beads import WorkBead
 
         if claimed_at is None:
-            # Default: 2 hours ago (well past DEACON_TIMEOUT_MINUTES=45)
+            # Default: 2 hours ago (well past WATCHDOG_TIMEOUT_MINUTES=45)
             from datetime import UTC, datetime, timedelta
 
             claimed_at = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
@@ -1693,7 +1693,7 @@ class TestDeaconScan:
 
     def test_no_zombies_does_nothing(self, tmp_path: Path) -> None:
         """When no beads exist, scan is a no-op."""
-        from brimstone.cli import _deacon_scan
+        from brimstone.cli import _watchdog_scan
 
         store = MagicMock()
         store.list_pr_beads.return_value = []
@@ -1701,7 +1701,7 @@ class TestDeaconScan:
         checkpoint = make_checkpoint()
 
         with patch("brimstone.cli.logger.log_conductor_event") as mock_log:
-            _deacon_scan(
+            _watchdog_scan(
                 repo="owner/repo",
                 config=config,
                 checkpoint=checkpoint,
@@ -1715,7 +1715,7 @@ class TestDeaconScan:
 
     def test_active_issue_skipped(self, tmp_path: Path) -> None:
         """An issue currently in an active future is NOT treated as a zombie."""
-        from brimstone.cli import _deacon_scan
+        from brimstone.cli import _watchdog_scan
 
         pr_bead = self._make_pr_bead(issue_number=7)
         store = MagicMock()
@@ -1724,7 +1724,7 @@ class TestDeaconScan:
         checkpoint = make_checkpoint()
 
         with patch("brimstone.cli._dispatch_recovery_agent") as mock_dispatch:
-            _deacon_scan(
+            _watchdog_scan(
                 repo="owner/repo",
                 config=config,
                 checkpoint=checkpoint,
@@ -1738,7 +1738,7 @@ class TestDeaconScan:
     def test_merged_bead_skipped(self, tmp_path: Path) -> None:
         """A PRBead with state='merged' is never treated as a zombie."""
         from brimstone.beads import PRBead
-        from brimstone.cli import _deacon_scan
+        from brimstone.cli import _watchdog_scan
 
         pr_bead = PRBead(
             v=1,
@@ -1759,7 +1759,7 @@ class TestDeaconScan:
         checkpoint = make_checkpoint()
 
         with patch("brimstone.cli._dispatch_recovery_agent") as mock_dispatch:
-            _deacon_scan(
+            _watchdog_scan(
                 repo="owner/repo",
                 config=config,
                 checkpoint=checkpoint,
@@ -1772,7 +1772,7 @@ class TestDeaconScan:
 
     def test_zombie_detected_dispatches_recovery(self, tmp_path: Path) -> None:
         """A timed-out, non-active issue triggers _dispatch_recovery_agent."""
-        from brimstone.cli import _deacon_scan
+        from brimstone.cli import _watchdog_scan
 
         pr_bead = self._make_pr_bead(issue_number=7, fix_attempts=0)
         work_bead = self._make_work_bead(issue_number=7)
@@ -1786,7 +1786,7 @@ class TestDeaconScan:
             patch("brimstone.cli._dispatch_recovery_agent") as mock_dispatch,
             patch("brimstone.cli.logger.log_conductor_event"),
         ):
-            _deacon_scan(
+            _watchdog_scan(
                 repo="owner/repo",
                 config=config,
                 checkpoint=checkpoint,
@@ -1800,10 +1800,10 @@ class TestDeaconScan:
         )
 
     def test_zombie_at_max_attempts_exhausts_issue(self, tmp_path: Path) -> None:
-        """A zombie at DEACON_MAX_FIX_ATTEMPTS calls _exhaust_issue instead of recovery."""
-        from brimstone.cli import DEACON_MAX_FIX_ATTEMPTS, _deacon_scan
+        """A zombie at WATCHDOG_MAX_FIX_ATTEMPTS calls _exhaust_issue instead of recovery."""
+        from brimstone.cli import WATCHDOG_MAX_FIX_ATTEMPTS, _watchdog_scan
 
-        pr_bead = self._make_pr_bead(issue_number=7, fix_attempts=DEACON_MAX_FIX_ATTEMPTS)
+        pr_bead = self._make_pr_bead(issue_number=7, fix_attempts=WATCHDOG_MAX_FIX_ATTEMPTS)
         work_bead = self._make_work_bead(issue_number=7)
         store = MagicMock()
         store.list_pr_beads.return_value = [pr_bead]
@@ -1816,7 +1816,7 @@ class TestDeaconScan:
             patch("brimstone.cli._dispatch_recovery_agent") as mock_dispatch,
             patch("brimstone.cli.logger.log_conductor_event"),
         ):
-            _deacon_scan(
+            _watchdog_scan(
                 repo="owner/repo",
                 config=config,
                 checkpoint=checkpoint,
@@ -1835,7 +1835,7 @@ class TestDeaconScan:
         """An issue claimed only 5 minutes ago is NOT a zombie."""
         from datetime import UTC, datetime, timedelta
 
-        from brimstone.cli import _deacon_scan
+        from brimstone.cli import _watchdog_scan
 
         pr_bead = self._make_pr_bead(issue_number=7)
         recent_claimed_at = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
@@ -1847,7 +1847,7 @@ class TestDeaconScan:
         checkpoint = make_checkpoint()
 
         with patch("brimstone.cli._dispatch_recovery_agent") as mock_dispatch:
-            _deacon_scan(
+            _watchdog_scan(
                 repo="owner/repo",
                 config=config,
                 checkpoint=checkpoint,
