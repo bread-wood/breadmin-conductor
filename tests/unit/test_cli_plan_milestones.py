@@ -5,6 +5,8 @@ Tests cover:
 - _validate_spec_path: absolute path accepted as-is
 - _validate_spec_path: non-existent path raises ClickException with clear message
 - _validate_spec_path: non-.md extension raises ClickException with clear message
+- _validate_spec_path: GitHub path (owner/repo/file.md) fetched via gh api and written to temp file
+- _validate_spec_path: GitHub path fetch failure raises ClickException with clear message
 - _seed_spec: version inferred from filename stem
 - _seed_spec: spec already exists in target repo → warning printed, no overwrite
 - _seed_spec: spec does not exist → file is copied and committed
@@ -109,6 +111,51 @@ class TestValidateSpecPath:
 
         assert result.exists()
         assert result.suffix == ".md"
+
+    def test_github_path_fetches_and_writes_temp_file(self, tmp_path: Path) -> None:
+        """A GitHub path (owner/repo/file.md) is fetched via gh api and returned as a temp file."""
+        spec_content = "# My GitHub Spec\n\nSome content here.\n"
+        # base64-encode with newlines as GitHub API returns it
+        import base64
+
+        b64_content = base64.b64encode(spec_content.encode()).decode() + "\n"
+
+        def fake_run(cmd: list[str], **kwargs):  # type: ignore[return]
+            result = MagicMock()
+            if cmd[0] == "gh":
+                result.returncode = 0
+                result.stdout = b64_content
+                result.stderr = ""
+            elif cmd[0] == "base64":
+                result.returncode = 0
+                result.stdout = spec_content
+                result.stderr = ""
+            return result
+
+        with patch("subprocess.run", side_effect=fake_run):
+            result = _validate_spec_path("bread-wood/brimstone-specs/brimstone/v0.2.0-spec.md")
+
+        assert result.exists()
+        assert result.suffix == ".md"
+        assert result.read_text() == spec_content
+
+    def test_github_path_fetch_failure_raises_click_exception(self) -> None:
+        """A failing gh api call for a GitHub path raises ClickException with a clear message."""
+        import click
+
+        def fake_run(cmd: list[str], **kwargs):  # type: ignore[return]
+            result = MagicMock()
+            result.returncode = 1
+            result.stdout = ""
+            result.stderr = "HTTP 404: Not Found"
+            return result
+
+        with patch("subprocess.run", side_effect=fake_run):
+            with pytest.raises(click.ClickException) as exc_info:
+                _validate_spec_path("bread-wood/brimstone-specs/brimstone/nonexistent.md")
+
+        msg = str(exc_info.value.format_message()).lower()
+        assert "github" in msg or "fetch" in msg or "could not" in msg
 
 
 # ---------------------------------------------------------------------------

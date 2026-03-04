@@ -358,31 +358,65 @@ class TestClassifyBlockingIssues:
         assert len(blocking) == 1
         assert len(non_blocking) == 0
 
-    def test_deferred_tag_is_non_blocking(self) -> None:
-        """Issues tagged [DEFERRED] are explicitly non-blocking."""
+    def test_deferred_bead_is_non_blocking(self, tmp_path: Path) -> None:
+        """Issues with bead.deferred=True are non-blocking."""
+        from brimstone.beads import BeadStore, WorkBead
+
+        store = BeadStore(tmp_path)
+        store.write_work_bead(
+            WorkBead(
+                v=1,
+                issue_number=3,
+                title="nice to know",
+                milestone="MVP Research",
+                stage="research",
+                module="none",
+                priority="P3",
+                state="claimed",
+                branch="3-nice-to-know",
+                deferred=True,
+            )
+        )
         config = make_config()
         checkpoint = make_checkpoint()
-        issues = [make_issue(3, body="[DEFERRED] — nice to know but not urgent")]
+        issues = [make_issue(3, body="nice to know but not urgent")]
 
         blocking, non_blocking = _classify_blocking_issues(
-            issues, "owner/repo", "MVP Research", config, checkpoint
+            issues, "owner/repo", "MVP Research", config, checkpoint, store=store
         )
 
         assert len(blocking) == 0
         assert len(non_blocking) == 1
 
-    def test_mixed_tags(self) -> None:
-        """Mix of tagged and untagged issues is classified correctly."""
+    def test_mixed_bead_deferred(self, tmp_path: Path) -> None:
+        """Mix of deferred and non-deferred beads is classified correctly."""
+        from brimstone.beads import BeadStore, WorkBead
+
+        store = BeadStore(tmp_path)
+        store.write_work_bead(
+            WorkBead(
+                v=1,
+                issue_number=4,
+                title="deferred",
+                milestone="MVP Research",
+                stage="research",
+                module="none",
+                priority="P3",
+                state="claimed",
+                branch="4-deferred",
+                deferred=True,
+            )
+        )
         config = make_config()
         checkpoint = make_checkpoint()
         issues = [
-            make_issue(4, body="[DEFERRED] deferred"),
-            make_issue(5, body="[BLOCKS_IMPL] critical"),
-            make_issue(6, body="no tag — blocking by default"),
+            make_issue(4, body="deferred"),
+            make_issue(5, body="critical"),
+            make_issue(6, body="no bead — blocking by default"),
         ]
 
         blocking, non_blocking = _classify_blocking_issues(
-            issues, "owner/repo", "MVP Research", config, checkpoint
+            issues, "owner/repo", "MVP Research", config, checkpoint, store=store
         )
 
         assert len(blocking) == 2
@@ -596,7 +630,9 @@ class TestRunResearchWorkerIssueSelection:
                 return [blocking_issue]
             return []
 
-        def classify_side_effect(open_issues, repo, milestone, config, checkpoint, dry_run=False):
+        def classify_side_effect(
+            open_issues, repo, milestone, config, checkpoint, dry_run=False, store=None
+        ):
             if open_issues:
                 return ([blocking_issue], [])
             return ([], [])
@@ -643,7 +679,9 @@ class TestRunResearchWorkerIssueSelection:
                 return [blocking_issue]
             return []
 
-        def classify_side_effect(open_issues, repo, milestone, config, checkpoint, dry_run=False):
+        def classify_side_effect(
+            open_issues, repo, milestone, config, checkpoint, dry_run=False, store=None
+        ):
             if open_issues:
                 return ([blocking_issue], [])
             return ([], [])
@@ -704,7 +742,9 @@ class TestRunResearchWorkerRateLimit:
 
         classify_calls = {"count": 0}
 
-        def classify_side_effect(open_issues, repo, milestone, config, checkpoint, dry_run=False):
+        def classify_side_effect(
+            open_issues, repo, milestone, config, checkpoint, dry_run=False, store=None
+        ):
             classify_calls["count"] += 1
             if classify_calls["count"] <= 2:
                 return ([blocking_issue], [])
@@ -762,7 +802,9 @@ class TestRunResearchWorkerRateLimit:
 
         classify_calls = {"count": 0}
 
-        def classify_side_effect(open_issues, repo, milestone, config, checkpoint, dry_run=False):
+        def classify_side_effect(
+            open_issues, repo, milestone, config, checkpoint, dry_run=False, store=None
+        ):
             classify_calls["count"] += 1
             if classify_calls["count"] <= 2:
                 return ([blocking_issue], [])
@@ -818,7 +860,9 @@ class TestRunResearchWorkerRateLimit:
 
         classify_calls = {"count": 0}
 
-        def classify_side_effect(open_issues, repo, milestone, config, checkpoint, dry_run=False):
+        def classify_side_effect(
+            open_issues, repo, milestone, config, checkpoint, dry_run=False, store=None
+        ):
             classify_calls["count"] += 1
             if classify_calls["count"] <= 2:
                 return ([blocking_issue], [])
@@ -878,7 +922,9 @@ class TestRunResearchWorkerErrorHandling:
 
         classify_calls = {"count": 0}
 
-        def classify_side_effect(open_issues, repo, milestone, config, checkpoint, dry_run=False):
+        def classify_side_effect(
+            open_issues, repo, milestone, config, checkpoint, dry_run=False, store=None
+        ):
             classify_calls["count"] += 1
             if classify_calls["count"] <= 4:
                 return ([blocking_issue], [])
@@ -933,7 +979,9 @@ class TestRunResearchWorkerErrorHandling:
 
         classify_calls = {"count": 0}
 
-        def classify_side_effect(open_issues, repo, milestone, config, checkpoint, dry_run=False):
+        def classify_side_effect(
+            open_issues, repo, milestone, config, checkpoint, dry_run=False, store=None
+        ):
             classify_calls["count"] += 1
             if classify_calls["count"] <= 2:
                 return ([blocking_issue], [])

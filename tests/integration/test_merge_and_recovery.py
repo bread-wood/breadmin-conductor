@@ -307,7 +307,10 @@ class TestImplWorkerBeadLifecycle:
         with (
             patch("brimstone.cli._get_default_branch_for_repo", return_value="mainline"),
             patch("brimstone.cli._list_open_issues_by_label", side_effect=open_issues),
-            patch("brimstone.cli._filter_unblocked", side_effect=lambda issues, nums: issues),
+            patch(
+                "brimstone.cli._filter_unblocked",
+                side_effect=lambda issues, nums, store=None: issues,
+            ),
             patch("brimstone.cli._sort_issues", side_effect=lambda issues: issues),
             patch("brimstone.cli._extract_module", return_value="cli"),
             patch("brimstone.cli._gh", side_effect=_gh_side_effect),
@@ -363,7 +366,10 @@ class TestImplWorkerBeadLifecycle:
         with (
             patch("brimstone.cli._get_default_branch_for_repo", return_value="mainline"),
             patch("brimstone.cli._list_open_issues_by_label", side_effect=open_issues),
-            patch("brimstone.cli._filter_unblocked", side_effect=lambda issues, nums: issues),
+            patch(
+                "brimstone.cli._filter_unblocked",
+                side_effect=lambda issues, nums, store=None: issues,
+            ),
             patch("brimstone.cli._sort_issues", side_effect=lambda issues: issues),
             patch("brimstone.cli._extract_module", return_value="runner"),
             patch("brimstone.cli._claim_issue", side_effect=spy_claim),

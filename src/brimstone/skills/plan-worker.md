@@ -119,10 +119,19 @@ Specs are intentionally high-level. Do not limit yourself to the spec's "Key Unk
 section — treat it as one input among many. Your job is to reason about every aspect of the
 implementation and ask: *what do we need to know before we can design this?*
 
+**MANDATORY**: Before filing any issues, you must write out your analysis for every
+dimension below — even if the answer is "no genuine unknown here". This ensures you don't
+skip dimensions. Do this in your thinking, then file issues for every dimension that has a
+genuine unknown.
+
+The spec's "Key Unknowns" section is a starting point only. Aim for **4–10 research issues**.
+Stopping at only the spec's Key Unknowns is always wrong — there are always additional
+unknowns across the dimensions below that the spec author didn't enumerate.
+
 #### Decomposition dimensions
 
-Work through every dimension below. For each one, ask whether there is a genuine unknown
-that would affect a design decision. If yes, file a research issue.
+Work through **every** dimension below. For each one, write one sentence on whether there
+is a genuine unknown, then file a research issue if yes.
 
 **Architecture & approach**
 - What architectural patterns are appropriate? Are there established conventions in this
@@ -178,6 +187,10 @@ For each genuine unknown identified above, apply the `[BLOCKS_IMPL]` filter befo
 > **File an issue only if** not knowing the answer would cause a design-level rework of
 > an implementation task. Skip questions answerable in seconds or that only affect
 > fine-grained implementation details.
+
+**Minimum**: if your analysis produces fewer than 4 research issues, re-examine each
+dimension — you almost certainly missed unknowns in architecture, project tooling, testing
+strategy, or error handling conventions.
 
 **Assign a priority label** to each issue before filing:
 

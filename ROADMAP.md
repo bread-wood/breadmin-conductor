@@ -40,8 +40,11 @@ Success criteria:
 
 ## v0.2.0 — Hardened Core [PLANNED — first self-hosted milestone]
 
-Credential proxy, GHA deployment on issue events, improved crash recovery.
+Credential proxy, GHA deployment on issue events, improved crash recovery, bead visualizer.
 Developed using brimstone on bread-wood/brimstone itself.
+
+- Bead visualizer: `brimstone beads` renders a live terminal view of WorkBead/PRBead state
+  across all issues in the current campaign (campaign progress, per-issue state, PR CI status)
 
 ## v0.3.0 — Multi-Model [PLANNED]
 

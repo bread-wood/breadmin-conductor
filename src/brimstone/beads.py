@@ -75,6 +75,8 @@ class WorkBead:
     branch: str
     pr_id: str | None = None  # "pr-187", links to PRBead file
     retry_count: int = 0
+    blocked_by: list[int] = field(default_factory=list)  # issue numbers that must close first
+    deferred: bool = False  # non-blocking for stage-gate; set at claim time from [DEFERRED] tag
     claimed_at: str | None = None  # ISO UTC
     closed_at: str | None = None
 
@@ -357,6 +359,8 @@ def _load_work_bead(path: Path) -> WorkBead:
         branch=data.get("branch", ""),
         pr_id=data.get("pr_id"),
         retry_count=data.get("retry_count", 0),
+        blocked_by=data.get("blocked_by", []),
+        deferred=data.get("deferred", False),
         claimed_at=data.get("claimed_at"),
         closed_at=data.get("closed_at"),
     )
