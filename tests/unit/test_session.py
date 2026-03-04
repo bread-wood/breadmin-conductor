@@ -14,13 +14,10 @@ from brimstone.session import (
     Checkpoint,  # noqa: F401
     CheckpointCorruptError,
     CheckpointVersionError,
-    classify_orphaned_issue,
     clear_backoff,
-    is_agent_hung,
     is_backing_off,
     load,
     new,
-    record_dispatch,
     save,
     set_backoff,
 )
@@ -80,12 +77,8 @@ class TestNew:
 
     def test_mutable_defaults_are_empty(self) -> None:
         c = new("owner/repo", "main", "MVP Impl", "impl")
-        assert c.claimed_issues == {}
+        # Legacy fields still present until cli.py migrates to BeadStore (PR 7a)
         assert c.active_worktrees == []
-        assert c.open_prs == {}
-        assert c.completed_prs == []
-        assert c.retry_counts == {}
-        assert c.dispatch_times == {}
 
     def test_optional_fields_are_none(self) -> None:
         c = new("owner/repo", "main", "MVP Impl", "impl")
@@ -96,8 +89,8 @@ class TestNew:
         """Two Checkpoint instances must not share mutable containers."""
         c1 = new("owner/repo", "main", "A", "impl")
         c2 = new("owner/repo", "main", "B", "impl")
-        c1.claimed_issues["1"] = "1-branch"
-        assert "1" not in c2.claimed_issues
+        c1.active_worktrees.append("branch-1")
+        assert "branch-1" not in c2.active_worktrees
 
 
 # ---------------------------------------------------------------------------
@@ -118,24 +111,14 @@ class TestSaveLoadRoundTrip:
         assert loaded.milestone == cp.milestone
         assert loaded.stage == cp.stage
         assert loaded.schema_version == cp.schema_version
-        assert loaded.claimed_issues == cp.claimed_issues
         assert loaded.active_worktrees == cp.active_worktrees
-        assert loaded.open_prs == cp.open_prs
-        assert loaded.completed_prs == cp.completed_prs
-        assert loaded.retry_counts == cp.retry_counts
-        assert loaded.dispatch_times == cp.dispatch_times
         assert loaded.rate_limit_backoff_until == cp.rate_limit_backoff_until
         assert loaded.last_error == cp.last_error
 
     def test_round_trip_preserves_populated_fields(
         self, cp: Checkpoint, checkpoint_path: Path
     ) -> None:
-        cp.claimed_issues = {"7": "7-my-branch", "12": "12-other-branch"}
         cp.active_worktrees = ["12-other-branch"]
-        cp.open_prs = {"12-other-branch": 55}
-        cp.completed_prs = [42]
-        cp.retry_counts = {"12": 1}
-        cp.dispatch_times = {"12-other-branch": "2026-03-02T15:00:00+00:00"}
         cp.last_error = {
             "code": 1,
             "subtype": "error_during_execution",
@@ -147,12 +130,7 @@ class TestSaveLoadRoundTrip:
         loaded = load(checkpoint_path)
 
         assert loaded is not None
-        assert loaded.claimed_issues == {"7": "7-my-branch", "12": "12-other-branch"}
         assert loaded.active_worktrees == ["12-other-branch"]
-        assert loaded.open_prs == {"12-other-branch": 55}
-        assert loaded.completed_prs == [42]
-        assert loaded.retry_counts == {"12": 1}
-        assert loaded.dispatch_times == {"12-other-branch": "2026-03-02T15:00:00+00:00"}
         assert loaded.last_error is not None
         assert loaded.last_error["subtype"] == "error_during_execution"
 
@@ -211,7 +189,7 @@ class TestLoadCorruptJson:
 
 
 # ---------------------------------------------------------------------------
-# load() — version checks
+# load() — version checks and migrations
 # ---------------------------------------------------------------------------
 
 
@@ -223,10 +201,9 @@ class TestLoadVersionChecks:
         with pytest.raises(CheckpointVersionError):
             load(future_file)
 
-    def test_forward_migration_adds_dispatch_times(self, tmp_path: Path) -> None:
-        """A v0 file (no dispatch_times key) should be migrated successfully."""
+    def test_v0_to_v2_migration(self, tmp_path: Path) -> None:
+        """A v0 checkpoint (no dispatch_times) migrates to v2 cleanly."""
         v0_file = tmp_path / "v0.checkpoint.json"
-        # Construct a minimal valid payload without dispatch_times, schema_version=0
         data = {
             "schema_version": 0,
             "run_id": "abc-123",
@@ -243,13 +220,41 @@ class TestLoadVersionChecks:
             "rate_limit_backoff_until": None,
             "retry_counts": {},
             "last_error": None,
-            # dispatch_times intentionally absent
+            # dispatch_times intentionally absent (v0 → v1 adds it)
         }
         v0_file.write_text(json.dumps(data), encoding="utf-8")
         result = load(v0_file)
         assert result is not None
         assert result.dispatch_times == {}
         assert result.schema_version == SCHEMA_VERSION
+
+    def test_v1_to_v2_migration(self, tmp_path: Path) -> None:
+        """A v1 checkpoint migrates to v2 without data loss."""
+        v1_file = tmp_path / "v1.checkpoint.json"
+        data = {
+            "schema_version": 1,
+            "run_id": "xyz-456",
+            "session_id": "",
+            "repo": "o/r",
+            "default_branch": "main",
+            "milestone": "M",
+            "stage": "impl",
+            "timestamp": "2026-03-03T00:00:00+00:00",
+            "claimed_issues": {"7": "7-branch"},
+            "active_worktrees": ["7-branch"],
+            "open_prs": {"7-branch": 55},
+            "completed_prs": [55],
+            "rate_limit_backoff_until": None,
+            "retry_counts": {"7": 1},
+            "last_error": None,
+            "dispatch_times": {"7": "2026-03-03T01:00:00+00:00"},
+        }
+        v1_file.write_text(json.dumps(data), encoding="utf-8")
+        result = load(v1_file)
+        assert result is not None
+        assert result.schema_version == SCHEMA_VERSION
+        # All legacy fields preserved (still on Checkpoint for backward-compat)
+        assert result.active_worktrees == ["7-branch"]
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +263,12 @@ class TestLoadVersionChecks:
 
 
 class TestAtomicWrite:
+    def test_save_uses_tmp_then_replaces(self, cp: Checkpoint, checkpoint_path: Path) -> None:
+        """After save(), the .tmp file should not remain on disk."""
+        save(cp, checkpoint_path)
+        tmp_path = checkpoint_path.with_suffix(".tmp")
+        assert not tmp_path.exists()
+
     def test_corrupted_tmp_does_not_affect_existing_checkpoint(
         self, cp: Checkpoint, checkpoint_path: Path
     ) -> None:
@@ -270,18 +281,12 @@ class TestAtomicWrite:
         tmp_path.write_text("CORRUPT DATA", encoding="utf-8")
 
         # A new save should overwrite the .tmp and produce a valid checkpoint
-        cp.claimed_issues["99"] = "99-new-branch"
+        cp.active_worktrees.append("99-new-branch")
         save(cp, checkpoint_path)
 
         loaded = load(checkpoint_path)
         assert loaded is not None
-        assert "99" in loaded.claimed_issues
-
-    def test_save_uses_tmp_then_replaces(self, cp: Checkpoint, checkpoint_path: Path) -> None:
-        """After save(), the .tmp file should not remain on disk."""
-        save(cp, checkpoint_path)
-        tmp_path = checkpoint_path.with_suffix(".tmp")
-        assert not tmp_path.exists()
+        assert "99-new-branch" in loaded.active_worktrees
 
 
 # ---------------------------------------------------------------------------
@@ -359,112 +364,28 @@ class TestIsBackingOff:
 
 
 # ---------------------------------------------------------------------------
-# record_dispatch() and is_agent_hung()
+# Verify removed functions are gone
 # ---------------------------------------------------------------------------
 
 
-class TestHangDetection:
-    def test_not_hung_when_no_dispatch_time(self, cp: Checkpoint) -> None:
-        assert is_agent_hung(cp, "42", timeout_minutes=60.0) is False
+class TestRemovedFunctions:
+    def test_record_dispatch_removed(self) -> None:
+        import brimstone.session as sess
 
-    def test_not_hung_before_timeout(self, cp: Checkpoint) -> None:
-        cp.dispatch_times["42"] = datetime.now(UTC).isoformat()
-        # 60-minute timeout; dispatched just now — not hung
-        assert is_agent_hung(cp, "42", timeout_minutes=60.0) is False
-
-    def test_hung_after_timeout(self, cp: Checkpoint) -> None:
-        # Dispatched 2 hours ago
-        two_hours_ago = datetime.now(UTC) - timedelta(hours=2)
-        cp.dispatch_times["42"] = two_hours_ago.isoformat()
-        assert is_agent_hung(cp, "42", timeout_minutes=60.0) is True
-
-    def test_record_dispatch_stamps_current_time(self, cp: Checkpoint) -> None:
-        before = datetime.now(UTC)
-        record_dispatch(cp, "7")
-        after = datetime.now(UTC)
-
-        assert "7" in cp.dispatch_times
-        stamped = datetime.fromisoformat(cp.dispatch_times["7"])
-        assert before <= stamped <= after
-
-    def test_record_dispatch_overwrites_existing(self, cp: Checkpoint) -> None:
-        old = (datetime.now(UTC) - timedelta(hours=5)).isoformat()
-        cp.dispatch_times["7"] = old
-        record_dispatch(cp, "7")
-        assert cp.dispatch_times["7"] != old
-
-    def test_not_hung_just_before_timeout(self, cp: Checkpoint) -> None:
-        # Dispatched 59 minutes and 59 seconds ago — comfortably under the 60-minute timeout
-        just_under = datetime.now(UTC) - timedelta(minutes=59, seconds=59)
-        cp.dispatch_times["42"] = just_under.isoformat()
-        assert is_agent_hung(cp, "42", timeout_minutes=60.0) is False
-
-
-# ---------------------------------------------------------------------------
-# classify_orphaned_issue() — all 5 scenarios
-# ---------------------------------------------------------------------------
-
-
-class TestClassifyOrphanedIssue:
-    def _make_cp(self) -> Checkpoint:
-        cp = new("owner/repo", "main", "MVP Impl", "impl")
-        cp.claimed_issues["42"] = "42-my-feature"
-        return cp
-
-    def test_monitor_when_pr_open(self) -> None:
-        cp = self._make_cp()
-        cp.open_prs["42-my-feature"] = 100
-        result = classify_orphaned_issue(
-            "42", cp, has_pr=True, has_commits=True, worktree_exists=True
+        assert not hasattr(sess, "record_dispatch"), (
+            "record_dispatch() was removed in v2 — use BeadStore.write_work_bead() instead"
         )
-        assert result == "monitor"
 
-    def test_abandoned_when_no_pr_but_commits(self) -> None:
-        cp = self._make_cp()
-        cp.active_worktrees.append("42-my-feature")
-        result = classify_orphaned_issue(
-            "42", cp, has_pr=False, has_commits=True, worktree_exists=True
-        )
-        assert result == "abandoned"
+    def test_is_agent_hung_removed(self) -> None:
+        import brimstone.session as sess
 
-    def test_auto_clean_when_no_pr_no_commits_worktree_exists(self) -> None:
-        cp = self._make_cp()
-        cp.active_worktrees.append("42-my-feature")
-        result = classify_orphaned_issue(
-            "42", cp, has_pr=False, has_commits=False, worktree_exists=True
+        assert not hasattr(sess, "is_agent_hung"), (
+            "is_agent_hung() was removed in v2 — use WorkBead.claimed_at + Deacon instead"
         )
-        assert result == "auto_clean"
 
-    def test_stale_label_when_no_pr_no_worktree(self) -> None:
-        cp = self._make_cp()
-        result = classify_orphaned_issue(
-            "42", cp, has_pr=False, has_commits=False, worktree_exists=False
-        )
-        assert result == "stale_label"
+    def test_classify_orphaned_issue_removed(self) -> None:
+        import brimstone.session as sess
 
-    def test_clean_worktree_when_pr_merged_and_worktree_exists(self) -> None:
-        cp = self._make_cp()
-        # PR was open, then merged — pr number in both open_prs and completed_prs
-        cp.open_prs["42-my-feature"] = 100
-        cp.completed_prs.append(100)
-        cp.active_worktrees.append("42-my-feature")
-        result = classify_orphaned_issue(
-            "42", cp, has_pr=False, has_commits=False, worktree_exists=True
+        assert not hasattr(sess, "classify_orphaned_issue"), (
+            "classify_orphaned_issue() was removed in v2 — Deacon reads bead states instead"
         )
-        assert result == "clean_worktree"
-
-    def test_monitor_takes_priority_over_commits(self) -> None:
-        """has_pr=True means open PR — should be 'monitor' regardless of commit state."""
-        cp = self._make_cp()
-        cp.open_prs["42-my-feature"] = 100
-        result = classify_orphaned_issue(
-            "42", cp, has_pr=True, has_commits=True, worktree_exists=True
-        )
-        assert result == "monitor"
-
-    def test_stale_label_no_worktree_no_commits(self) -> None:
-        cp = self._make_cp()
-        result = classify_orphaned_issue(
-            "42", cp, has_pr=False, has_commits=False, worktree_exists=False
-        )
-        assert result == "stale_label"

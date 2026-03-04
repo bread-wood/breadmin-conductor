@@ -611,7 +611,6 @@ class TestRunResearchWorkerIssueSelection:
             patch("brimstone.cli._run_completion_gate"),
             patch("brimstone.cli.build_subprocess_env", return_value={}),
             patch("brimstone.cli.logger.log_conductor_event"),
-            patch("brimstone.cli.session.record_dispatch"),
             patch("brimstone.cli.session.save"),
         ):
             _run_research_worker(
@@ -660,7 +659,6 @@ class TestRunResearchWorkerIssueSelection:
             patch("brimstone.cli._run_completion_gate"),
             patch("brimstone.cli.build_subprocess_env", return_value={}),
             patch("brimstone.cli.logger.log_conductor_event"),
-            patch("brimstone.cli.session.record_dispatch"),
             patch("brimstone.cli.session.save"),
         ):
             _run_research_worker(
@@ -720,7 +718,6 @@ class TestRunResearchWorkerRateLimit:
             patch("brimstone.cli._run_completion_gate"),
             patch("brimstone.cli.build_subprocess_env", return_value={}),
             patch("brimstone.cli.logger.log_conductor_event"),
-            patch("brimstone.cli.session.record_dispatch"),
             patch("brimstone.cli.session.save"),
             patch("brimstone.cli.time.sleep"),  # skip actual sleep
         ):
@@ -778,7 +775,6 @@ class TestRunResearchWorkerRateLimit:
             patch("brimstone.cli._run_completion_gate"),
             patch("brimstone.cli.build_subprocess_env", return_value={}),
             patch("brimstone.cli.logger.log_conductor_event"),
-            patch("brimstone.cli.session.record_dispatch"),
             patch("brimstone.cli.session.save"),
             patch("brimstone.cli.time.sleep"),
             patch.object(UsageGovernor, "record_429") as mock_429,
@@ -835,7 +831,6 @@ class TestRunResearchWorkerRateLimit:
             patch("brimstone.cli._run_completion_gate"),
             patch("brimstone.cli.build_subprocess_env", return_value={}),
             patch("brimstone.cli.logger.log_conductor_event"),
-            patch("brimstone.cli.session.record_dispatch"),
             patch("brimstone.cli.session.save"),
             patch("brimstone.cli.time.sleep"),
         ):
@@ -901,7 +896,6 @@ class TestRunResearchWorkerErrorHandling:
             patch("brimstone.cli._run_completion_gate"),
             patch("brimstone.cli.build_subprocess_env", return_value={}),
             patch("brimstone.cli.logger.log_conductor_event", side_effect=capture_event),
-            patch("brimstone.cli.session.record_dispatch"),
             patch("brimstone.cli.session.save"),
         ):
             _run_research_worker(
@@ -950,7 +944,6 @@ class TestRunResearchWorkerErrorHandling:
             patch("brimstone.cli._run_completion_gate"),
             patch("brimstone.cli.build_subprocess_env", return_value={}),
             patch("brimstone.cli.logger.log_conductor_event"),
-            patch("brimstone.cli.session.record_dispatch"),
             patch("brimstone.cli.session.save"),
         ):
             _run_research_worker(

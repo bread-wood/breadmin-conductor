@@ -32,13 +32,13 @@ from brimstone.cli import (
     _find_pr_for_issue,
     _get_pr_checks_status,
     _get_review_status,
+    _handle_pr_review_feedback,
     _list_open_issues_by_label,
     _monitor_pr,
     _rebase_branch,
     _resume_stale_issues,
     _run_impl_worker,
     _slugify,
-    _triage_review_comments,
 )
 from brimstone.config import Config
 from brimstone.runner import RunResult
@@ -523,25 +523,56 @@ class TestFindPrForIssue:
 
 
 # ---------------------------------------------------------------------------
-# _triage_review_comments — fix agent dispatch
+# _handle_pr_review_feedback — comprehensive review handler
 # ---------------------------------------------------------------------------
 
 
-class TestTriageReviewComments:
-    def test_dispatches_fix_agent_when_comments_exist(self) -> None:
-        comments = [
-            {"path": "src/foo.py", "line": 10, "body": "Please fix this."},
-        ]
+class TestHandlePrReviewFeedback:
+    def _make_gh_side_effect(self, reviews, inline, thread):
+        """Return a side_effect callable that returns different payloads per call."""
+        calls = iter(
+            [
+                make_gh_result(stdout=json.dumps({"reviews": reviews})),  # pr view --json reviews
+                make_gh_result(stdout=json.dumps(inline)),  # api pulls/comments
+                make_gh_result(stdout=json.dumps({"comments": thread})),  # pr view --json comments
+            ]
+        )
 
+        def _side_effect(*args, **kwargs):
+            try:
+                return next(calls)
+            except StopIteration:
+                return make_gh_result(stdout="{}")
+
+        return _side_effect
+
+    def test_dispatches_fix_agent_when_changes_requested(self) -> None:
+        reviews = [
+            {
+                "author": {"login": "claude[bot]"},
+                "state": "CHANGES_REQUESTED",
+                "body": "Please rename this variable.",
+            }
+        ]
+        inline = [
+            {
+                "user": {"login": "claude[bot]"},
+                "path": "src/foo.py",
+                "line": 10,
+                "body": "Rename x to config.",
+            }
+        ]
+        thread = []
+
+        gh_side_effect = self._make_gh_side_effect(reviews, inline, thread)
         with (
-            patch("brimstone.cli._gh") as mock_gh,
+            patch("brimstone.cli._gh", side_effect=gh_side_effect),
             patch("brimstone.cli.runner.run") as mock_run,
             patch("brimstone.cli.build_subprocess_env", return_value={}),
+            patch("brimstone.cli._dismiss_stale_change_requests"),
         ):
-            mock_gh.return_value = make_gh_result(stdout=json.dumps(comments))
             mock_run.return_value = make_run_result()
-
-            _triage_review_comments(
+            result = _handle_pr_review_feedback(
                 pr_number=99,
                 branch="42-add-config",
                 repo="owner/repo",
@@ -550,19 +581,24 @@ class TestTriageReviewComments:
                 issue_number=42,
             )
 
+        assert result == "fixed"
         mock_run.assert_called_once()
         prompt = mock_run.call_args[1]["prompt"]
         assert "PR #99" in prompt
         assert "42-add-config" in prompt
-        assert "src/foo.py" in prompt
+        assert "rename" in prompt.lower()
 
-    def test_does_nothing_when_no_comments(self) -> None:
+    def test_returns_no_feedback_when_nothing_actionable(self) -> None:
+        reviews = [{"author": {"login": "claude[bot]"}, "state": "APPROVED", "body": ""}]
+        inline = []
+        thread = []
+
+        gh_side_effect2 = self._make_gh_side_effect(reviews, inline, thread)
         with (
-            patch("brimstone.cli._gh") as mock_gh,
+            patch("brimstone.cli._gh", side_effect=gh_side_effect2),
             patch("brimstone.cli.runner.run") as mock_run,
         ):
-            mock_gh.return_value = make_gh_result(stdout="[]")
-            _triage_review_comments(
+            result = _handle_pr_review_feedback(
                 pr_number=99,
                 branch="42-add-config",
                 repo="owner/repo",
@@ -570,6 +606,8 @@ class TestTriageReviewComments:
                 checkpoint=make_checkpoint(),
                 issue_number=42,
             )
+
+        assert result == "no_feedback"
         mock_run.assert_not_called()
 
 
@@ -797,6 +835,7 @@ class TestRunImplWorkerCompletionGate:
 
         with (
             patch("brimstone.cli._list_open_issues_by_label", return_value=[]),
+            patch("brimstone.cli._count_all_issues_by_label", return_value=3),
             patch("brimstone.cli._gh") as mock_gh,
             patch("brimstone.cli.logger.log_conductor_event") as mock_log_event,
             patch("brimstone.cli.session.save"),
@@ -865,6 +904,7 @@ class TestRunImplWorkerClaiming:
 
         with (
             patch("brimstone.cli._list_open_issues_by_label", side_effect=[issues, issues, [], []]),
+            patch("brimstone.cli._count_all_issues_by_label", return_value=1),
             patch("brimstone.cli._claim_issue") as mock_claim,
             patch("brimstone.cli._create_worktree", return_value="/tmp/wt"),
             patch("brimstone.cli._dispatch_impl_agent") as mock_dispatch,
@@ -874,7 +914,6 @@ class TestRunImplWorkerClaiming:
             patch("brimstone.cli._gh") as mock_gh,
             patch("brimstone.cli.logger.log_conductor_event"),
             patch("brimstone.cli.session.save"),
-            patch("brimstone.cli.session.record_dispatch"),
             patch("brimstone.cli.click.echo"),
         ):
             mock_gh.return_value = make_gh_result(returncode=0)
@@ -912,7 +951,6 @@ class TestRunImplWorkerClaiming:
             patch("brimstone.cli._gh") as mock_gh,
             patch("brimstone.cli.logger.log_conductor_event"),
             patch("brimstone.cli.session.save"),
-            patch("brimstone.cli.session.record_dispatch"),
             patch("brimstone.cli.click.echo"),
         ):
             mock_gh.return_value = make_gh_result(returncode=0)
@@ -948,6 +986,7 @@ class TestRunImplWorkerRateLimitHandling:
 
         with (
             patch("brimstone.cli._list_open_issues_by_label", side_effect=[issues, issues, [], []]),
+            patch("brimstone.cli._count_all_issues_by_label", return_value=1),
             patch("brimstone.cli._claim_issue"),
             patch("brimstone.cli._unclaim_issue") as mock_unclaim,
             patch("brimstone.cli._create_worktree", return_value="/tmp/wt"),
@@ -956,7 +995,6 @@ class TestRunImplWorkerRateLimitHandling:
             patch("brimstone.cli._gh") as mock_gh,
             patch("brimstone.cli.logger.log_conductor_event"),
             patch("brimstone.cli.session.save"),
-            patch("brimstone.cli.session.record_dispatch"),
             patch("brimstone.cli.click.echo"),
         ):
             mock_gh.return_value = make_gh_result(returncode=0)

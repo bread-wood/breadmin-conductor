@@ -212,6 +212,7 @@ def _run_agent(
     prefix: str,
     config: Config,
     issue_number: int | None = None,
+    model: str | None = None,
 ) -> runner.RunResult:
     """Run a single headless agent and log its transcript.
 
@@ -231,15 +232,22 @@ def _run_agent(
     config_dir = f"/tmp/brimstone-agent-{key}-{uuid.uuid4().hex}"
     extra: dict[str, str] = {"CLAUDE_CONFIG_DIR": config_dir}
     env = build_subprocess_env(config, extra=extra if extra else None)
+    silent_header = (
+        "SILENT MODE: You are running in a fully automated headless pipeline. "
+        "Minimize text output. Use tools directly. "
+        "Do NOT narrate, explain, summarize, or produce any text between tool calls "
+        "unless the task explicitly requires written output (e.g. a document or issue body). "
+        "Every word you output costs money.\n\n"
+    )
     try:
         result = runner.run(
-            prompt=prompt,
+            prompt=silent_header + prompt,
             allowed_tools=allowed_tools,
             append_system_prompt_file=skill_tmp,
             env=env,
             max_turns=max_turns,
             timeout_seconds=config.agent_timeout_minutes * 60,
-            model=config.model,
+            model=model or config.model,
             prefix=prefix,
             disallowed_tools=runner.TOOLS_DISALLOWED,
             max_budget_usd=config.max_budget_usd,
@@ -628,6 +636,107 @@ def _list_in_progress_issues(repo: str, milestone: str, label: str) -> list[dict
         return []
 
 
+def _resume_open_prs(
+    repo: str,
+    milestone: str,
+    label: str,
+    log_prefix: str,
+    config: Config,
+    checkpoint: Checkpoint,
+    default_branch: str = "main",
+    repo_root: str = "",
+    already_handled: set[int] | None = None,
+) -> None:
+    """Monitor any open PRs for the milestone whose issue is not already in-progress.
+
+    Complements ``_resume_stale_issues``: that function finds issues by their
+    ``in-progress`` label; this function finds open PRs directly and monitors
+    any that were missed (e.g. the in-progress label was stripped, or the
+    issue was closed but the PR is still open/conflicting).
+
+    ``already_handled`` is a set of issue numbers already handled by
+    ``_resume_stale_issues`` so we don't double-monitor.
+    """
+    if already_handled is None:
+        already_handled = set()
+
+    # Fetch all open PRs for the repo
+    result = _gh(
+        ["pr", "list", "--state", "open", "--json", "number,headRefName", "--limit", "100"],
+        repo=repo,
+        check=False,
+    )
+    if result.returncode != 0:
+        return
+    try:
+        open_prs: list[dict] = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return
+
+    # Fetch all impl issues for the milestone (open + closed) to build a number set
+    issues_result = _gh(
+        [
+            "issue",
+            "list",
+            "--state",
+            "all",
+            "--label",
+            label,
+            "--milestone",
+            milestone,
+            "--json",
+            "number",
+            "--limit",
+            "200",
+        ],
+        repo=repo,
+        check=False,
+    )
+    try:
+        milestone_issue_numbers: set[int] = {
+            i["number"] for i in json.loads(issues_result.stdout or "[]")
+        }
+    except (json.JSONDecodeError, KeyError):
+        milestone_issue_numbers = set()
+
+    for pr in open_prs:
+        branch: str = pr.get("headRefName") or ""
+        pr_number: int = int(pr["number"])
+        # Branch must start with "<issue_number>-"
+        dash = branch.find("-")
+        if dash <= 0:
+            continue
+        try:
+            issue_number = int(branch[:dash])
+        except ValueError:
+            continue
+        if issue_number not in milestone_issue_numbers:
+            continue
+        if issue_number in already_handled:
+            continue
+        click.echo(
+            f"{log_prefix} Resuming untracked open PR #{pr_number} for issue #{issue_number}",
+            err=True,
+        )
+        wt_path = ""
+        if repo_root:
+            wt_path = _checkout_existing_branch_worktree(branch, repo_root) or ""
+        try:
+            _monitor_pr(
+                pr_number=pr_number,
+                branch=branch,
+                repo=repo,
+                config=config,
+                checkpoint=checkpoint,
+                issue_number=issue_number,
+                worktree_path=wt_path,
+                default_branch=default_branch,
+            )
+        finally:
+            if wt_path:
+                _remove_worktree(wt_path, repo_root)
+
+
 def _resume_stale_issues(
     repo: str,
     milestone: str,
@@ -637,7 +746,7 @@ def _resume_stale_issues(
     checkpoint: Checkpoint,
     default_branch: str = "main",
     repo_root: str = "",
-) -> None:
+) -> set[int]:
     """Resume or unclaim in-progress issues from a crashed previous session.
 
     For each in-progress issue in *milestone* with *label*:
@@ -648,8 +757,12 @@ def _resume_stale_issues(
     When *repo_root* is provided, a temporary worktree is created for the
     stale branch so that conflict detection and rebase work correctly.
 
+    Returns the set of issue numbers handled, for use by ``_resume_open_prs``
+    to avoid double-monitoring.
+
     Called at the start of research-worker, design-worker, and impl-worker.
     """
+    handled: set[int] = set()
     for stale in _list_in_progress_issues(repo, milestone, label):
         stale_number: int = stale["number"]
         found = _find_pr_for_issue(repo, stale_number)
@@ -676,18 +789,22 @@ def _resume_stale_issues(
             finally:
                 if wt_path:
                     _remove_worktree(wt_path, repo_root)
+            handled.add(stale_number)
         elif _pr_merged_for_issue(repo, stale_number):
             _gh(["issue", "close", str(stale_number)], repo=repo, check=False)
             click.echo(
                 f"{log_prefix} Closed #{stale_number} — merged PR found, issue was not auto-closed",
                 err=True,
             )
+            handled.add(stale_number)
         else:
             _unclaim_issue(repo, stale_number)
             click.echo(
                 f"{log_prefix} Unclaimed stale #{stale_number} (no open or merged PR found)",
                 err=True,
             )
+            handled.add(stale_number)
+    return handled
 
 
 def _log_agent_cost(
@@ -697,6 +814,8 @@ def _log_agent_cost(
     config: Config,
     checkpoint: Checkpoint,
     issue_number: int | None = None,
+    milestone: str | None = None,
+    model: str | None = None,
 ) -> None:
     """Log agent cost to the cost ledger."""
     logger.log_cost(
@@ -707,9 +826,10 @@ def _log_agent_cost(
             repo=repo,
             stage=stage,
             issue_number=issue_number,
+            milestone=milestone,
         ),
         log_dir=config.log_dir.expanduser(),
-        model=config.model,
+        model=model or config.model,
         auth_mode=_auth_mode(config),
     )
 
@@ -1105,6 +1225,38 @@ def _unclaim_issue(repo: str, issue_number: int) -> None:
     _gh(args, repo=repo, check=False)
 
 
+def _exhaust_issue(repo: str, issue_number: int, reason: str) -> None:
+    """Mark an issue as permanently exhausted after all retries are spent.
+
+    Unclaims the issue, adds the ``bug`` label, leaves a comment with the
+    failure reason, and closes it.  The issue can be reopened manually to
+    retry on the next brimstone run.
+
+    Args:
+        repo:         Repository in ``owner/repo`` format.
+        issue_number: GitHub issue number.
+        reason:       Short failure description (e.g. subtype string).
+    """
+    _gh(
+        [
+            "issue",
+            "comment",
+            str(issue_number),
+            "--body",
+            (
+                f"brimstone: agent exhausted all {MAX_RETRIES} retries without success.\n"
+                f"Failure reason: `{reason}`\n\n"
+                "Manual investigation required. Reopen this issue to retry on the next run."
+            ),
+        ],
+        repo=repo,
+        check=False,
+    )
+    _unclaim_issue(repo=repo, issue_number=issue_number)
+    _gh(["issue", "edit", str(issue_number), "--add-label", "bug"], repo=repo, check=False)
+    _gh(["issue", "close", str(issue_number)], repo=repo, check=False)
+
+
 def _delete_remote_branch(repo: str, branch: str) -> None:
     """Delete a remote branch ref via the GitHub API.
 
@@ -1188,35 +1340,6 @@ def _classify_blocking_issues(
 # ---------------------------------------------------------------------------
 # Research worker implementation
 # ---------------------------------------------------------------------------
-
-
-def _find_pr_for_issue(repo: str, issue_number: int) -> tuple[int, str] | None:
-    """Find an open PR for an issue by scanning branches named ``<issue_number>-*``.
-
-    Returns ``(pr_number, branch_name)`` if a matching open PR exists, else ``None``.
-    """
-    branch_result = _gh(
-        [
-            "api",
-            f"repos/{repo}/git/refs/heads",
-            "--jq",
-            (
-                f'[.[] | select(.ref | startswith("refs/heads/{issue_number}-"))'
-                f' | .ref | ltrimstr("refs/heads/")]'
-            ),
-        ],
-        check=False,
-    )
-    try:
-        branches: list[str] = json.loads(branch_result.stdout or "[]")
-    except json.JSONDecodeError:
-        branches = []
-
-    for branch in branches:
-        pr_number = _find_pr_for_branch(repo, branch)
-        if pr_number is not None:
-            return (pr_number, branch)
-    return None
 
 
 def _strip_research_prefix(title: str) -> str:
@@ -1324,6 +1447,7 @@ def _dispatch_research_agent(
         f"[research #{issue_number}] ",
         config,
         issue_number,
+        model=config.model,
     )
     return issue, branch_name, worktree_path, result
 
@@ -1334,6 +1458,8 @@ def _run_persistent_pool(
     gov: UsageGovernor | None = None,
     repo: str,
     repo_root: str,
+    milestone: str,
+    model: str | None = None,
     config: Config,
     checkpoint: Checkpoint,
     stage: str,
@@ -1435,7 +1561,16 @@ def _run_persistent_pool(
                 gov.record_result(result)
             session.save(checkpoint, checkpoint_path)
 
-            _log_agent_cost(result, repo, stage, config, checkpoint, issue_number=issue_number)
+            _log_agent_cost(
+                result,
+                repo,
+                stage,
+                config,
+                checkpoint,
+                issue_number=issue_number,
+                milestone=milestone,
+                model=model,
+            )
 
             logger.log_conductor_event(
                 run_id=checkpoint.run_id,
@@ -1446,6 +1581,8 @@ def _run_persistent_pool(
                     "subtype": result.subtype,
                     "is_error": result.is_error,
                     "error_code": result.error_code,
+                    "exit_code": result.exit_code,
+                    "stderr": result.stderr[:500] if result.stderr else "",
                 },
                 log_dir=config.log_dir.expanduser(),
             )
@@ -1477,22 +1614,31 @@ def _run_persistent_pool(
             if result.is_error:
                 current_retries = retry_counts.get(issue_number, 0) + 1
                 retry_counts[issue_number] = current_retries
-                _unclaim_issue(repo=repo, issue_number=issue_number)
                 _delete_remote_branch(repo, _branch)
                 if current_retries >= MAX_RETRIES:
+                    reason = result.subtype or "unknown_error"
+                    _exhaust_issue(repo, issue_number, reason)
+                    click.echo(
+                        f"[{stage}] #{issue_number} exhausted {MAX_RETRIES} retries "
+                        f"({reason}) — closed with 'bug' label. Reopen to retry.",
+                        err=True,
+                    )
                     logger.log_conductor_event(
                         run_id=checkpoint.run_id,
                         phase="dispatch",
                         event_type="human_escalate",
                         payload={
                             "issue_number": issue_number,
-                            "reason": result.subtype or "unknown_error",
+                            "reason": reason,
                             "error_code": result.error_code,
                             "retry_count": current_retries,
+                            "stderr": result.stderr[:500] if result.stderr else "",
                             "action_required": "manual investigation",
                         },
                         log_dir=config.log_dir.expanduser(),
                     )
+                else:
+                    _unclaim_issue(repo=repo, issue_number=issue_number)
                 _remove_worktree(_worktree_path, repo_root)
                 session.save(checkpoint, checkpoint_path)
                 continue
@@ -1620,7 +1766,6 @@ def _run_research_worker(
                 slug = _slugify(issue.get("title", "")[:40])
                 branch_name = f"{issue_number}-{slug}"
                 _claim_issue(repo=repo, issue_number=issue_number)
-                session.record_dispatch(checkpoint, str(issue_number))
                 session.save(checkpoint, checkpoint_path)
                 worktree_path = _create_worktree(branch_name, repo_root, default_branch)
                 if worktree_path is None:
@@ -1669,6 +1814,7 @@ def _run_research_worker(
                     config=config,
                     checkpoint=checkpoint,
                     issue_number=issue_number,
+                    worktree_path=worktree_path,
                     default_branch=default_branch,
                 )
             else:
@@ -1715,6 +1861,8 @@ def _run_research_worker(
             gov=gov,
             repo=repo,
             repo_root=repo_root,
+            milestone=milestone,
+            model=config.model,
             config=config,
             checkpoint=checkpoint,
             stage="research",
@@ -2347,6 +2495,10 @@ def _monitor_pr(
     checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
     rebase_attempts = 0
     ci_fail_count = 0
+    ci_fix_attempts = 0
+    review_fix_attempts = 0
+    _MAX_CI_FIX_ATTEMPTS = 2
+    _MAX_REVIEW_FIX_ATTEMPTS = 2
 
     for poll_idx in range(max_polls):
         time.sleep(poll_interval)
@@ -2421,8 +2573,21 @@ def _monitor_pr(
             review_status = _get_review_status(repo, pr_number)
 
             if review_status == "changes_requested":
-                # Read inline comments and triage: fix/file-issue/skip
-                _triage_review_comments(
+                if review_fix_attempts >= _MAX_REVIEW_FIX_ATTEMPTS:
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="review",
+                        event_type="human_escalate",
+                        payload={
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            "reason": "review changes_requested after max fix attempts",
+                            "review_fix_attempts": review_fix_attempts,
+                        },
+                        log_dir=config.log_dir.expanduser(),
+                    )
+                    return False
+                result = _handle_pr_review_feedback(
                     pr_number=pr_number,
                     branch=branch,
                     repo=repo,
@@ -2430,8 +2595,14 @@ def _monitor_pr(
                     checkpoint=checkpoint,
                     issue_number=issue_number,
                 )
+                review_fix_attempts += 1
+                if result == "fixed":
+                    continue  # wait for CI to re-run on new commit
+                elif result == "error":
+                    return False
+                # "no_feedback" → fall through to merge
 
-            # Squash merge — proceed regardless of review status ("no_review" is OK)
+            # Squash merge — review is approved, no_review, or feedback was addressed
             merge_result = _gh(
                 ["pr", "merge", str(pr_number), "--squash", "--delete-branch"],
                 repo=repo,
@@ -2470,9 +2641,23 @@ def _monitor_pr(
                 return False
 
         elif ci_status == "fail":
-            # Non-conflict CI failure: escalate after MAX_RETRIES
             ci_fail_count += 1
-            if ci_fail_count >= MAX_RETRIES:
+            if ci_fail_count == 1:
+                # First failure: may be transient — poll once more before acting.
+                pass
+            elif ci_fix_attempts < _MAX_CI_FIX_ATTEMPTS:
+                # Persistent failure: dispatch a CI fix agent and reset the counter.
+                ci_fix_attempts += 1
+                ci_fail_count = 0
+                _dispatch_ci_fix_agent(
+                    pr_number=pr_number,
+                    branch=branch,
+                    repo=repo,
+                    config=config,
+                    checkpoint=checkpoint,
+                    issue_number=issue_number,
+                )
+            else:
                 logger.log_conductor_event(
                     run_id=checkpoint.run_id,
                     phase="ci_check",
@@ -2480,13 +2665,12 @@ def _monitor_pr(
                     payload={
                         "pr_number": pr_number,
                         "issue_number": issue_number,
-                        "reason": "ci failed repeatedly",
-                        "ci_fail_count": ci_fail_count,
+                        "reason": "ci failed after fix attempts",
+                        "ci_fix_attempts": ci_fix_attempts,
                     },
                     log_dir=config.log_dir.expanduser(),
                 )
                 return False
-            # Otherwise continue polling (may be transient)
 
         # ci_status == "pending": continue polling
 
@@ -2505,7 +2689,7 @@ def _monitor_pr(
     return False
 
 
-def _triage_review_comments(
+def _dispatch_ci_fix_agent(
     pr_number: int,
     branch: str,
     repo: str,
@@ -2513,76 +2697,68 @@ def _triage_review_comments(
     checkpoint: Checkpoint,
     issue_number: int,
 ) -> None:
-    """Dispatch a fix agent to address review comments on a PR.
+    """Dispatch a fix agent to repair CI failures on a PR branch.
 
-    Triaging policy (applied by the fix agent):
-    - Straightforward in-scope fixes → apply and push
-    - Valid but out-of-scope → file a follow-up issue
-    - False positives → add a skip comment on the PR
+    Reads the latest failing CI run logs, then dispatches a Claude agent that
+    checks out the branch, diagnoses and fixes the failures, and pushes a fix
+    commit. The caller should continue polling after this returns.
 
     Args:
         pr_number:    GitHub PR number.
         branch:       Branch name for the PR.
         repo:         Repository in ``owner/repo`` format.
-        config:       Config instance.
-        checkpoint:   Checkpoint instance.
-        issue_number: Original issue number.
+        config:       Config instance (provides model, env, timeouts).
+        checkpoint:   Checkpoint instance for logging.
+        issue_number: Original issue number (for logging).
     """
-    # Read inline comments
-    comments_result = _gh(
-        ["api", f"repos/{repo}/pulls/{pr_number}/comments"],
-        repo=None,  # already embedded in path
-        check=False,
-    )
-    if comments_result.returncode != 0:
-        return
-
-    try:
-        comments = json.loads(comments_result.stdout)
-    except json.JSONDecodeError:
-        return
-
-    if not comments:
-        return
-
-    # Format review comments for the fix agent
-    comments_text = ""
-    for c in comments[:20]:  # cap to avoid huge prompts
-        path = c.get("path") or "?"
-        line = c.get("line") or c.get("original_line") or "?"
-        body = c.get("body") or ""
-        comments_text += f"- File: `{path}`, line {line}\n  {body}\n\n"
-
     logger.log_conductor_event(
         run_id=checkpoint.run_id,
-        phase="review",
-        event_type="review_comments_triaged",
-        payload={
-            "pr_number": pr_number,
-            "issue_number": issue_number,
-            "comment_count": len(comments),
-            "action": "dispatching_fix_agent",
-        },
+        phase="ci_check",
+        event_type="ci_fix_dispatched",
+        payload={"pr_number": pr_number, "issue_number": issue_number, "branch": branch},
         log_dir=config.log_dir.expanduser(),
     )
 
+    # Fetch failure logs from the most recent CI run on this branch.
+    run_list = _gh(
+        ["run", "list", "--branch", branch, "--limit", "1", "--json", "databaseId"],
+        repo=repo,
+        check=False,
+    )
+    failure_logs = "(could not retrieve CI logs)"
+    try:
+        runs = json.loads(run_list.stdout or "[]")
+        if runs:
+            run_id = runs[0]["databaseId"]
+            log_result = _gh(
+                ["run", "view", str(run_id), "--log-failed"],
+                repo=repo,
+                check=False,
+            )
+            if log_result.returncode == 0 and log_result.stdout:
+                failure_logs = log_result.stdout[:4000]
+    except (json.JSONDecodeError, KeyError, IndexError):
+        pass
+
     prompt = (
-        f"You are addressing review comments on PR #{pr_number} in repository `{repo}`.\n"
+        f"You are fixing CI failures on PR #{pr_number} in repository `{repo}`.\n"
         f"Branch: `{branch}`\n\n"
-        f"Review comments to triage:\n\n"
-        f"{comments_text}\n"
+        f"CI failure logs:\n```\n{failure_logs}\n```\n\n"
         f"Steps:\n"
         f"1. Clone the repo into a temp directory:\n"
         f"   WORK=$(mktemp -d) && gh repo clone {repo} $WORK\n"
         f"2. cd $WORK && git checkout {branch} && git pull origin {branch}\n"
-        f"3. For each review comment, choose one action:\n"
-        f"   a. Fix it — make the change in the file, then commit and push\n"
-        f"   b. Out of scope — `gh issue create --repo {repo} --title '...' --body '...'`\n"
-        f"   c. False positive — `gh pr comment {pr_number} --repo {repo}"
-        f" --body 'Skipping: <reason>'`\n"
-        f"4. If you made changes:\n"
-        f"   git add -A && git commit -m 'fix: address review on PR #{pr_number}' && git push\n"
-        f"5. STOP.\n"
+        f"3. Diagnose the failure from the logs above. Fix the root cause in the source files.\n"
+        f"   - Lint errors: remove unused imports, fix formatting\n"
+        f"   - Test failures: fix the implementation or correct a wrong test expectation\n"
+        f"   - Type errors: add or fix type annotations\n"
+        f"   Stay within the files already modified on this branch"
+        f" — do not refactor unrelated code.\n"
+        f"4. Run CI locally to verify the fix:\n"
+        f"   make lint && make test   (or uv run ruff check && uv run pytest)\n"
+        f"5. Commit and push:\n"
+        f"   git add -A && git commit -m 'fix: repair CI on PR #{pr_number}' && git push\n"
+        f"6. STOP.\n"
     )
 
     env = build_subprocess_env(config)
@@ -2590,11 +2766,253 @@ def _triage_review_comments(
         prompt=prompt,
         allowed_tools=["Bash"],
         env=env,
-        max_turns=30,
+        max_turns=40,
         timeout_seconds=config.agent_timeout_minutes * 60,
         model=config.model,
-        prefix=f"[review #{pr_number}] ",
+        prefix=f"[ci-fix {branch}] ",
     )
+
+
+def _collect_pr_review_context(pr_number: int, repo: str) -> dict[str, Any]:
+    """Collect all review feedback from a PR: formal reviews, inline comments, thread comments.
+
+    Returns a dict with keys:
+        ``reviews``        — list of formal review dicts (state, author, body)
+        ``inline``         — list of inline code comment dicts (path, line, body, author)
+        ``thread``         — list of PR thread comment dicts (body, author)
+        ``blocking_logins``— set of reviewer logins whose state is CHANGES_REQUESTED
+    """
+    context: dict[str, Any] = {
+        "reviews": [],
+        "inline": [],
+        "thread": [],
+        "blocking_logins": set(),
+    }
+
+    # Formal reviews (state + body)
+    reviews_result = _gh(
+        ["pr", "view", str(pr_number), "--json", "reviews"],
+        repo=repo,
+        check=False,
+    )
+    if reviews_result.returncode == 0:
+        try:
+            data = json.loads(reviews_result.stdout)
+            raw_reviews = data.get("reviews", [])
+            # Deduplicate: keep the latest review per author
+            latest: dict[str, dict] = {}
+            for r in raw_reviews:
+                login = (r.get("author") or {}).get("login", "unknown")
+                latest[login] = r
+            for login, r in latest.items():
+                state = (r.get("state") or "").upper()
+                entry = {
+                    "author": login,
+                    "state": state,
+                    "body": (r.get("body") or "").strip(),
+                }
+                context["reviews"].append(entry)
+                if state == "CHANGES_REQUESTED":
+                    context["blocking_logins"].add(login)
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+    # Inline code comments
+    inline_result = _gh(
+        ["api", f"repos/{repo}/pulls/{pr_number}/comments"],
+        repo=None,
+        check=False,
+    )
+    if inline_result.returncode == 0:
+        try:
+            for c in json.loads(inline_result.stdout or "[]")[:30]:
+                context["inline"].append(
+                    {
+                        "author": (c.get("user") or {}).get("login", "?"),
+                        "path": c.get("path") or "?",
+                        "line": c.get("line") or c.get("original_line") or "?",
+                        "body": (c.get("body") or "").strip(),
+                    }
+                )
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+    # PR thread comments
+    thread_result = _gh(
+        ["pr", "view", str(pr_number), "--json", "comments"],
+        repo=repo,
+        check=False,
+    )
+    if thread_result.returncode == 0:
+        try:
+            data = json.loads(thread_result.stdout)
+            for c in (data.get("comments") or [])[:20]:
+                context["thread"].append(
+                    {
+                        "author": (c.get("author") or {}).get("login", "?"),
+                        "body": (c.get("body") or "").strip(),
+                    }
+                )
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+    return context
+
+
+def _dismiss_stale_change_requests(pr_number: int, repo: str, logins: set[str]) -> None:
+    """Dismiss CHANGES_REQUESTED reviews for *logins* after fixes have been pushed.
+
+    Called after a review-fix agent pushes changes so the stale blocking reviews
+    don't prevent the squash merge. Only dismisses reviews from *logins* — human
+    reviews that were not specifically addressed are left intact.
+
+    Args:
+        pr_number: GitHub PR number.
+        repo:      Repository in ``owner/repo`` format.
+        logins:    Set of reviewer logins whose CHANGES_REQUESTED reviews to dismiss.
+    """
+    # Fetch current reviews with IDs
+    result = _gh(
+        ["api", f"repos/{repo}/pulls/{pr_number}/reviews"],
+        repo=None,
+        check=False,
+    )
+    if result.returncode != 0:
+        return
+    try:
+        reviews = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError:
+        return
+
+    for review in reviews:
+        state = (review.get("state") or "").upper()
+        login = (review.get("user") or {}).get("login", "")
+        if state == "CHANGES_REQUESTED" and login in logins:
+            review_id = review.get("id")
+            if review_id:
+                _gh(
+                    [
+                        "api",
+                        "--method",
+                        "PUT",
+                        f"repos/{repo}/pulls/{pr_number}/reviews/{review_id}/dismissals",
+                        "-f",
+                        "message=Review feedback addressed in latest commit.",
+                    ],
+                    repo=None,
+                    check=False,
+                )
+
+
+def _handle_pr_review_feedback(
+    pr_number: int,
+    branch: str,
+    repo: str,
+    config: Config,
+    checkpoint: Checkpoint,
+    issue_number: int,
+) -> str:
+    """Collect all PR review feedback, dispatch a fix agent, and dismiss stale reviews.
+
+    Gathers formal review bodies, inline code comments, and PR thread comments from
+    all reviewers (human and automated, including Claude Code). Dispatches a single
+    fix agent with full context. After the agent pushes fixes, dismisses stale
+    CHANGES_REQUESTED reviews so they no longer block the squash merge.
+
+    Returns:
+        ``"fixed"``    — fix agent ran; caller should re-poll CI before merging.
+        ``"no_feedback"`` — no actionable feedback found; caller may merge.
+        ``"error"``    — could not read feedback; caller should escalate.
+    """
+    ctx = _collect_pr_review_context(pr_number, repo)
+
+    # Check if there is any substantive feedback to act on
+    has_formal = any(r["body"] for r in ctx["reviews"])
+    has_inline = bool(ctx["inline"])
+    has_thread = any(c["body"] and not c["author"].endswith("[bot]") for c in ctx["thread"])
+    if not has_formal and not has_inline and not has_thread:
+        return "no_feedback"
+
+    # Format reviews section
+    reviews_text = ""
+    for r in ctx["reviews"]:
+        state_tag = f"[{r['state']}]" if r["state"] else ""
+        body_text = r["body"] or "(no body)"
+        reviews_text += f"- **{r['author']}** {state_tag}:\n  {body_text}\n\n"
+
+    # Format inline comments
+    inline_text = ""
+    for c in ctx["inline"]:
+        inline_text += f"- `{c['path']}` line {c['line']} (@{c['author']}):\n  {c['body']}\n\n"
+
+    # Format thread comments (skip bots and empty)
+    thread_text = ""
+    for c in ctx["thread"]:
+        if c["body"] and not c["author"].endswith("[bot]"):
+            thread_text += f"- **@{c['author']}**: {c['body']}\n\n"
+
+    blocking = sorted(ctx["blocking_logins"])
+    blocking_str = ", ".join(f"@{login}" for login in blocking) or "none"
+
+    logger.log_conductor_event(
+        run_id=checkpoint.run_id,
+        phase="review",
+        event_type="review_feedback_dispatched",
+        payload={
+            "pr_number": pr_number,
+            "issue_number": issue_number,
+            "blocking_reviewers": blocking,
+            "inline_count": len(ctx["inline"]),
+            "thread_comment_count": len(ctx["thread"]),
+        },
+        log_dir=config.log_dir.expanduser(),
+    )
+
+    prompt = (
+        f"You are addressing review feedback on PR #{pr_number} in repository `{repo}`.\n"
+        f"Branch: `{branch}`\n"
+        f"Reviewers requesting changes: {blocking_str}\n\n"
+        f"## Formal Reviews\n{reviews_text or '(none)'}\n"
+        f"## Inline Code Comments\n{inline_text or '(none)'}\n"
+        f"## PR Thread Comments\n{thread_text or '(none)'}\n\n"
+        f"## Instructions\n"
+        f"1. Clone the repo:\n"
+        f"   WORK=$(mktemp -d) && gh repo clone {repo} $WORK\n"
+        f"2. cd $WORK && git checkout {branch} && git pull origin {branch}\n"
+        f"3. Triage every piece of feedback:\n"
+        f"   **Fix now**: correctness bugs, lint/type errors, broken tests, clear API mistakes → "
+        f"fix in the source, run tests to verify.\n"
+        f"   **File issue**: valid feedback that is out of scope for this PR → "
+        f"   `gh issue create --repo {repo} --title '...' --body '...'` "
+        f"   then comment on the PR: `gh pr comment {pr_number} --repo {repo} "
+        f"--body 'Filed as #<N>'`\n"
+        f"   **Skip**: false positives, style nitpicks, subjective preferences → "
+        f"   `gh pr comment {pr_number} --repo {repo} --body 'Skipping: <reason>'`\n"
+        f"4. Run lint and tests locally to confirm no regressions:\n"
+        f"   make lint && make test   (or: uv run ruff check && uv run pytest)\n"
+        f"5. Commit and push ALL fixes in a single commit:\n"
+        f"   git add -A && git commit -m 'fix: address review feedback on PR #{pr_number}' "
+        f"&& git push\n"
+        f"6. STOP — do not merge.\n"
+    )
+
+    env = build_subprocess_env(config)
+    runner.run(
+        prompt=prompt,
+        allowed_tools=["Bash"],
+        env=env,
+        max_turns=50,
+        timeout_seconds=config.agent_timeout_minutes * 60,
+        model=config.model,
+        prefix=f"[review-fix {branch}] ",
+    )
+
+    # Dismiss stale CHANGES_REQUESTED reviews from the reviewers we just addressed.
+    # This unblocks the squash merge; CI will re-run on the new commit.
+    if ctx["blocking_logins"]:
+        _dismiss_stale_change_requests(pr_number, repo, ctx["blocking_logins"])
+
+    return "fixed"
 
 
 def _create_worktree(branch: str, repo_root: str, default_branch: str = "main") -> str | None:
@@ -2885,6 +3303,7 @@ def _dispatch_design_agent(
         prefix,
         config,
         issue_number,
+        model=config.model,
     )
     return issue, branch, worktree_path, result
 
@@ -3029,8 +3448,9 @@ def _run_impl_worker(
 
     # Resume: for any in-progress impl issues, find their PR and monitor it.
     # If no PR exists, unclaim so the issue can be re-dispatched cleanly.
+    # Also scan open PRs directly in case the in-progress label was stripped.
     if not dry_run:
-        _resume_stale_issues(
+        handled = _resume_stale_issues(
             repo=repo,
             milestone=milestone,
             label=IMPL_LABEL,
@@ -3039,6 +3459,17 @@ def _run_impl_worker(
             checkpoint=checkpoint,
             default_branch=default_branch,
             repo_root=repo_root,
+        )
+        _resume_open_prs(
+            repo=repo,
+            milestone=milestone,
+            label=IMPL_LABEL,
+            log_prefix="[impl-worker]",
+            config=config,
+            checkpoint=checkpoint,
+            default_branch=default_branch,
+            repo_root=repo_root,
+            already_handled=handled,
         )
         _startup_dep_checks(_list_open_issues_by_label(repo, milestone, IMPL_LABEL), repo)
 
@@ -3095,7 +3526,6 @@ def _run_impl_worker(
                         log_dir=config.log_dir.expanduser(),
                     )
                     continue
-                session.record_dispatch(checkpoint, str(issue_number))
                 checkpoint.claimed_issues[str(issue_number)] = branch
                 session.save(checkpoint, checkpoint_path)
                 logger.log_conductor_event(
@@ -3157,16 +3587,38 @@ def _run_impl_worker(
                 },
                 log_dir=config.log_dir.expanduser(),
             )
-            merged = _monitor_pr(
-                pr_number=pr_number,
-                branch=branch,
-                repo=repo,
-                config=config,
-                checkpoint=checkpoint,
-                worktree_path=worktree_path,
-                issue_number=issue_number,
-                default_branch=default_branch,
-            )
+            # Retry monitoring until the PR merges or we exhaust retries.
+            # Each failed attempt re-enters _monitor_pr so that a conflict that
+            # develops mid-flight (another PR merged while CI was running) is
+            # caught on the next pass.
+            monitor_attempts = 0
+            merged = False
+            while not merged and monitor_attempts < _REBASE_RETRY_LIMIT:
+                merged = _monitor_pr(
+                    pr_number=pr_number,
+                    branch=branch,
+                    repo=repo,
+                    config=config,
+                    checkpoint=checkpoint,
+                    worktree_path=worktree_path,
+                    issue_number=issue_number,
+                    default_branch=default_branch,
+                )
+                monitor_attempts += 1
+                if not merged:
+                    # Check if the PR is still open — if it was closed externally,
+                    # stop retrying.
+                    pr_info = _gh(
+                        ["pr", "view", str(pr_number), "--json", "state"],
+                        repo=repo,
+                        check=False,
+                    )
+                    try:
+                        pr_state = json.loads(pr_info.stdout).get("state", "")
+                    except (json.JSONDecodeError, AttributeError):
+                        pr_state = ""
+                    if pr_state != "OPEN":
+                        break
             if merged:
                 _remove_worktree(worktree_path, repo_root)
             else:
@@ -3186,8 +3638,21 @@ def _run_impl_worker(
             active_modules.discard(slot[3])
 
         def _when_empty() -> bool:
-            open_issues = _list_open_issues_by_label(repo, milestone, IMPL_LABEL)
-            if not open_issues:
+            # Count ALL open impl issues — including in-progress ones. A non-zero
+            # count means at least one PR is unmerged (monitor failed or agent is
+            # still running), so do not declare completion.
+            total_open = _count_open_issues_by_label(repo, milestone, IMPL_LABEL)
+            if total_open == 0:
+                # Guard: if no impl issues exist at all (open or closed), scope
+                # never ran or failed silently. Declaring "complete" here would
+                # be a false positive — raise instead.
+                total_all = _count_all_issues_by_label(repo, milestone, IMPL_LABEL)
+                if total_all == 0:
+                    raise click.ClickException(
+                        f"No stage/impl issues found for milestone '{milestone}' "
+                        "(open or closed). The scope stage may not have run or "
+                        "failed silently. Run `brimstone run --scope` first."
+                    )
                 logger.log_conductor_event(
                     run_id=checkpoint.run_id,
                     phase="complete",
@@ -3205,6 +3670,8 @@ def _run_impl_worker(
             gov=gov,
             repo=repo,
             repo_root=repo_root,
+            milestone=milestone,
+            model=config.model,
             config=config,
             checkpoint=checkpoint,
             stage="impl",
@@ -3368,7 +3835,16 @@ def _run_design_worker(
             checkpoint=checkpoint,
         )
 
-        _log_agent_cost(hld_result, repo, "design", config, checkpoint, issue_number=hld_number)
+        _log_agent_cost(
+            hld_result,
+            repo,
+            "design",
+            config,
+            checkpoint,
+            issue_number=hld_number,
+            milestone=milestone,
+            model=config.model,
+        )
 
         if hld_result.is_error:
             _unclaim_issue(repo=repo, issue_number=hld_number)
@@ -3523,6 +3999,7 @@ def _run_design_worker(
                 )
                 _remove_worktree(worktree_path, repo_root)
                 if merged:
+                    _unclaim_issue(repo=repo, issue_number=issue_number)
                     click.echo(f"LLD for {module!r} merged (PR #{pr_number}).")
                 else:
                     click.echo(
@@ -3540,6 +4017,8 @@ def _run_design_worker(
                 gov=None,
                 repo=repo,
                 repo_root=repo_root,
+                milestone=milestone,
+                model=config.model,
                 config=config,
                 checkpoint=checkpoint,
                 stage="design",
@@ -3592,22 +4071,6 @@ def _run_plan_issues(
     checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
     today = date.today().isoformat()
 
-    base_prompt = (
-        f"## Session Parameters\n"
-        f"- Repository: {repo}\n"
-        f"- Milestone: {milestone}\n"
-        f"- Session Date: {today}\n"
-        f"- Dry Run: {dry_run}\n\n"
-        f"You are the plan-issues orchestrator for the `{repo}` repository.\n"
-        f"Read the HLD and LLD design docs and file fully-specified `stage/impl` issues "
-        f"against milestone `{milestone}` following the skill instructions.\n"
-        + (
-            "\nThe `--dry-run` flag is set: print all planned issues but do NOT call "
-            "`gh issue create`.\n"
-            if dry_run
-            else ""
-        )
-    )
     if dry_run:
         click.echo(
             f"[dry-run] Would dispatch plan-issues agent for milestone "
@@ -3615,25 +4078,56 @@ def _run_plan_issues(
         )
         return
 
-    logger.log_conductor_event(
-        run_id=checkpoint.run_id,
-        phase="dispatch",
-        event_type="plan_issues_start",
-        payload={"repo": repo, "milestone": milestone},
-        log_dir=config.log_dir.expanduser(),
-    )
+    repo_root, clone_dir = _ensure_worktree_repo(repo)
+    try:
+        base_prompt = (
+            f"## Headless Autonomous Mode\n"
+            f"You are running in a fully automated headless pipeline. No human is present.\n"
+            f"Use tools directly and silently. Do NOT produce conversational text.\n\n"
+            f"## Session Parameters\n"
+            f"- Repository: {repo}\n"
+            f"- Milestone: {milestone}\n"
+            f"- Local repo clone: {repo_root}\n"
+            f"- Session Date: {today}\n\n"
+            f"You are the plan-issues orchestrator for the `{repo}` repository.\n"
+            f"The repository has been cloned to `{repo_root}`. "
+            f"Read the HLD and LLD design docs from the local clone at "
+            f"`{repo_root}/docs/design/{milestone}/` — do NOT use `gh api` to fetch them.\n"
+            f"File fully-specified `stage/impl` issues against milestone `{milestone}` "
+            f"following the skill instructions.\n"
+        )
 
-    result = _run_agent(
-        base_prompt,
-        "scope-worker",
-        ["Bash", "Read", "Glob", "Grep"],
-        200,
-        f"plan-issues-{milestone}",
-        f"[scope {milestone}] ",
+        logger.log_conductor_event(
+            run_id=checkpoint.run_id,
+            phase="dispatch",
+            event_type="plan_issues_start",
+            payload={"repo": repo, "milestone": milestone},
+            log_dir=config.log_dir.expanduser(),
+        )
+
+        result = _run_agent(
+            base_prompt,
+            "scope-worker",
+            ["Bash", "Read", "Glob", "Grep"],
+            200,
+            f"plan-issues-{milestone}",
+            f"[scope {milestone}] ",
+            config,
+            model=config.model,
+        )
+    finally:
+        shutil.rmtree(clone_dir, ignore_errors=True)
+
+    _log_agent_cost(
+        result,
+        repo,
+        "scoping",
         config,
+        checkpoint,
+        issue_number=None,
+        milestone=milestone,
+        model=config.model,
     )
-
-    _log_agent_cost(result, repo, "scoping", config, checkpoint, issue_number=None)
 
     logger.log_conductor_event(
         run_id=checkpoint.run_id,
@@ -3651,12 +4145,18 @@ def _run_plan_issues(
     session.save(checkpoint, checkpoint_path)
 
     if result.is_error:
-        click.echo(
-            f"Plan-issues completed with error: {result.subtype} / {result.error_code}",
-            err=True,
+        if result.stderr:
+            click.echo(
+                f"[scope {milestone}] stderr (exit_code={result.exit_code}):\n"
+                f"{result.stderr[:2000]}",
+                err=True,
+            )
+        raise click.ClickException(
+            f"Scope stage failed for milestone '{milestone}': "
+            f"{result.subtype} / {result.error_code} (exit_code={result.exit_code}). "
+            "No impl issues were created. Fix the failure and re-run --scope."
         )
-    else:
-        click.echo(f"Plan-issues complete for milestone '{milestone}'.")
+    click.echo(f"Plan-issues complete for milestone '{milestone}'.")
 
 
 # ---------------------------------------------------------------------------
@@ -4131,6 +4631,20 @@ def _run_plan(
     checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
     today = date.today().isoformat()
 
+    # Skip plan if design is already underway (HLD merged → research issues
+    # seeded in a prior run; re-filing them would block design with new research).
+    if not dry_run:
+        hld_doc_path = f"docs/design/{version}/HLD.md"
+        try:
+            default_branch = _get_default_branch_for_repo(repo)
+            if _doc_exists_on_default_branch(repo, hld_doc_path, default_branch):
+                click.echo(
+                    f"HLD already merged for {version!r} — plan stage skipped (design underway)."
+                )
+                return
+        except Exception:
+            pass  # If the check fails, fall through and let the agent run normally
+
     if spec_local_path is not None:
         spec_read_instruction = f"Read the spec from the local file:\n  cat {spec_local_path}"
     else:
@@ -4162,6 +4676,11 @@ def _run_plan(
         f"You are running in a headless temp directory (not inside the repo checkout).\n"
         f"IMPORTANT: The milestone title MUST be exactly `{version}` — do not shorten or "
         f"normalize it (e.g. do not use `v0.1` if the version is `v0.1.0`).\n\n"
+        f"CRITICAL — Label format for every research issue:\n"
+        f'  --label "stage/research,P1"  (or P0 / P2 / P3 as appropriate)\n'
+        f"  NEVER use bare `research` — the `stage/` prefix is required.\n"
+        f"  NEVER put priority (e.g. [P1]) in the issue title.\n"
+        f"  Every issue must carry both `stage/research` AND exactly one priority label.\n\n"
         f"{spec_read_instruction}\n"
         f"Then create the milestone and file research issues"
         f" following the skill instructions in your system prompt."
@@ -4355,8 +4874,7 @@ def _check_gate_before_stage(
             )
 
     if stage == "impl" and "scope" not in stages_being_run:
-        open_impl = _list_open_issues_by_label(repo, milestone, IMPL_LABEL)
-        if not open_impl:
+        if _count_open_issues_by_label(repo, milestone, IMPL_LABEL) == 0:
             raise click.ClickException(
                 f"No open impl issues found for milestone '{milestone}'. "
                 "Run `brimstone run --scope` first to generate them from the design docs."

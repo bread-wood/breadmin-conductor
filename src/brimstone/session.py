@@ -1,8 +1,15 @@
 """Checkpoint persistence and state recovery for the orchestrator.
 
 Single source of truth for in-flight orchestrator state across subprocess
-boundaries. Owns the checkpoint schema, atomic read/write, backoff state,
-hang detection, and orphaned-work classification.
+boundaries. Owns the checkpoint schema, atomic read/write, and backoff state.
+
+Issue/PR lifecycle tracking is migrating to bead files (src/brimstone/beads.py).
+The fields claimed_issues, open_prs, completed_prs, retry_counts, and
+dispatch_times are retained here for backward-compat while cli.py transitions;
+they will be removed once cli.py no longer writes to them (PR 7a).
+
+The functions record_dispatch(), is_agent_hung(), and classify_orphaned_issue()
+have been removed — their logic moves to BeadStore + Deacon (beads.py / cli.py).
 
 No subprocess calls are made here — callers pass in any GitHub/git state
 they have already resolved, keeping this module fully testable without
@@ -23,7 +30,7 @@ from pathlib import Path
 # Module constant
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION: int = 1
+SCHEMA_VERSION: int = 2
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -51,6 +58,11 @@ class CheckpointCorruptError(CheckpointError):
 class Checkpoint:
     """Complete orchestrator state persisted to disk between restarts.
 
+    Note: claimed_issues, open_prs, completed_prs, retry_counts, and
+    dispatch_times are legacy fields retained while cli.py transitions to bead
+    files. They will be dropped in a future schema version once cli.py no longer
+    writes to them.
+
     All mutable collection fields use ``field(default_factory=...)`` so that
     each instance gets its own independent container — never a shared default.
     """
@@ -63,6 +75,7 @@ class Checkpoint:
     milestone: str
     stage: str
     timestamp: str
+    # Legacy fields — will be removed once cli.py reads from BeadStore instead
     claimed_issues: dict[str, str] = field(default_factory=dict)
     active_worktrees: list[str] = field(default_factory=list)
     open_prs: dict[str, int] = field(default_factory=dict)
@@ -210,6 +223,12 @@ def _migrate(data: dict, *, from_version: int) -> dict:
         data.setdefault("dispatch_times", {})
         version = 1
 
+    if version < 2:
+        # v1 → v2: schema_version bump; legacy fields are still present on
+        # Checkpoint for now (they will be dropped in a later schema version
+        # once cli.py reads from BeadStore exclusively).
+        version = 2
+
     data["schema_version"] = SCHEMA_VERSION
     return data
 
@@ -279,114 +298,3 @@ def is_backing_off(checkpoint: Checkpoint) -> bool:
 def clear_backoff(checkpoint: Checkpoint) -> None:
     """Clear the backoff deadline after a successful dispatch post-backoff."""
     checkpoint.rate_limit_backoff_until = None
-
-
-# ---------------------------------------------------------------------------
-# Dispatch recording and hang detection
-# ---------------------------------------------------------------------------
-
-
-def record_dispatch(checkpoint: Checkpoint, issue_number: str) -> None:
-    """Stamp ``dispatch_times[issue_number]`` with the current UTC time.
-
-    Called immediately after an agent subprocess is spawned.
-
-    Args:
-        checkpoint:   The checkpoint to mutate.
-        issue_number: The issue number string (e.g. ``"42"``).
-    """
-    checkpoint.dispatch_times[issue_number] = datetime.now(UTC).isoformat()
-
-
-def is_agent_hung(
-    checkpoint: Checkpoint,
-    issue_number: str,
-    timeout_minutes: float,
-) -> bool:
-    """Return ``True`` if the agent for *issue_number* has exceeded the timeout.
-
-    Returns ``False`` when no dispatch timestamp exists for *issue_number*
-    (i.e. the agent has not yet been dispatched).
-
-    Args:
-        checkpoint:      The checkpoint to inspect.
-        issue_number:    The issue number string (e.g. ``"42"``).
-        timeout_minutes: Elapsed-time threshold in minutes.
-    """
-    dispatch_time_str = checkpoint.dispatch_times.get(issue_number)
-    if dispatch_time_str is None:
-        return False
-    dispatch_time = datetime.fromisoformat(dispatch_time_str)
-    elapsed = datetime.now(UTC) - dispatch_time
-    return elapsed.total_seconds() > timeout_minutes * 60
-
-
-# ---------------------------------------------------------------------------
-# Recovery decision
-# ---------------------------------------------------------------------------
-
-
-def classify_orphaned_issue(
-    issue_number: str,
-    checkpoint: Checkpoint,
-    *,
-    has_pr: bool,
-    has_commits: bool,
-    worktree_exists: bool,
-) -> str:
-    """Classify an in-progress issue for the recovery decision tree.
-
-    Inspects the checkpoint and the caller-supplied live-state flags to
-    determine what action the orchestrator should take.  No mutations are made
-    here — classification only.
-
-    Args:
-        issue_number:   Issue number string (e.g. ``"42"``).
-        checkpoint:     The checkpoint to inspect.
-        has_pr:         ``True`` if an open PR exists for this issue's branch.
-                        Pass ``False`` for a merged PR (use the ``completed_prs``
-                        field in the checkpoint to detect that case).
-        has_commits:    ``True`` if the worktree has commits beyond the base
-                        branch (only meaningful when ``worktree_exists`` is
-                        ``True``).
-        worktree_exists: ``True`` if the worktree directory exists on disk.
-
-    Returns:
-        One of the following strings:
-
-        ``"monitor"``
-            PR is open — continue CI monitoring, no cleanup needed.
-        ``"abandoned"``
-            No PR, but the worktree has commits.  Preserve work; escalate to
-            human review.
-        ``"auto_clean"``
-            No PR, worktree exists but has no commits.  Safe to remove the
-            worktree and re-dispatch.
-        ``"stale_label"``
-            No PR and no worktree at all.  Remove the ``in-progress`` label
-            and clean up the checkpoint entry.
-        ``"clean_worktree"``
-            PR has been merged (PR number is in ``checkpoint.completed_prs``)
-            but the worktree still exists.  Remove the worktree.
-    """
-    # Determine whether the issue's branch has a merged PR recorded in the
-    # checkpoint.  open_prs maps branch → pr_number for *open* PRs; if that
-    # PR number also appears in completed_prs, the PR has been merged.
-    branch = checkpoint.claimed_issues.get(issue_number, "")
-    pr_number = checkpoint.open_prs.get(branch)
-    pr_is_merged = pr_number is not None and pr_number in checkpoint.completed_prs
-
-    if pr_is_merged and worktree_exists:
-        return "clean_worktree"
-
-    if has_pr:
-        return "monitor"
-
-    if not has_pr and has_commits:
-        return "abandoned"
-
-    if not has_pr and worktree_exists and not has_commits:
-        return "auto_clean"
-
-    # No PR, no worktree (stale label only)
-    return "stale_label"
