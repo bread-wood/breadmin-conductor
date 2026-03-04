@@ -190,14 +190,7 @@ Launch sub-agents in parallel using `Agent(isolation: "worktree")`.
 >    <list issue numbers or 'none'>
 >    "
 >    ```
-> 11. Wait for CI: `gh pr checks <PR-number> --watch`
-> 12. Read all CI and review feedback: `gh pr view <PR-number> --json reviews,comments`
->     and inline comments: `gh api repos/<owner>/<repo>/pulls/<PR-number>/comments`
-> 13. Triage each piece of feedback:
->     - **Fix now**: in scope and straightforward — fix, push, re-check CI
->     - **File issue**: valid but out of scope — `gh issue create` and note in PR comment
->     - **Skip**: false positive — note why in PR comment
-> 14. STOP. Do not merge.
+> 11. STOP. Do not merge. The orchestrator monitors CI and merges when ready.
 
 ### Step 3 — Merge & Requeue
 
@@ -247,11 +240,6 @@ When the pipeline drains for the active milestone:
    - Issues failed/abandoned (with reasons)
    - Remaining open research issues in active milestone
    - **Milestone completion status**: X of Y issues resolved
-
-2. **File the next pipeline stage issue** (only if research is declared complete):
-   ```bash
-   gh issue create --title "Run design-worker for <milestone>" --label "pipeline" --milestone "<milestone>"
-   ```
 
 ## Constraints
 

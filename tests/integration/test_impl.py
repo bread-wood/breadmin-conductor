@@ -49,9 +49,9 @@ class TestImplWorkerDefaultBranch:
 
         call_count = [0]
 
-        def open_issues(repo: str, milestone: str) -> list:
+        def open_issues(repo: str, milestone: str, label: str) -> list:
             call_count[0] += 1
-            return [issue] if call_count[0] == 1 else []
+            return [issue] if call_count[0] <= 2 else []
 
         def fake_dispatch(
             issue: dict,
@@ -65,7 +65,7 @@ class TestImplWorkerDefaultBranch:
 
         with (
             patch("brimstone.cli._get_default_branch_for_repo", return_value="mainline"),
-            patch("brimstone.cli._list_open_impl_issues", side_effect=open_issues),
+            patch("brimstone.cli._list_open_issues_by_label", side_effect=open_issues),
             patch("brimstone.cli._filter_unblocked", side_effect=lambda issues, nums: issues),
             patch("brimstone.cli._sort_issues", side_effect=lambda issues: issues),
             patch("brimstone.cli._extract_module", return_value="cli"),
@@ -111,7 +111,7 @@ class TestImplWorkerLoopMechanics:
 
         with (
             patch("brimstone.cli._get_default_branch_for_repo", return_value="mainline"),
-            patch("brimstone.cli._list_open_impl_issues", return_value=[]),
+            patch("brimstone.cli._list_open_issues_by_label", return_value=[]),
             patch("brimstone.cli._gh"),  # suppress pipeline issue creation
         ):
             # Should exit without error (not loop forever)
@@ -133,16 +133,16 @@ class TestImplWorkerLoopMechanics:
 
         call_count = [0]
 
-        def open_issues(repo: str, milestone: str) -> list:
+        def open_issues(repo: str, milestone: str, label: str) -> list:
             call_count[0] += 1
-            return [issue] if call_count[0] == 1 else []
+            return [issue] if call_count[0] <= 2 else []
 
         def fake_unclaim(repo: str, issue_number: int) -> None:
             unclaimed.append(issue_number)
 
         with (
             patch("brimstone.cli._get_default_branch_for_repo", return_value="mainline"),
-            patch("brimstone.cli._list_open_impl_issues", side_effect=open_issues),
+            patch("brimstone.cli._list_open_issues_by_label", side_effect=open_issues),
             patch("brimstone.cli._filter_unblocked", side_effect=lambda issues, nums: issues),
             patch("brimstone.cli._sort_issues", side_effect=lambda issues: issues),
             patch("brimstone.cli._extract_module", return_value="cli"),
@@ -179,9 +179,9 @@ class TestImplWorkerLoopMechanics:
         all_dispatched: list[int] = []
         call_count = [0]
 
-        def open_issues(repo: str, milestone: str) -> list:
+        def open_issues(repo: str, milestone: str, label: str) -> list:
             call_count[0] += 1
-            if call_count[0] == 1:
+            if call_count[0] <= 2:
                 return [issue_a, issue_b, issue_c]
             return []
 
@@ -197,7 +197,7 @@ class TestImplWorkerLoopMechanics:
 
         with (
             patch("brimstone.cli._get_default_branch_for_repo", return_value="mainline"),
-            patch("brimstone.cli._list_open_impl_issues", side_effect=open_issues),
+            patch("brimstone.cli._list_open_issues_by_label", side_effect=open_issues),
             patch("brimstone.cli._filter_unblocked", side_effect=lambda issues, nums: issues),
             patch("brimstone.cli._sort_issues", side_effect=lambda issues: issues),
             # Do NOT mock _extract_module — let the real one read feat:* labels

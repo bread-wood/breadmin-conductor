@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -44,7 +44,10 @@ class TestDesignWorkerGates:
 
         with (
             patch("brimstone.cli._get_default_branch_for_repo", return_value="mainline"),
-            patch("brimstone.cli._count_all_open_research_issues", return_value=3),
+            patch(
+                "brimstone.cli._list_open_issues_by_label",
+                return_value=[make_issue(1, "Blocking research")],
+            ),
         ):
             with pytest.raises(SystemExit):
                 _run_design_worker(
@@ -63,9 +66,8 @@ class TestDesignWorkerGates:
 
         with (
             patch("brimstone.cli._get_default_branch_for_repo", return_value="mainline"),
-            patch("brimstone.cli._count_all_open_research_issues", return_value=0),
+            patch("brimstone.cli._list_open_issues_by_label", side_effect=[[], [hld]]),
             patch("brimstone.cli._doc_exists_on_default_branch", return_value=False),
-            patch("brimstone.cli._list_open_design_issues", return_value=[hld]),
             patch("brimstone.cli._claim_issue"),
             patch("brimstone.cli._unclaim_issue"),
             patch(
@@ -92,9 +94,7 @@ class TestDesignWorkerHLDPhase:
 
         worktrees_seen: list[str] = []
 
-        def spy_dispatch(
-            issue: dict, branch: str, worktree_path: str, **kwargs: object
-        ) -> tuple:
+        def spy_dispatch(issue: dict, branch: str, worktree_path: str, **kwargs: object) -> tuple:
             worktrees_seen.append(worktree_path)
             assert Path(worktree_path).is_dir(), "Worktree must exist when agent is dispatched"
             return issue, branch, worktree_path, fake_run_result()
@@ -105,15 +105,14 @@ class TestDesignWorkerHLDPhase:
         # (LLD recovery checks will not be called since lld_issues is empty)
         with (
             patch("brimstone.cli._get_default_branch_for_repo", return_value="mainline"),
-            patch("brimstone.cli._count_all_open_research_issues", return_value=0),
+            # Gate 1 research → []; Phase 1 design → [hld]; Phase 2 LLD → []
+            patch(
+                "brimstone.cli._list_open_issues_by_label",
+                side_effect=[[], [hld], []],
+            ),
             patch(
                 "brimstone.cli._doc_exists_on_default_branch",
                 side_effect=[False, True],
-            ),
-            # First call: [hld] for HLD lookup; second call: [] for LLD lookup
-            patch(
-                "brimstone.cli._list_open_design_issues",
-                side_effect=[[hld], []],
             ),
             patch("brimstone.cli._claim_issue"),
             patch("brimstone.cli._unclaim_issue"),
@@ -151,10 +150,9 @@ class TestDesignWorkerHLDPhase:
         # doc_exists: HLD already on branch (Phase 1 skip + Gate 2 pass)
         with (
             patch("brimstone.cli._get_default_branch_for_repo", return_value="mainline"),
-            patch("brimstone.cli._count_all_open_research_issues", return_value=0),
+            # Call 1: Gate 1 research → []; Gate 2 passes (HLD on branch); Call 2: Phase 2 LLD → []
+            patch("brimstone.cli._list_open_issues_by_label", return_value=[]),
             patch("brimstone.cli._doc_exists_on_default_branch", return_value=True),
-            # No LLD issues → SystemExit(1) after gate passes
-            patch("brimstone.cli._list_open_design_issues", return_value=[]),
             patch("brimstone.cli._dispatch_design_agent", side_effect=spy_dispatch),
         ):
             with pytest.raises(SystemExit):
@@ -179,9 +177,7 @@ class TestDesignWorkerLLDPhase:
 
         worktrees_seen: list[str] = []
 
-        def spy_dispatch(
-            issue: dict, branch: str, worktree_path: str, **kwargs: object
-        ) -> tuple:
+        def spy_dispatch(issue: dict, branch: str, worktree_path: str, **kwargs: object) -> tuple:
             worktrees_seen.append(worktree_path)
             assert Path(worktree_path).is_dir()
             return issue, branch, worktree_path, fake_run_result()
@@ -193,12 +189,12 @@ class TestDesignWorkerLLDPhase:
         # 4. LLD recovery for "runner"→ False (not yet merged)
         with (
             patch("brimstone.cli._get_default_branch_for_repo", return_value="mainline"),
-            patch("brimstone.cli._count_all_open_research_issues", return_value=0),
+            # Call 1: Gate 1 research → []; Call 2: Phase 2 LLD listing → llds
+            patch("brimstone.cli._list_open_issues_by_label", side_effect=[[], llds]),
             patch(
                 "brimstone.cli._doc_exists_on_default_branch",
                 side_effect=[True, True, False, False],
             ),
-            patch("brimstone.cli._list_open_design_issues", return_value=llds),
             patch("brimstone.cli._claim_issue"),
             patch("brimstone.cli._unclaim_issue"),
             patch("brimstone.cli._dispatch_design_agent", side_effect=spy_dispatch),

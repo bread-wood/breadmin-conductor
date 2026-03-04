@@ -107,7 +107,7 @@ class TestRunMilestoneCheck:
             with (
                 patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", return_value=True),
-                patch("brimstone.cli._count_all_open_research_issues", return_value=3),
+                patch("brimstone.cli._count_open_issues_by_label", return_value=3),
                 patch("brimstone.cli.startup_sequence", return_value=(object(), object())),
                 patch("brimstone.cli._run_research_worker"),
             ):
@@ -163,7 +163,7 @@ class TestRunCompletionSkip:
             with (
                 patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", return_value=True),
-                patch("brimstone.cli._count_all_open_research_issues", return_value=0),
+                patch("brimstone.cli._count_open_issues_by_label", return_value=0),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
                 patch(
                     "brimstone.cli._run_research_worker",
@@ -189,7 +189,7 @@ class TestRunCompletionSkip:
                 patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
-                patch("brimstone.cli._count_all_open_research_issues", return_value=0),
+                patch("brimstone.cli._count_open_issues_by_label", return_value=0),
                 patch("brimstone.cli._doc_exists_on_default_branch", return_value=True),
                 patch(
                     "brimstone.cli._run_design_worker",
@@ -221,7 +221,7 @@ class TestRunGates:
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
                 patch("brimstone.cli._doc_exists_on_default_branch", return_value=False),
-                patch("brimstone.cli._count_all_open_research_issues", return_value=5),
+                patch("brimstone.cli._count_open_issues_by_label", return_value=5),
             ):
                 runner = CliRunner()
                 result = runner.invoke(
@@ -240,7 +240,7 @@ class TestRunGates:
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
                 patch("brimstone.cli._doc_exists_on_default_branch", return_value=False),
-                patch("brimstone.cli._list_open_impl_issues", return_value=[]),
+                patch("brimstone.cli._list_open_issues_by_label", return_value=[]),
             ):
                 runner = CliRunner()
                 result = runner.invoke(
@@ -260,9 +260,9 @@ class TestRunGates:
                 patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
-                patch("brimstone.cli._count_all_open_research_issues", return_value=2),
+                patch("brimstone.cli._count_open_issues_by_label", return_value=2),
                 patch("brimstone.cli._doc_exists_on_default_branch", return_value=False),
-                patch("brimstone.cli._list_open_impl_issues", return_value=[{"number": 1}]),
+                patch("brimstone.cli._list_open_issues_by_label", return_value=[{"number": 1}]),
                 patch(
                     "brimstone.cli.startup_sequence",
                     return_value=(object(), object()),
@@ -300,7 +300,7 @@ class TestRunGates:
                 patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
-                patch("brimstone.cli._count_all_open_research_issues", return_value=1),
+                patch("brimstone.cli._count_open_issues_by_label", return_value=1),
                 patch("brimstone.cli._doc_exists_on_default_branch", return_value=False),
                 patch("brimstone.cli.startup_sequence", return_value=(object(), object())),
                 patch(
@@ -346,7 +346,7 @@ class TestRunScopeStage:
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
                 patch("brimstone.cli._doc_exists_on_default_branch", return_value=True),
-                patch("brimstone.cli._list_open_impl_issues", return_value=[]),
+                patch("brimstone.cli._list_open_issues_by_label", return_value=[]),
                 patch("brimstone.cli.startup_sequence", return_value=(object(), object())),
                 patch(
                     "brimstone.cli._run_plan_issues",
@@ -370,7 +370,7 @@ class TestRunScopeStage:
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
                 patch("brimstone.cli._doc_exists_on_default_branch", return_value=True),
-                patch("brimstone.cli._list_open_impl_issues", return_value=[]),
+                patch("brimstone.cli._list_open_issues_by_label", return_value=[]),
             ):
                 runner = CliRunner()
                 result = runner.invoke(
@@ -391,7 +391,7 @@ class TestRunScopeStage:
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
                 patch("brimstone.cli._doc_exists_on_default_branch", return_value=True),
                 patch(
-                    "brimstone.cli._list_open_impl_issues",
+                    "brimstone.cli._list_open_issues_by_label",
                     return_value=[{"number": 1}, {"number": 2}],
                 ),
                 patch("brimstone.cli.startup_sequence", return_value=(object(), object())),

@@ -45,6 +45,7 @@ _BASE_PATCHES = {
     "build_env": "brimstone.cli.build_subprocess_env",
     "skill_tmp": "brimstone.cli.write_skill_tmp",
     "classify": "brimstone.cli._classify_blocking_issues",
+    "dep_checks": "brimstone.cli._startup_dep_checks",
 }
 
 
@@ -66,9 +67,9 @@ class TestResearchWorkerHappyPath:
 
         call_count = [0]
 
-        def open_issues(repo: str, milestone: str) -> list:
+        def open_issues(repo: str, milestone: str, label: str) -> list:
             call_count[0] += 1
-            return [issue] if call_count[0] == 1 else []
+            return [issue] if call_count[0] <= 2 else []
 
         with (
             patch(_BASE_PATCHES["milestone_exists"], return_value=True),
@@ -82,7 +83,7 @@ class TestResearchWorkerHappyPath:
             patch(_BASE_PATCHES["runner"], return_value=fake_run_result()),
             patch(_BASE_PATCHES["build_env"], return_value={}),
             patch(_BASE_PATCHES["skill_tmp"], side_effect=_skill_mock(tmp_path)),
-            patch("brimstone.cli._list_open_research_issues", side_effect=open_issues),
+            patch("brimstone.cli._list_open_issues_by_label", side_effect=open_issues),
             patch(_BASE_PATCHES["classify"], return_value=([issue], [])),
         ):
             _run_research_worker(
@@ -106,9 +107,9 @@ class TestResearchWorkerHappyPath:
 
         call_count = [0]
 
-        def open_issues(repo: str, milestone: str) -> list:
+        def open_issues(repo: str, milestone: str, label: str) -> list:
             call_count[0] += 1
-            return [issue] if call_count[0] == 1 else []
+            return [issue] if call_count[0] <= 2 else []
 
         with (
             patch(_BASE_PATCHES["milestone_exists"], return_value=True),
@@ -122,7 +123,7 @@ class TestResearchWorkerHappyPath:
             patch(_BASE_PATCHES["runner"], return_value=fake_run_result()),
             patch(_BASE_PATCHES["build_env"], return_value={}),
             patch(_BASE_PATCHES["skill_tmp"], side_effect=_skill_mock(tmp_path)),
-            patch("brimstone.cli._list_open_research_issues", side_effect=open_issues),
+            patch("brimstone.cli._list_open_issues_by_label", side_effect=open_issues),
             patch(_BASE_PATCHES["classify"], return_value=([issue], [])),
         ):
             _run_research_worker(
@@ -158,9 +159,9 @@ class TestResearchWorkerHappyPath:
 
         call_count = [0]
 
-        def open_issues(repo: str, milestone: str) -> list:
+        def open_issues(repo: str, milestone: str, label: str) -> list:
             call_count[0] += 1
-            return [issue] if call_count[0] == 1 else []
+            return [issue] if call_count[0] <= 2 else []
 
         with (
             patch(_BASE_PATCHES["milestone_exists"], return_value=True),
@@ -174,7 +175,7 @@ class TestResearchWorkerHappyPath:
             patch(_BASE_PATCHES["runner"], side_effect=fake_run),
             patch(_BASE_PATCHES["build_env"], return_value={}),
             patch(_BASE_PATCHES["skill_tmp"], side_effect=_skill_mock(tmp_path)),
-            patch("brimstone.cli._list_open_research_issues", side_effect=open_issues),
+            patch("brimstone.cli._list_open_issues_by_label", side_effect=open_issues),
             patch(_BASE_PATCHES["classify"], return_value=([issue], [])),
         ):
             _run_research_worker(
@@ -203,7 +204,7 @@ class TestResearchWorkerHappyPath:
             patch(_BASE_PATCHES["milestone_exists"], return_value=True),
             patch(_BASE_PATCHES["default_branch"], return_value="mainline"),
             patch(_BASE_PATCHES["in_progress"], return_value=[]),
-            patch("brimstone.cli._list_open_research_issues", return_value=[]),
+            patch("brimstone.cli._list_open_issues_by_label", return_value=[]),
             patch("brimstone.cli._run_completion_gate", side_effect=fake_gate),
         ):
             _run_research_worker(
@@ -238,7 +239,7 @@ class TestResearchWorkerHappyPath:
             patch(_BASE_PATCHES["milestone_exists"], return_value=True),
             patch(_BASE_PATCHES["default_branch"], return_value="mainline"),
             patch(_BASE_PATCHES["in_progress"], return_value=[]),
-            patch("brimstone.cli._list_open_research_issues", return_value=[issue]),
+            patch("brimstone.cli._list_open_issues_by_label", return_value=[issue]),
             # All issues non-blocking
             patch(_BASE_PATCHES["classify"], return_value=([], [issue])),
             patch("brimstone.cli._run_completion_gate", side_effect=fake_gate),
@@ -265,11 +266,11 @@ class TestResearchWorkerErrorHandling:
 
         call_count = [0]
 
-        def open_issues(repo: str, milestone: str) -> list:
+        def open_issues(repo: str, milestone: str, label: str) -> list:
             call_count[0] += 1
             # After the error path, unclaim means issue is open again but
             # we return [] on second call to let the loop exit via gate.
-            return [issue] if call_count[0] == 1 else []
+            return [issue] if call_count[0] <= 2 else []
 
         with (
             patch(_BASE_PATCHES["milestone_exists"], return_value=True),
@@ -283,7 +284,7 @@ class TestResearchWorkerErrorHandling:
             patch(_BASE_PATCHES["runner"], return_value=fake_run_result(is_error=True)),
             patch(_BASE_PATCHES["build_env"], return_value={}),
             patch(_BASE_PATCHES["skill_tmp"], side_effect=_skill_mock(tmp_path)),
-            patch("brimstone.cli._list_open_research_issues", side_effect=open_issues),
+            patch("brimstone.cli._list_open_issues_by_label", side_effect=open_issues),
             patch(_BASE_PATCHES["classify"], return_value=([issue], [])),
             patch("brimstone.cli._gh"),  # suppress remote branch delete call
         ):
@@ -312,9 +313,9 @@ class TestResearchWorkerErrorHandling:
 
         call_count = [0]
 
-        def open_issues(repo: str, milestone: str) -> list:
+        def open_issues(repo: str, milestone: str, label: str) -> list:
             call_count[0] += 1
-            return [issue] if call_count[0] == 1 else []
+            return [issue] if call_count[0] <= 2 else []
 
         with (
             patch(_BASE_PATCHES["milestone_exists"], return_value=True),
@@ -328,7 +329,7 @@ class TestResearchWorkerErrorHandling:
             patch(_BASE_PATCHES["runner"], return_value=fake_run_result(is_error=True)),
             patch(_BASE_PATCHES["build_env"], return_value={}),
             patch(_BASE_PATCHES["skill_tmp"], side_effect=_skill_mock(tmp_path)),
-            patch("brimstone.cli._list_open_research_issues", side_effect=open_issues),
+            patch("brimstone.cli._list_open_issues_by_label", side_effect=open_issues),
             patch(_BASE_PATCHES["classify"], return_value=([issue], [])),
             patch("brimstone.cli._gh"),
         ):
@@ -364,7 +365,7 @@ class TestResearchWorkerErrorHandling:
             patch(_BASE_PATCHES["find_pr"], return_value=None),
             # _pr_merged_for_issue returns False → no merged PR → unclaim
             patch(_BASE_PATCHES["merged_pr"], return_value=False),
-            patch("brimstone.cli._list_open_research_issues", return_value=[]),
+            patch("brimstone.cli._list_open_issues_by_label", return_value=[]),
             patch("brimstone.cli._run_completion_gate"),
         ):
             _run_research_worker(
@@ -411,9 +412,9 @@ class TestResearchWorkerParallelDispatch:
 
         call_count = [0]
 
-        def open_issues(repo: str, milestone: str) -> list:
+        def open_issues(repo: str, milestone: str, label: str) -> list:
             call_count[0] += 1
-            return [issue_a, issue_b, issue_c] if call_count[0] == 1 else []
+            return [issue_a, issue_b, issue_c] if call_count[0] <= 2 else []
 
         with (
             patch(_BASE_PATCHES["milestone_exists"], return_value=True),
@@ -427,7 +428,7 @@ class TestResearchWorkerParallelDispatch:
             patch(_BASE_PATCHES["runner"], side_effect=controlled_run),
             patch(_BASE_PATCHES["build_env"], return_value={}),
             patch(_BASE_PATCHES["skill_tmp"], side_effect=_skill_mock(tmp_path)),
-            patch("brimstone.cli._list_open_research_issues", side_effect=open_issues),
+            patch("brimstone.cli._list_open_issues_by_label", side_effect=open_issues),
             patch(_BASE_PATCHES["classify"], return_value=([issue_a, issue_b, issue_c], [])),
             patch("brimstone.cli._gh"),  # suppress branch-delete and pipeline gh calls
             patch("brimstone.cli._run_completion_gate"),

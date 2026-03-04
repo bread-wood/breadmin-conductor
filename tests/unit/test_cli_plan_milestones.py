@@ -10,7 +10,7 @@ Tests cover:
 - _seed_spec: spec does not exist → file is copied and committed
 - brimstone init: --repo and --spec are required
 - brimstone init: version inferred from spec filename stem
-- brimstone init: calls _upload_spec_to_repo and _run_plan_milestones
+- brimstone init: calls _upload_spec_to_repo and _run_plan
 """
 
 from __future__ import annotations
@@ -225,7 +225,7 @@ class TestRunPlanCommand:
             patch("brimstone.cli.load_config") as mock_load_config,
             patch("brimstone.cli.startup_sequence") as mock_startup,
             patch("brimstone.cli._upload_spec_to_repo"),
-            patch("brimstone.cli._run_plan_milestones") as mock_run,
+            patch("brimstone.cli._run_plan") as mock_run,
             patch("brimstone.cli._resolve_repo", return_value="owner/repo"),
             patch("brimstone.cli._milestone_exists", return_value=True),
             patch("brimstone.cli._get_default_branch_for_repo", return_value="mainline"),
@@ -255,7 +255,7 @@ class TestRunPlanCommand:
         assert run_call_kwargs["version"] == "calculator"
 
     def test_plan_milestones_called_with_correct_version(self, tmp_path: Path) -> None:
-        """_run_plan_milestones is called with the milestone as version."""
+        """_run_plan is called with the milestone as version."""
         spec_file = tmp_path / "mvp.md"
         spec_file.write_text("# MVP")
 
@@ -269,7 +269,7 @@ class TestRunPlanCommand:
             patch("brimstone.cli.load_config") as mock_load_config,
             patch("brimstone.cli.startup_sequence") as mock_startup,
             patch("brimstone.cli._upload_spec_to_repo"),
-            patch("brimstone.cli._run_plan_milestones", side_effect=fake_plan),
+            patch("brimstone.cli._run_plan", side_effect=fake_plan),
             patch("brimstone.cli._resolve_repo", return_value="owner/repo"),
             patch("brimstone.cli._milestone_exists", return_value=True),
             patch("brimstone.cli._get_default_branch_for_repo", return_value="mainline"),
@@ -313,7 +313,7 @@ class TestRunPlanCommand:
                 "brimstone.cli._upload_spec_to_repo",
                 side_effect=lambda *a, **kw: upload_called.append(True),
             ),
-            patch("brimstone.cli._run_plan_milestones"),
+            patch("brimstone.cli._run_plan"),
             patch("brimstone.cli._resolve_repo", return_value="owner/repo"),
             patch("brimstone.cli._milestone_exists", return_value=True),
             patch("brimstone.cli._get_default_branch_for_repo", return_value="mainline"),

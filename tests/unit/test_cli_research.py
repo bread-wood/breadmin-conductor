@@ -17,10 +17,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from brimstone.cli import (
+    RESEARCH_LABEL,
     UsageGovernor,
     _classify_blocking_issues,
     _filter_unblocked,
-    _list_open_research_issues,
+    _list_open_issues_by_label,
     _parse_dependencies,
     _run_completion_gate,
     _run_research_worker,
@@ -249,7 +250,7 @@ class TestSortIssues:
 
 
 # ---------------------------------------------------------------------------
-# _list_open_research_issues
+# _list_open_issues_by_label (research)
 # ---------------------------------------------------------------------------
 
 
@@ -277,7 +278,7 @@ class TestListOpenResearchIssues:
         gh_output = json.dumps(issues)
 
         with patch("brimstone.cli.subprocess.run", return_value=make_gh_result(stdout=gh_output)):
-            result = _list_open_research_issues("owner/repo", "MVP Research")
+            result = _list_open_issues_by_label("owner/repo", "MVP Research", RESEARCH_LABEL)
 
         assert len(result) == 1
         assert result[0]["number"] == 1
@@ -305,19 +306,19 @@ class TestListOpenResearchIssues:
         gh_output = json.dumps(issues)
 
         with patch("brimstone.cli.subprocess.run", return_value=make_gh_result(stdout=gh_output)):
-            result = _list_open_research_issues("owner/repo", "MVP Research")
+            result = _list_open_issues_by_label("owner/repo", "MVP Research", RESEARCH_LABEL)
 
         assert len(result) == 1
         assert result[0]["number"] == 4
 
     def test_returns_empty_on_gh_failure(self) -> None:
         with patch("brimstone.cli.subprocess.run", return_value=make_gh_result(returncode=1)):
-            result = _list_open_research_issues("owner/repo", "MVP Research")
+            result = _list_open_issues_by_label("owner/repo", "MVP Research", RESEARCH_LABEL)
         assert result == []
 
     def test_returns_empty_on_invalid_json(self) -> None:
         with patch("brimstone.cli.subprocess.run", return_value=make_gh_result(stdout="not json")):
-            result = _list_open_research_issues("owner/repo", "MVP Research")
+            result = _list_open_issues_by_label("owner/repo", "MVP Research", RESEARCH_LABEL)
         assert result == []
 
 
@@ -523,7 +524,7 @@ class TestRunResearchWorkerCompletionGate:
         checkpoint = make_checkpoint()
 
         with (
-            patch("brimstone.cli._list_open_research_issues", return_value=[]),
+            patch("brimstone.cli._list_open_issues_by_label", return_value=[]),
             patch("brimstone.cli._run_completion_gate") as mock_gate,
             patch("brimstone.cli.logger.log_conductor_event"),
             patch("brimstone.cli.session.save"),
@@ -547,7 +548,7 @@ class TestRunResearchWorkerCompletionGate:
         open_issues = [make_issue(10, body="Non-blocking research")]
 
         with (
-            patch("brimstone.cli._list_open_research_issues", return_value=open_issues),
+            patch("brimstone.cli._list_open_issues_by_label", return_value=open_issues),
             patch("brimstone.cli._classify_blocking_issues", return_value=([], open_issues)),
             patch("brimstone.cli._run_completion_gate") as mock_gate,
             patch("brimstone.cli.logger.log_conductor_event"),
@@ -588,10 +589,10 @@ class TestRunResearchWorkerIssueSelection:
 
         calls = {"count": 0}
 
-        def open_issues_side_effect(repo, milestone):
+        def open_issues_side_effect(repo, milestone, label):
             # First call: return open issue; second call (after dispatch): return empty
             calls["count"] += 1
-            if calls["count"] == 1:
+            if calls["count"] <= 2:
                 return [blocking_issue]
             return []
 
@@ -601,7 +602,7 @@ class TestRunResearchWorkerIssueSelection:
             return ([], [])
 
         with (
-            patch("brimstone.cli._list_open_research_issues", side_effect=open_issues_side_effect),
+            patch("brimstone.cli._list_open_issues_by_label", side_effect=open_issues_side_effect),
             patch("brimstone.cli._classify_blocking_issues", side_effect=classify_side_effect),
             patch("brimstone.cli._filter_unblocked", return_value=[blocking_issue]),
             patch("brimstone.cli._sort_issues", return_value=[blocking_issue]),
@@ -634,9 +635,9 @@ class TestRunResearchWorkerIssueSelection:
 
         calls = {"count": 0}
 
-        def open_issues_side_effect(repo, milestone):
+        def open_issues_side_effect(repo, milestone, label):
             calls["count"] += 1
-            if calls["count"] == 1:
+            if calls["count"] <= 2:
                 return [blocking_issue]
             return []
 
@@ -646,7 +647,7 @@ class TestRunResearchWorkerIssueSelection:
             return ([], [])
 
         with (
-            patch("brimstone.cli._list_open_research_issues", side_effect=open_issues_side_effect),
+            patch("brimstone.cli._list_open_issues_by_label", side_effect=open_issues_side_effect),
             patch("brimstone.cli._classify_blocking_issues", side_effect=classify_side_effect),
             patch("brimstone.cli._filter_unblocked", return_value=[blocking_issue]),
             patch("brimstone.cli._sort_issues", return_value=[blocking_issue]),
@@ -694,7 +695,7 @@ class TestRunResearchWorkerRateLimit:
 
         calls = {"count": 0}
 
-        def open_issues_side_effect(repo, milestone):
+        def open_issues_side_effect(repo, milestone, label):
             calls["count"] += 1
             if calls["count"] <= 2:
                 return [blocking_issue]
@@ -709,7 +710,7 @@ class TestRunResearchWorkerRateLimit:
             return ([], [])
 
         with (
-            patch("brimstone.cli._list_open_research_issues", side_effect=open_issues_side_effect),
+            patch("brimstone.cli._list_open_issues_by_label", side_effect=open_issues_side_effect),
             patch("brimstone.cli._classify_blocking_issues", side_effect=classify_side_effect),
             patch("brimstone.cli._filter_unblocked", return_value=[blocking_issue]),
             patch("brimstone.cli._sort_issues", return_value=[blocking_issue]),
@@ -749,7 +750,7 @@ class TestRunResearchWorkerRateLimit:
 
         calls = {"count": 0}
 
-        def open_issues_side_effect(repo, milestone):
+        def open_issues_side_effect(repo, milestone, label):
             calls["count"] += 1
             # Return issue twice so we can observe one rate-limit cycle, then stop
             if calls["count"] <= 2:
@@ -765,7 +766,7 @@ class TestRunResearchWorkerRateLimit:
             return ([], [])
 
         with (
-            patch("brimstone.cli._list_open_research_issues", side_effect=open_issues_side_effect),
+            patch("brimstone.cli._list_open_issues_by_label", side_effect=open_issues_side_effect),
             patch("brimstone.cli._classify_blocking_issues", side_effect=classify_side_effect),
             patch("brimstone.cli._filter_unblocked", return_value=[blocking_issue]),
             patch("brimstone.cli._sort_issues", return_value=[blocking_issue]),
@@ -807,7 +808,7 @@ class TestRunResearchWorkerRateLimit:
 
         calls = {"count": 0}
 
-        def open_issues_side_effect(repo, milestone):
+        def open_issues_side_effect(repo, milestone, label):
             calls["count"] += 1
             if calls["count"] <= 2:
                 return [blocking_issue]
@@ -822,7 +823,7 @@ class TestRunResearchWorkerRateLimit:
             return ([], [])
 
         with (
-            patch("brimstone.cli._list_open_research_issues", side_effect=open_issues_side_effect),
+            patch("brimstone.cli._list_open_issues_by_label", side_effect=open_issues_side_effect),
             patch("brimstone.cli._classify_blocking_issues", side_effect=classify_side_effect),
             patch("brimstone.cli._filter_unblocked", return_value=[blocking_issue]),
             patch("brimstone.cli._sort_issues", return_value=[blocking_issue]),
@@ -867,7 +868,7 @@ class TestRunResearchWorkerErrorHandling:
 
         dispatch_calls = {"count": 0}
 
-        def open_issues_side_effect(repo, milestone):
+        def open_issues_side_effect(repo, milestone, label):
             # Return the issue enough times to exhaust retries, then stop
             dispatch_calls["count"] += 1
             if dispatch_calls["count"] <= 4:
@@ -888,7 +889,7 @@ class TestRunResearchWorkerErrorHandling:
             logged_events.append(kwargs.get("event_type", ""))
 
         with (
-            patch("brimstone.cli._list_open_research_issues", side_effect=open_issues_side_effect),
+            patch("brimstone.cli._list_open_issues_by_label", side_effect=open_issues_side_effect),
             patch("brimstone.cli._classify_blocking_issues", side_effect=classify_side_effect),
             patch("brimstone.cli._filter_unblocked", return_value=[blocking_issue]),
             patch("brimstone.cli._sort_issues", return_value=[blocking_issue]),
@@ -924,7 +925,7 @@ class TestRunResearchWorkerErrorHandling:
 
         calls = {"count": 0}
 
-        def open_issues_side_effect(repo, milestone):
+        def open_issues_side_effect(repo, milestone, label):
             calls["count"] += 1
             if calls["count"] <= 2:
                 return [blocking_issue]
@@ -939,7 +940,7 @@ class TestRunResearchWorkerErrorHandling:
             return ([], [])
 
         with (
-            patch("brimstone.cli._list_open_research_issues", side_effect=open_issues_side_effect),
+            patch("brimstone.cli._list_open_issues_by_label", side_effect=open_issues_side_effect),
             patch("brimstone.cli._classify_blocking_issues", side_effect=classify_side_effect),
             patch("brimstone.cli._filter_unblocked", return_value=[blocking_issue]),
             patch("brimstone.cli._sort_issues", return_value=[blocking_issue]),
@@ -978,7 +979,7 @@ class TestRunResearchWorkerDryRun:
         blocking_issue = make_issue(1, body="[BLOCKS_IMPL]")
 
         with (
-            patch("brimstone.cli._list_open_research_issues", return_value=[blocking_issue]),
+            patch("brimstone.cli._list_open_issues_by_label", return_value=[blocking_issue]),
             patch("brimstone.cli._classify_blocking_issues", return_value=([blocking_issue], [])),
             patch("brimstone.cli._filter_unblocked", return_value=[blocking_issue]),
             patch("brimstone.cli._sort_issues", return_value=[blocking_issue]),
@@ -1008,7 +1009,7 @@ class TestRunResearchWorkerDryRun:
         blocking_issue = make_issue(1, body="[BLOCKS_IMPL]")
 
         with (
-            patch("brimstone.cli._list_open_research_issues", return_value=[blocking_issue]),
+            patch("brimstone.cli._list_open_issues_by_label", return_value=[blocking_issue]),
             patch("brimstone.cli._classify_blocking_issues", return_value=([blocking_issue], [])),
             patch("brimstone.cli._filter_unblocked", return_value=[blocking_issue]),
             patch("brimstone.cli._sort_issues", return_value=[blocking_issue]),
@@ -1061,7 +1062,7 @@ class TestResumeUnclaim:
                 side_effect=lambda repo, num: unclaim_calls.append(num),
             ),
             # After resume, return no open issues so the main loop exits
-            patch("brimstone.cli._list_open_research_issues", return_value=[]),
+            patch("brimstone.cli._list_open_issues_by_label", return_value=[]),
             patch("brimstone.cli._run_completion_gate"),
             patch("brimstone.cli.logger.log_conductor_event"),
             patch("brimstone.cli.session.save"),
@@ -1102,7 +1103,7 @@ class TestResumeUnclaim:
                 side_effect=lambda **kw: monitor_calls.append(kw.get("pr_number")),
             ),
             # After unclaim, no open issues remain so the main loop exits
-            patch("brimstone.cli._list_open_research_issues", return_value=[]),
+            patch("brimstone.cli._list_open_issues_by_label", return_value=[]),
             patch("brimstone.cli._run_completion_gate"),
             patch("brimstone.cli.logger.log_conductor_event"),
             patch("brimstone.cli.session.save"),
@@ -1151,7 +1152,7 @@ class TestResumeUnclaim:
                 "brimstone.cli._unclaim_issue",
                 side_effect=lambda repo, num: unclaim_calls.append(num),
             ),
-            patch("brimstone.cli._list_open_research_issues", return_value=[]),
+            patch("brimstone.cli._list_open_issues_by_label", return_value=[]),
             patch("brimstone.cli._run_completion_gate"),
             patch("brimstone.cli.logger.log_conductor_event"),
             patch("brimstone.cli.session.save"),

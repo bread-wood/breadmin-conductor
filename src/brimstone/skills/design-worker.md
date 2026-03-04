@@ -164,14 +164,6 @@ Print a summary:
 - Any research gaps that prevented full design coverage (note inline; do not file new issues)
 - **Verdict**: "Ready for plan-issues — HLD and N LLD docs merged."
 
-File the next pipeline stage issue:
-```bash
-gh issue create \
-  --title "Run plan-issues for <research-milestone>" \
-  --label "pipeline" \
-  --milestone "<research-milestone>"
-```
-
 ## Constraints
 
 - **No code** — design-worker creates design documents only, never touches source files

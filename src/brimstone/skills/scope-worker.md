@@ -201,4 +201,3 @@ Print a full summary to stdout:
 - **`--dry-run` prints, does not create** — if `--dry-run` is set, print all planned issues
   to stdout and stop without calling `gh issue create`
 - **Verify no circular deps** before finalizing the issue set
-- **File the pipeline tracking issue** `Run impl-worker for <impl-milestone>` when done

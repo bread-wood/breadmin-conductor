@@ -148,27 +148,6 @@ def startup_sequence(
 # ---------------------------------------------------------------------------
 
 
-def inject_skill(skill_name: str, base_prompt: str) -> str:
-    """Read skills/<skill_name>.md, apply headless policy, and prepend to base_prompt.
-
-    Args:
-        skill_name:  Filename stem without extension (e.g. "research-worker").
-        base_prompt: Session-specific context assembled by the caller. Runtime
-                     values (repo, milestone, issue number, date) must already
-                     be substituted by the caller.
-
-    Returns:
-        Full prompt string ready to pass to runner.run() as the -p argument.
-
-    Raises:
-        FileNotFoundError: If skills/<skill_name>.md does not exist.
-    """
-    skill_path = Path(__file__).parent / "skills" / f"{skill_name}.md"
-    skill_text = skill_path.read_text(encoding="utf-8")
-    skill_text = _apply_headless_policy(skill_text)
-    return base_prompt + "\n\n---\n\n" + skill_text
-
-
 def write_skill_tmp(skill_name: str) -> Path:
     """Write skills/<skill_name>.md to a named temp file and return its path.
 
@@ -222,6 +201,56 @@ def _apply_headless_policy(text: str) -> str:
     for old, new in replacements:
         text = text.replace(old, new)
     return text
+
+
+def _run_agent(
+    prompt: str,
+    skill_name: str,
+    allowed_tools: list[str],
+    max_turns: int,
+    log_label: str,
+    prefix: str,
+    config: Config,
+    issue_number: int | None = None,
+) -> runner.RunResult:
+    """Run a single headless agent and log its transcript.
+
+    Handles skill file lifecycle, env construction, runner.run() invocation,
+    and transcript logging. The caller is responsible only for building the
+    prompt and interpreting the result.
+
+    Args:
+        issue_number: When provided, bakes the issue number into CLAUDE_CONFIG_DIR
+                      for a unique per-agent isolation path.
+    """
+    skill_tmp = write_skill_tmp(skill_name)
+    extra: dict[str, str] = {}
+    if issue_number is not None:
+        extra["CLAUDE_CONFIG_DIR"] = f"/tmp/brimstone-agent-{issue_number}-{uuid.uuid4().hex}"
+    env = build_subprocess_env(config, extra=extra if extra else None)
+    try:
+        result = runner.run(
+            prompt=prompt,
+            allowed_tools=allowed_tools,
+            append_system_prompt_file=skill_tmp,
+            env=env,
+            max_turns=max_turns,
+            timeout_seconds=config.agent_timeout_minutes * 60,
+            model=config.model,
+            prefix=prefix,
+            disallowed_tools=runner.TOOLS_DISALLOWED,
+            max_budget_usd=config.max_budget_usd,
+            fallback_model=runner.FALLBACK_MODEL,
+        )
+    finally:
+        skill_tmp.unlink(missing_ok=True)
+    logger.log_agent_transcript(
+        result.all_events,
+        log_label,
+        session_id=(result.raw_result_event or {}).get("session_id"),
+        log_dir=config.log_dir.expanduser(),
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -563,21 +592,10 @@ def _gh(
     return subprocess.run(cmd, capture_output=True, text=True, check=check)
 
 
-def _list_open_research_issues(repo: str, milestone: str) -> list[dict[str, Any]]:
-    """Return open, unassigned, non-in-progress research issues for *milestone*.
+def _list_in_progress_issues(repo: str, milestone: str, label: str) -> list[dict[str, Any]]:
+    """Return open issues with in-progress label for *milestone* scoped to *label*.
 
-    Calls ``gh issue list`` with JSON output and filters client-side:
-    - label contains ``research``
-    - milestone matches *milestone*
-    - no assignee
-    - label does NOT contain ``in-progress``
-
-    Args:
-        repo:      GitHub repository in ``owner/repo`` format.
-        milestone: Milestone name to scope the query.
-
-    Returns:
-        List of issue dicts with keys: number, title, body, labels, assignees.
+    Used at worker startup to resume monitoring PRs from a previous run.
     """
     result = _gh(
         [
@@ -586,53 +604,13 @@ def _list_open_research_issues(repo: str, milestone: str) -> list[dict[str, Any]
             "--state",
             "open",
             "--label",
-            RESEARCH_LABEL,
+            f"{label},in-progress",
             "--milestone",
             milestone,
             "--json",
-            "number,title,body,labels,assignees,milestone",
+            "number,title",
             "--limit",
-            "200",
-        ],
-        repo=repo,
-        check=False,
-    )
-    if result.returncode != 0:
-        return []
-
-    try:
-        issues: list[dict] = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return []
-
-    # Filter out assigned or in-progress issues
-    filtered = []
-    for issue in issues:
-        # Skip if anyone is assigned
-        if issue.get("assignees"):
-            continue
-        # Skip if in-progress label present
-        label_names = [lb.get("name", "") for lb in issue.get("labels", [])]
-        if "in-progress" in label_names:
-            continue
-        filtered.append(issue)
-
-    return filtered
-
-
-def _list_in_progress_issues(repo: str, milestone: str, label: str) -> list[dict[str, Any]]:
-    """Return open issues with in-progress label for *milestone* scoped to *label*.
-
-    Used at worker startup to resume monitoring PRs from a previous run.
-    """
-    result = _gh(
-        [
-            "issue", "list",
-            "--state", "open",
-            "--label", f"{label},in-progress",
-            "--milestone", milestone,
-            "--json", "number,title",
-            "--limit", "50",
+            "50",
         ],
         repo=repo,
         check=False,
@@ -652,6 +630,7 @@ def _resume_stale_issues(
     log_prefix: str,
     config: Config,
     checkpoint: Checkpoint,
+    default_branch: str = "main",
 ) -> None:
     """Resume or unclaim in-progress issues from a crashed previous session.
 
@@ -668,8 +647,7 @@ def _resume_stale_issues(
         if found is not None:
             pr_number, stale_branch = found
             click.echo(
-                f"{log_prefix} Resuming: monitoring PR #{pr_number}"
-                f" for issue #{stale_number}",
+                f"{log_prefix} Resuming: monitoring PR #{pr_number} for issue #{stale_number}",
                 err=True,
             )
             _monitor_pr(
@@ -679,19 +657,18 @@ def _resume_stale_issues(
                 config=config,
                 checkpoint=checkpoint,
                 issue_number=stale_number,
+                default_branch=default_branch,
             )
         elif _pr_merged_for_issue(repo, stale_number):
             _gh(["issue", "close", str(stale_number)], repo=repo, check=False)
             click.echo(
-                f"{log_prefix} Closed #{stale_number}"
-                " — merged PR found, issue was not auto-closed",
+                f"{log_prefix} Closed #{stale_number} — merged PR found, issue was not auto-closed",
                 err=True,
             )
         else:
             _unclaim_issue(repo, stale_number)
             click.echo(
-                f"{log_prefix} Unclaimed stale #{stale_number}"
-                " (no open or merged PR found)",
+                f"{log_prefix} Unclaimed stale #{stale_number} (no open or merged PR found)",
                 err=True,
             )
 
@@ -720,11 +697,8 @@ def _log_agent_cost(
     )
 
 
-def _count_all_open_research_issues(repo: str, milestone: str) -> int:
-    """Return the total count of open research issues for *milestone*, including in-progress.
-
-    Used by the design-worker Gate 1 check to verify all research is done.
-    """
+def _list_open_issues_by_label(repo: str, milestone: str, label: str) -> list[dict[str, Any]]:
+    """Return open, unassigned, non-in-progress issues for a given stage label."""
     result = _gh(
         [
             "issue",
@@ -732,71 +706,7 @@ def _count_all_open_research_issues(repo: str, milestone: str) -> int:
             "--state",
             "open",
             "--label",
-            RESEARCH_LABEL,
-            "--milestone",
-            milestone,
-            "--json",
-            "number",
-            "--limit",
-            "200",
-        ],
-        repo=repo,
-        check=False,
-    )
-    if result.returncode != 0:
-        return 0
-    try:
-        return len(json.loads(result.stdout))
-    except json.JSONDecodeError:
-        return 0
-
-
-def _count_all_open_design_issues(repo: str, milestone: str) -> int:
-    """Return the total count of open design issues for *milestone*, including in-progress."""
-    result = _gh(
-        [
-            "issue",
-            "list",
-            "--state",
-            "open",
-            "--label",
-            DESIGN_LABEL,
-            "--milestone",
-            milestone,
-            "--json",
-            "number",
-            "--limit",
-            "200",
-        ],
-        repo=repo,
-        check=False,
-    )
-    if result.returncode != 0:
-        return 0
-    try:
-        return len(json.loads(result.stdout))
-    except json.JSONDecodeError:
-        return 0
-
-
-def _list_open_design_issues(repo: str, milestone: str) -> list[dict[str, Any]]:
-    """Return open, unassigned, non-in-progress stage/design issues for *milestone*.
-
-    Args:
-        repo:      GitHub repository in ``owner/repo`` format.
-        milestone: Milestone name to scope the query.
-
-    Returns:
-        List of issue dicts with keys: number, title, body, labels, assignees.
-    """
-    result = _gh(
-        [
-            "issue",
-            "list",
-            "--state",
-            "open",
-            "--label",
-            DESIGN_LABEL,
+            label,
             "--milestone",
             milestone,
             "--json",
@@ -813,16 +723,40 @@ def _list_open_design_issues(repo: str, milestone: str) -> list[dict[str, Any]]:
         issues: list[dict] = json.loads(result.stdout)
     except json.JSONDecodeError:
         return []
+    return [
+        issue
+        for issue in issues
+        if not issue.get("assignees")
+        and "in-progress" not in {lb.get("name", "") for lb in issue.get("labels", [])}
+    ]
 
-    filtered = []
-    for issue in issues:
-        if issue.get("assignees"):
-            continue
-        label_names = [lb.get("name", "") for lb in issue.get("labels", [])]
-        if "in-progress" in label_names:
-            continue
-        filtered.append(issue)
-    return filtered
+
+def _count_open_issues_by_label(repo: str, milestone: str, label: str) -> int:
+    """Return count of all open issues (including in-progress) for a stage label."""
+    result = _gh(
+        [
+            "issue",
+            "list",
+            "--state",
+            "open",
+            "--label",
+            label,
+            "--milestone",
+            milestone,
+            "--json",
+            "number",
+            "--limit",
+            "200",
+        ],
+        repo=repo,
+        check=False,
+    )
+    if result.returncode != 0:
+        return 0
+    try:
+        return len(json.loads(result.stdout))
+    except json.JSONDecodeError:
+        return 0
 
 
 def _file_design_issue_if_missing(
@@ -942,20 +876,134 @@ def _filter_unblocked(
     return unblocked
 
 
-def _sort_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Sort issues by lowest number (simple stable ordering, highest-impact-first heuristic).
+_PRIORITY_ORDER: dict[str, int] = {"P0": 0, "P1": 1, "P2": 2, "P3": 3, "P4": 4}
 
-    In the absence of a full downstream-impact graph, issues are sorted by
-    number ascending (oldest first), which approximates the "highest impact first"
-    heuristic from the spec without requiring a graph traversal.
+
+def _issue_priority(issue: dict[str, Any]) -> int:
+    """Return numeric priority for *issue* based on its P0–P4 label (lower = higher priority).
+
+    Issues with no priority label sort after P4 (value 5).
+    """
+    for lb in issue.get("labels", []):
+        name = lb.get("name", "") if isinstance(lb, dict) else str(lb)
+        if name in _PRIORITY_ORDER:
+            return _PRIORITY_ORDER[name]
+    return 5
+
+
+def _sort_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Sort issues by priority label then issue number.
+
+    Primary key: P0 < P1 < P2 < P3 < P4 < unlabelled.
+    Tiebreaker: issue number ascending (oldest first).
 
     Args:
         issues: List of issue dicts with at least a ``number`` key.
 
     Returns:
-        Issues sorted by number ascending.
+        Issues sorted by (priority, number).
     """
-    return sorted(issues, key=lambda i: i.get("number", 0))
+    return sorted(issues, key=lambda i: (_issue_priority(i), i.get("number", 0)))
+
+
+def _detect_dependency_cycles(issues: list[dict[str, Any]]) -> list[list[int]]:
+    """Detect cycles in the dependency graph formed by open issues.
+
+    Only considers edges between issues that are in the provided list (i.e. open
+    in the current milestone). Dependencies on closed/external issues are ignored.
+
+    Args:
+        issues: List of open issue dicts with ``number`` and ``body`` fields.
+
+    Returns:
+        List of cycles, each cycle being a list of issue numbers forming the loop.
+        Empty list if no cycles exist.
+    """
+    open_numbers = {i["number"] for i in issues}
+    graph: dict[int, list[int]] = {}
+    for issue in issues:
+        num = issue["number"]
+        deps = [d for d in _parse_dependencies(issue.get("body") or "") if d in open_numbers]
+        graph[num] = deps
+
+    # Iterative DFS cycle detection
+    cycles: list[list[int]] = []
+    visited: set[int] = set()
+    rec_stack: set[int] = set()
+    path: list[int] = []
+
+    def dfs(node: int) -> bool:
+        visited.add(node)
+        rec_stack.add(node)
+        path.append(node)
+        for neighbour in graph.get(node, []):
+            if neighbour not in visited:
+                if dfs(neighbour):
+                    return True
+            elif neighbour in rec_stack:
+                # Found a cycle — extract the loop portion of the path
+                cycle_start = path.index(neighbour)
+                cycles.append(path[cycle_start:] + [neighbour])
+                return True
+        path.pop()
+        rec_stack.discard(node)
+        return False
+
+    for node in list(graph):
+        if node not in visited:
+            dfs(node)
+
+    return cycles
+
+
+def _validate_dependency_refs(issues: list[dict[str, Any]], repo: str) -> None:
+    """Warn about ``Depends on: #N`` references that don't exist on GitHub.
+
+    Makes one API call per unresolved dependency (only called for deps absent
+    from the current open-issue set, so this is rare in practice).
+
+    Args:
+        issues: List of open issue dicts (current milestone).
+        repo:   Repository in ``owner/repo`` format.
+    """
+    open_numbers = {i["number"] for i in issues}
+    all_referenced: set[int] = set()
+    for issue in issues:
+        all_referenced.update(_parse_dependencies(issue.get("body") or ""))
+
+    unknown = all_referenced - open_numbers
+    for dep in sorted(unknown):
+        result = _gh(["issue", "view", str(dep), "--json", "number"], repo=repo, check=False)
+        if result.returncode != 0:
+            click.echo(
+                f"[dep-check] Warning: issue #{dep} referenced as a dependency does not "
+                f"exist on GitHub. The depending issue will be treated as unblocked.",
+                err=True,
+            )
+
+
+def _startup_dep_checks(open_issues: list[dict[str, Any]], repo: str) -> None:
+    """Run dependency validation and cycle detection at worker startup.
+
+    Emits warnings for missing dependency references and errors out on cycles.
+    Called once per worker run (not per fill cycle) since issue bodies don't change.
+
+    Args:
+        open_issues: All currently open issues for the milestone.
+        repo:        Repository in ``owner/repo`` format.
+    """
+    _validate_dependency_refs(open_issues, repo)
+    cycles = _detect_dependency_cycles(open_issues)
+    if cycles:
+        for cycle in cycles:
+            nums = " → ".join(f"#{n}" for n in cycle)
+            click.echo(f"[dep-check] Error: dependency cycle detected: {nums}", err=True)
+        click.echo(
+            "[dep-check] Resolve the cycle(s) above before dispatching. "
+            "Break a cycle by adding [DEFERRED] to one issue's body or closing it.",
+            err=True,
+        )
+        raise SystemExit(1)
 
 
 def _claim_issue(repo: str, issue_number: int) -> None:
@@ -1021,7 +1069,6 @@ def _delete_remote_branch(repo: str, branch: str) -> None:
     )
 
 
-
 def _milestone_exists(repo: str, title: str) -> bool:
     """Return True if a milestone with *title* exists in *repo* (open or closed)."""
     result = _gh(
@@ -1032,7 +1079,6 @@ def _milestone_exists(repo: str, title: str) -> bool:
         return False
     titles = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     return title in titles
-
 
 
 # ---------------------------------------------------------------------------
@@ -1165,6 +1211,10 @@ def _dispatch_research_agent(
     today = date.today().isoformat()
 
     base_prompt = (
+        f"## Headless Autonomous Mode\n"
+        f"You are running in a fully automated headless pipeline. No human is present.\n"
+        f"- Use tools directly and silently. Do NOT produce conversational text between calls.\n"
+        f"- Do NOT explain what you are about to do. Do NOT narrate your reasoning.\n"
         f"## MANDATORY: Working Directory\n"
         f"You are working in an isolated git worktree. Your FIRST action must be:\n"
         f"```\n"
@@ -1214,41 +1264,17 @@ def _dispatch_research_agent(
         f"Execute them immediately — do not say 'ready to push' or ask for approval.\n\n"
         f"**After the PR URL is confirmed:** output exactly one line: `Done.`\n"
         f"Do NOT summarize findings, restate conclusions, or add any other text.\n"
-        f"The research document is the deliverable — not your terminal output.\n\n"
-        f"**Prohibited:** Do NOT use the TodoWrite tool at any point."
+        f"The research document is the deliverable — not your terminal output."
     )
-    skill_tmp = write_skill_tmp("research-worker")
-
-    env = build_subprocess_env(config)
-    env["CLAUDE_CONFIG_DIR"] = f"/tmp/brimstone-agent-{issue_number}-{uuid.uuid4().hex}"
-
-    try:
-        result = runner.run(
-            prompt=base_prompt,
-            allowed_tools=[
-                "Bash",
-                "Read",
-                "Edit",
-                "Write",
-                "Glob",
-                "Grep",
-                "WebSearch",
-                "WebFetch",
-            ],
-            append_system_prompt_file=skill_tmp,
-            env=env,
-            max_turns=100,
-            timeout_seconds=config.agent_timeout_minutes * 60,
-            model=config.model,
-            prefix=f"[research #{issue_number}] ",
-        )
-    finally:
-        skill_tmp.unlink(missing_ok=True)
-    logger.log_agent_transcript(
-        result.all_events,
+    result = _run_agent(
+        base_prompt,
+        "research-worker",
+        ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "WebSearch", "WebFetch"],
+        100,
         f"research-{issue_number}",
-        session_id=(result.raw_result_event or {}).get("session_id"),
-        log_dir=config.log_dir.expanduser(),
+        f"[research #{issue_number}] ",
+        config,
+        issue_number,
     )
     return issue, branch_name, worktree_path, result
 
@@ -1481,13 +1507,15 @@ def _run_research_worker(
             log_prefix="[research-worker]",
             config=config,
             checkpoint=checkpoint,
+            default_branch=default_branch,
         )
+        _startup_dep_checks(_list_open_issues_by_label(repo, milestone, RESEARCH_LABEL), repo)
 
     research_limits: dict[str, int] = {"pro": 2, "max": 3, "max20x": 5}
     pool_size = config.max_concurrency or research_limits.get(config.subscription_tier, 3)
 
     if dry_run:
-        open_issues = _list_open_research_issues(repo, milestone)
+        open_issues = _list_open_issues_by_label(repo, milestone, RESEARCH_LABEL)
         blocking, _ = _classify_blocking_issues(
             open_issues=open_issues,
             repo=repo,
@@ -1514,7 +1542,7 @@ def _run_research_worker(
     with concurrent.futures.ThreadPoolExecutor(max_workers=pool_size) as executor:
 
         def _fill(active: dict) -> None:
-            open_issues = _list_open_research_issues(repo, milestone)
+            open_issues = _list_open_issues_by_label(repo, milestone, RESEARCH_LABEL)
             if not open_issues:
                 return
             blocking, _ = _classify_blocking_issues(
@@ -1591,6 +1619,7 @@ def _run_research_worker(
                     config=config,
                     checkpoint=checkpoint,
                     issue_number=issue_number,
+                    default_branch=default_branch,
                 )
             else:
                 click.echo(
@@ -1600,7 +1629,7 @@ def _run_research_worker(
             _remove_worktree(worktree_path, repo_root)
 
         def _when_empty() -> bool:
-            open_issues = _list_open_research_issues(repo, milestone)
+            open_issues = _list_open_issues_by_label(repo, milestone, RESEARCH_LABEL)
             if not open_issues:
                 _run_completion_gate(
                     repo=repo,
@@ -1840,60 +1869,6 @@ def _extract_module(issue: dict[str, Any]) -> str:
     return "none"
 
 
-def _list_open_impl_issues(repo: str, milestone: str) -> list[dict[str, Any]]:
-    """Return open implementation issues for *milestone*.
-
-    Fetches all open issues in the milestone and filters client-side:
-    - Excludes issues with the ``research`` label
-    - Excludes issues with the ``pipeline`` label
-    - Excludes issues already assigned or labeled ``in-progress``
-
-    Args:
-        repo:      GitHub repository in ``owner/repo`` format.
-        milestone: Milestone name to scope the query (may be empty for all open impl issues).
-
-    Returns:
-        List of issue dicts with keys: number, title, body, labels, assignees.
-    """
-    cmd = [
-        "issue",
-        "list",
-        "--state",
-        "open",
-        "--json",
-        "number,title,body,labels,assignees,milestone",
-        "--limit",
-        "200",
-    ]
-    if milestone:
-        cmd += ["--milestone", milestone]
-
-    result = _gh(cmd, repo=repo, check=False)
-    if result.returncode != 0:
-        return []
-
-    try:
-        issues: list[dict] = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return []
-
-    # Filter out research, pipeline, and in-progress issues
-    filtered = []
-    for issue in issues:
-        label_names = [lb.get("name", "") for lb in issue.get("labels", [])]
-        # Skip research or pipeline issues
-        if "stage/research" in label_names or "pipeline" in label_names:
-            continue
-        # Skip assigned or in-progress issues
-        if issue.get("assignees"):
-            continue
-        if "in-progress" in label_names:
-            continue
-        filtered.append(issue)
-
-    return filtered
-
-
 def _find_pr_for_branch(repo: str, branch: str) -> int | None:
     """Find the open PR number for a given branch name.
 
@@ -2103,13 +2078,16 @@ def _is_conflict_failure(repo: str, pr_number: int) -> bool:
         return False
 
 
-def _rebase_branch(branch: str, repo: str, worktree_path: str) -> bool:
-    """Rebase a worktree branch onto origin/main.
+def _rebase_branch(
+    branch: str, repo: str, worktree_path: str, default_branch: str = "main"
+) -> bool:
+    """Rebase a worktree branch onto the remote default branch.
 
     Args:
-        branch:        Branch name being rebased.
-        repo:          Repository in ``owner/repo`` format (unused but kept for context).
-        worktree_path: Absolute path to the worktree directory.
+        branch:         Branch name being rebased.
+        repo:           Repository in ``owner/repo`` format (unused but kept for context).
+        worktree_path:  Absolute path to the worktree directory.
+        default_branch: Default branch name (e.g. ``"main"``, ``"mainline"``).
 
     Returns:
         True if the rebase succeeded, False if it failed or conflicted.
@@ -2126,7 +2104,7 @@ def _rebase_branch(branch: str, repo: str, worktree_path: str) -> bool:
 
     # Attempt rebase
     rebase = subprocess.run(
-        ["git", "rebase", "origin/main"],
+        ["git", "rebase", f"origin/{default_branch}"],
         cwd=worktree_path,
         capture_output=True,
         text=True,
@@ -2226,27 +2204,33 @@ def _monitor_pr(
     checkpoint: Checkpoint,
     issue_number: int,
     worktree_path: str = "",
+    default_branch: str = "main",
     max_polls: int = _CI_MAX_POLLS,
     poll_interval: int = _CI_POLL_INTERVAL,
 ) -> bool:
     """Monitor a PR's CI status and squash-merge it when CI passes.
 
-    Polls ``gh pr checks`` up to *max_polls* times. On conflict, attempts a
-    rebase up to ``_REBASE_RETRY_LIMIT`` times. On success, checks reviews and
-    squash-merges.
+    Polls ``gh pr checks`` up to *max_polls* times. Conflicts are detected at
+    the start of each poll (before CI status is checked) so that a rebase can
+    be attempted even while CI is still pending. On successful rebase, polling
+    resumes so CI can re-run on the rebased branch. Rebase is retried up to
+    ``_REBASE_RETRY_LIMIT`` times before escalating. On CI pass, checks reviews
+    and squash-merges.
 
     Args:
-        pr_number:     GitHub PR number.
-        branch:        Branch name for the PR.
-        repo:          Repository in ``owner/repo`` format.
-        config:        Config instance for logging.
-        checkpoint:    Checkpoint instance for logging.
-        issue_number:  Original issue number (for logging).
-        worktree_path: Absolute path to the worktree directory (for rebase).
-                       If empty, rebase on conflict is skipped and the PR is
-                       escalated to human review instead.
-        max_polls:     Maximum number of CI status polls before timeout.
-        poll_interval: Seconds to sleep between polls.
+        pr_number:      GitHub PR number.
+        branch:         Branch name for the PR.
+        repo:           Repository in ``owner/repo`` format.
+        config:         Config instance for logging.
+        checkpoint:     Checkpoint instance for logging.
+        issue_number:   Original issue number (for logging).
+        worktree_path:  Absolute path to the worktree directory (for rebase).
+                        If empty, rebase on conflict is skipped and the PR is
+                        escalated to human review instead.
+        default_branch: Default branch name used as the rebase target
+                        (e.g. ``"main"``, ``"mainline"``).
+        max_polls:      Maximum number of CI status polls before timeout.
+        poll_interval:  Seconds to sleep between polls.
 
     Returns:
         True if the PR was successfully merged. False otherwise.
@@ -2257,6 +2241,57 @@ def _monitor_pr(
 
     for poll_idx in range(max_polls):
         time.sleep(poll_interval)
+
+        # Detect merge conflicts at the start of every poll — this fires even
+        # while CI is still pending so we don't wait 30 min before rebasing.
+        if _is_conflict_failure(repo, pr_number):
+            if not worktree_path:
+                # No worktree available (e.g. research PRs) — can't rebase
+                logger.log_conductor_event(
+                    run_id=checkpoint.run_id,
+                    phase="ci_check",
+                    event_type="human_escalate",
+                    payload={
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "reason": "conflict detected but no worktree for rebase",
+                    },
+                    log_dir=config.log_dir.expanduser(),
+                )
+                return False
+
+            if rebase_attempts >= _REBASE_RETRY_LIMIT:
+                logger.log_conductor_event(
+                    run_id=checkpoint.run_id,
+                    phase="ci_check",
+                    event_type="human_escalate",
+                    payload={
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "reason": "rebase limit exceeded",
+                    },
+                    log_dir=config.log_dir.expanduser(),
+                )
+                return False
+
+            rebase_ok = _rebase_branch(branch, repo, worktree_path, default_branch)
+            rebase_attempts += 1
+            if not rebase_ok:
+                logger.log_conductor_event(
+                    run_id=checkpoint.run_id,
+                    phase="ci_check",
+                    event_type="human_escalate",
+                    payload={
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "reason": "rebase failed — conflicts outside agent scope",
+                    },
+                    log_dir=config.log_dir.expanduser(),
+                )
+                return False
+            # Rebase succeeded — continue polling so CI can re-run
+            continue
+
         ci_status = _get_pr_checks_status(repo, pr_number)
 
         logger.log_conductor_event(
@@ -2326,56 +2361,7 @@ def _monitor_pr(
                 return False
 
         elif ci_status == "fail":
-            # Check if it's a conflict
-            if _is_conflict_failure(repo, pr_number):
-                if not worktree_path:
-                    # No worktree available (e.g. research PRs) — can't rebase
-                    logger.log_conductor_event(
-                        run_id=checkpoint.run_id,
-                        phase="ci_check",
-                        event_type="human_escalate",
-                        payload={
-                            "pr_number": pr_number,
-                            "issue_number": issue_number,
-                            "reason": "conflict detected but no worktree for rebase",
-                        },
-                        log_dir=config.log_dir.expanduser(),
-                    )
-                    return False
-
-                if rebase_attempts >= _REBASE_RETRY_LIMIT:
-                    logger.log_conductor_event(
-                        run_id=checkpoint.run_id,
-                        phase="ci_check",
-                        event_type="human_escalate",
-                        payload={
-                            "pr_number": pr_number,
-                            "issue_number": issue_number,
-                            "reason": "rebase limit exceeded",
-                        },
-                        log_dir=config.log_dir.expanduser(),
-                    )
-                    return False
-
-                rebase_ok = _rebase_branch(branch, repo, worktree_path)
-                rebase_attempts += 1
-                if not rebase_ok:
-                    logger.log_conductor_event(
-                        run_id=checkpoint.run_id,
-                        phase="ci_check",
-                        event_type="human_escalate",
-                        payload={
-                            "pr_number": pr_number,
-                            "issue_number": issue_number,
-                            "reason": "rebase failed — conflicts outside agent scope",
-                        },
-                        log_dir=config.log_dir.expanduser(),
-                    )
-                    return False
-                # Rebase succeeded — continue polling
-                continue
-
-            # Non-conflict failure: escalate after MAX_RETRIES
+            # Non-conflict CI failure: escalate after MAX_RETRIES
             ci_fail_count += 1
             if ci_fail_count >= MAX_RETRIES:
                 logger.log_conductor_event(
@@ -2656,6 +2642,10 @@ def _dispatch_design_agent(
     if module_name:
         issue_body = issue.get("body") or ""
         prompt = (
+            f"## Headless Autonomous Mode\n"
+            f"You are running in a fully automated headless pipeline. No human is present.\n"
+            f"- Use tools directly and silently. No conversational text between calls.\n"
+            f"- Do NOT explain what you are about to do. Do NOT narrate your reasoning.\n"
             f"## MANDATORY: Working Directory\n"
             f"You are working in an isolated git worktree. Your FIRST action must be:\n"
             f"```bash\n"
@@ -2663,8 +2653,7 @@ def _dispatch_design_agent(
             f"```\n"
             f"ALL file reads, writes, and git operations must happen inside `{worktree_path}`.\n"
             f"The branch `{branch}` is already checked out there.\n"
-            f"Do NOT use the Agent tool. Do NOT spawn sub-agents."
-            f" Do NOT explore the repo broadly.\n"
+            f"Do NOT explore the repo broadly.\n"
             f"Do NOT run `git checkout` or `git rebase`.\n"
             f"Read ONLY the files specified in the skill instructions.\n\n"
             f"## Session Parameters\n"
@@ -2704,6 +2693,10 @@ def _dispatch_design_agent(
         prefix = f"[design-lld #{issue_number}] "
     else:
         prompt = (
+            f"## Headless Autonomous Mode\n"
+            f"You are running in a fully automated headless pipeline. No human is present.\n"
+            f"- Use tools directly and silently. No conversational text between calls.\n"
+            f"- Do NOT explain what you are about to do. Do NOT narrate your reasoning.\n"
             f"## MANDATORY: Working Directory\n"
             f"You are working in an isolated git worktree. Your FIRST action must be:\n"
             f"```bash\n"
@@ -2711,7 +2704,6 @@ def _dispatch_design_agent(
             f"```\n"
             f"ALL file reads, writes, and git operations must happen inside `{worktree_path}`.\n"
             f"The branch `{branch}` is already checked out there.\n"
-            f"Do NOT use the Agent tool. Do NOT spawn sub-agents.\n"
             f"Do NOT run `git checkout` or `git rebase`.\n\n"
             f"## Session Parameters\n"
             f"- Repository: {repo}\n"
@@ -2726,34 +2718,20 @@ def _dispatch_design_agent(
         )
         prefix = f"[design-hld #{issue_number}] "
 
-    skill_tmp = write_skill_tmp(skill_name)
-    env = build_subprocess_env(config)
-    env["CLAUDE_CONFIG_DIR"] = f"/tmp/brimstone-agent-{issue_number}-{uuid.uuid4().hex}"
-
-    try:
-        result = runner.run(
-            prompt=prompt,
-            allowed_tools=["Bash", "Read", "Edit", "Write", "Glob", "Grep"],
-            append_system_prompt_file=skill_tmp,
-            env=env,
-            max_turns=200,
-            timeout_seconds=config.agent_timeout_minutes * 60,
-            model=config.model,
-            prefix=prefix,
-        )
-    finally:
-        skill_tmp.unlink(missing_ok=True)
-
     label = (
-        f"design-hld-{issue.get('number', 0)}"
+        f"design-hld-{issue_number}"
         if module_name is None
-        else f"design-lld-{module_name}-{issue.get('number', 0)}"
+        else f"design-lld-{module_name}-{issue_number}"
     )
-    logger.log_agent_transcript(
-        result.all_events,
+    result = _run_agent(
+        prompt,
+        skill_name,
+        ["Bash", "Read", "Edit", "Write", "Glob", "Grep"],
+        200,
         label,
-        session_id=(result.raw_result_event or {}).get("session_id"),
-        log_dir=config.log_dir.expanduser(),
+        prefix,
+        config,
+        issue_number,
     )
     return issue, branch, worktree_path, result
 
@@ -2798,6 +2776,10 @@ def _dispatch_impl_agent(
 
     # Build the agent prompt
     base_prompt = (
+        f"## Headless Autonomous Mode\n"
+        f"You are running in a fully automated headless pipeline. No human is present.\n"
+        f"- Use tools directly and silently. Do NOT produce conversational text between calls.\n"
+        f"- Do NOT explain what you are about to do. Do NOT narrate your reasoning.\n"
         f"## Working directory\n"
         f"Your isolated worktree is already checked out at:\n"
         f"  {worktree_path}\n\n"
@@ -2805,6 +2787,11 @@ def _dispatch_impl_agent(
         f"  cd {worktree_path}\n\n"
         f"ALL file writes and git operations must happen inside that directory.\n"
         f"Do NOT write to /tmp, ~/, or the main repo checkout.\n\n"
+        f"## Dependencies\n"
+        f"All issues listed in 'Depends on' are already merged to the default branch.\n"
+        f"Your worktree was branched from the default branch tip and already contains\n"
+        f"all merged dependency work. Do NOT cherry-pick, merge, pull from, or inspect\n"
+        f"other branches. Implement your issue from the code that is already present.\n\n"
         f"## Task\n"
         f"You are implementing issue #{issue_number} on branch `{branch}`.\n"
         f"Repository: {repo}\n"
@@ -2821,23 +2808,15 @@ def _dispatch_impl_agent(
         f"8. git push -u origin {branch}\n"
         f'9. Create PR: gh pr create --repo {repo} --title "{issue_title}" '
         f'--label "{feat_label}" --body "Closes #{issue_number}"\n'
-        f"10. Wait for CI: gh pr checks <PR-number> --repo {repo} --watch\n"
-        f"11. Read all CI and review feedback\n"
-        f"12. Triage each piece of feedback (fix now / file issue / skip)\n"
-        f"13. STOP. Do not merge.\n\n"
+        f"10. STOP. Do not merge. The orchestrator monitors CI and merges when ready.\n\n"
         f"## Issue body\n{body}"
     )
-    skill_tmp = write_skill_tmp("impl-worker")
-
     if dry_run:
-        skill_tmp.unlink(missing_ok=True)
-        from brimstone.runner import RunResult as _RunResult
-
         return (
             issue,
             branch,
             worktree_path,
-            _RunResult(
+            runner.RunResult(
                 is_error=False,
                 subtype="success",
                 error_code=None,
@@ -2853,33 +2832,15 @@ def _dispatch_impl_agent(
             ),
         )
 
-    # Build isolated env for the impl agent
-    env = build_subprocess_env(config)
-    # Each impl agent gets an isolated CLAUDE_CONFIG_DIR
-    env["CLAUDE_CONFIG_DIR"] = f"/tmp/brimstone-agent-{issue_number}-{uuid.uuid4().hex}"
-
-    max_turns = 100
-    if hasattr(config, "max_turns") and config.max_turns:
-        max_turns = config.max_turns
-
-    try:
-        result = runner.run(
-            prompt=base_prompt,
-            allowed_tools=runner.TOOLS_IMPL_AGENT,
-            append_system_prompt_file=skill_tmp,
-            env=env,
-            max_turns=max_turns,
-            timeout_seconds=config.agent_timeout_minutes * 60,
-            model=config.model,
-            prefix=f"[implement #{issue_number}] ",
-        )
-    finally:
-        skill_tmp.unlink(missing_ok=True)
-    logger.log_agent_transcript(
-        result.all_events,
+    result = _run_agent(
+        base_prompt,
+        "impl-worker",
+        runner.TOOLS_IMPL_AGENT,
+        100,
         f"impl-{issue_number}",
-        session_id=(result.raw_result_event or {}).get("session_id"),
-        log_dir=config.log_dir.expanduser(),
+        f"[implement #{issue_number}] ",
+        config,
+        issue_number,
     )
     return issue, branch, worktree_path, result
 
@@ -2923,10 +2884,12 @@ def _run_impl_worker(
             log_prefix="[impl-worker]",
             config=config,
             checkpoint=checkpoint,
+            default_branch=default_branch,
         )
+        _startup_dep_checks(_list_open_issues_by_label(repo, milestone, IMPL_LABEL), repo)
 
     if dry_run:
-        open_issues = _list_open_impl_issues(repo, milestone)
+        open_issues = _list_open_issues_by_label(repo, milestone, IMPL_LABEL)
         open_issue_numbers = {i.get("number", 0) for i in open_issues}
         unblocked = _filter_unblocked(open_issues, open_issue_numbers)
         ranked = _sort_issues(unblocked)
@@ -2948,7 +2911,7 @@ def _run_impl_worker(
     with concurrent.futures.ThreadPoolExecutor(max_workers=pool_size) as executor:
 
         def _fill(active: dict) -> None:
-            open_issues = _list_open_impl_issues(repo, milestone)
+            open_issues = _list_open_issues_by_label(repo, milestone, IMPL_LABEL)
             active_issue_numbers = {info[0]["number"] for info in active.values()}
             open_issue_numbers = {i.get("number", 0) for i in open_issues}
             unblocked = _filter_unblocked(open_issues, open_issue_numbers)
@@ -3048,6 +3011,7 @@ def _run_impl_worker(
                 checkpoint=checkpoint,
                 worktree_path=worktree_path,
                 issue_number=issue_number,
+                default_branch=default_branch,
             )
             if merged:
                 _remove_worktree(worktree_path, repo_root)
@@ -3068,7 +3032,7 @@ def _run_impl_worker(
             active_modules.discard(slot[3])
 
         def _when_empty() -> bool:
-            open_issues = _list_open_impl_issues(repo, milestone)
+            open_issues = _list_open_issues_by_label(repo, milestone, IMPL_LABEL)
             if not open_issues:
                 logger.log_conductor_event(
                     run_id=checkpoint.run_id,
@@ -3140,7 +3104,7 @@ def _run_design_worker(
     # Gate 1: No blocking research issues may remain                     #
     # ------------------------------------------------------------------ #
     if not dry_run:
-        open_research_issues = _list_open_research_issues(repo, milestone)
+        open_research_issues = _list_open_issues_by_label(repo, milestone, RESEARCH_LABEL)
         blocking, _ = _classify_blocking_issues(
             open_research_issues, repo, milestone, config, checkpoint
         )
@@ -3166,6 +3130,7 @@ def _run_design_worker(
             log_prefix="[design-worker]",
             config=config,
             checkpoint=checkpoint,
+            default_branch=default_branch,
         )
     else:
         _clone_dir = None
@@ -3192,7 +3157,7 @@ def _run_design_worker(
         click.echo("HLD already merged — skipping Phase 1")
     else:
         # Find the HLD issue (may have been filed by completion gate or on a previous run)
-        design_issues = _list_open_design_issues(repo, milestone)
+        design_issues = _list_open_issues_by_label(repo, milestone, DESIGN_LABEL)
         hld_issue = next((i for i in design_issues if i["title"] == hld_issue_title), None)
         if hld_issue is None:
             # Missing — create it (idempotent) and re-fetch
@@ -3211,7 +3176,7 @@ def _run_design_worker(
                     "Check for duplicates before filing."
                 ),
             )
-            design_issues = _list_open_design_issues(repo, milestone)
+            design_issues = _list_open_issues_by_label(repo, milestone, DESIGN_LABEL)
             hld_issue = next((i for i in design_issues if i["title"] == hld_issue_title), None)
 
         if hld_issue is None:
@@ -3274,6 +3239,7 @@ def _run_design_worker(
             checkpoint=checkpoint,
             worktree_path=worktree_path,
             issue_number=hld_number,
+            default_branch=default_branch,
         )
         _remove_worktree(worktree_path, repo_root)
         if not merged:
@@ -3305,7 +3271,7 @@ def _run_design_worker(
         return
 
     # LLD issues were filed by the HLD agent; pick up all open ones
-    all_design_issues = _list_open_design_issues(repo, milestone)
+    all_design_issues = _list_open_issues_by_label(repo, milestone, DESIGN_LABEL)
     lld_issues = [i for i in all_design_issues if i["title"] != hld_issue_title]
 
     if not lld_issues:
@@ -3398,6 +3364,7 @@ def _run_design_worker(
                     checkpoint=checkpoint,
                     worktree_path=worktree_path,
                     issue_number=issue_number,
+                    default_branch=default_branch,
                 )
                 _remove_worktree(worktree_path, repo_root)
                 if merged:
@@ -3486,10 +3453,7 @@ def _run_plan_issues(
             else ""
         )
     )
-    skill_tmp = write_skill_tmp("plan-issues")
-
     if dry_run:
-        skill_tmp.unlink(missing_ok=True)
         click.echo(
             f"[dry-run] Would dispatch plan-issues agent for milestone "
             f"{milestone!r} in repo {repo!r}"
@@ -3504,27 +3468,16 @@ def _run_plan_issues(
         log_dir=config.log_dir.expanduser(),
     )
 
-    env = build_subprocess_env(config)
-    try:
-        result = runner.run(
-            prompt=base_prompt,
-            allowed_tools=["Bash", "Read", "Glob", "Grep"],
-            append_system_prompt_file=skill_tmp,
-            env=env,
-            max_turns=200,
-            timeout_seconds=config.agent_timeout_minutes * 60,
-            model=config.model,
-            prefix=f"[scope {milestone}] ",
-        )
-    finally:
-        skill_tmp.unlink(missing_ok=True)
-
-    logger.log_agent_transcript(
-        result.all_events,
+    result = _run_agent(
+        base_prompt,
+        "scope-worker",
+        ["Bash", "Read", "Glob", "Grep"],
+        200,
         f"plan-issues-{milestone}",
-        session_id=(result.raw_result_event or {}).get("session_id"),
-        log_dir=config.log_dir.expanduser(),
+        f"[scope {milestone}] ",
+        config,
     )
+
     _log_agent_cost(result, repo, "scoping", config, checkpoint, issue_number=None)
 
     logger.log_conductor_event(
@@ -3939,8 +3892,8 @@ def _ensure_labels(repo: str) -> None:
             click.echo(f"  label ok: {name}", err=True)
 
 
-def _report_plan_milestones_output(repo: str, milestone: str) -> None:
-    """Print the milestone and research issues that plan-milestones created."""
+def _report_plan_output(repo: str, milestone: str) -> None:
+    """Print the milestone and research issues that plan created."""
     # Fetch the milestone description
     ms_result = _gh(
         ["milestone", "list", "--json", "title,description", "--limit", "100"],
@@ -3992,7 +3945,7 @@ def _report_plan_milestones_output(repo: str, milestone: str) -> None:
             pass
 
 
-def _run_plan_milestones(
+def _run_plan(
     repo: str,
     version: str,
     config: Config,
@@ -4001,9 +3954,9 @@ def _run_plan_milestones(
     spec_stem: str | None = None,
     spec_local_path: str | None = None,
 ) -> None:
-    """Dispatch a single plan-milestones agent to create a milestone pair and seed issues.
+    """Dispatch a single plan agent to create a milestone pair and seed issues.
 
-    Builds a prompt by injecting the ``plan-milestones`` skill file and
+    Builds a prompt by injecting the ``plan`` skill file and
     invoking ``runner.run()`` once. The agent reads the spec, creates
     milestones, and files seed research issues.
 
@@ -4050,7 +4003,7 @@ def _run_plan_milestones(
         f"- Repository: {repo}\n"
         f"- Version: {version}\n"
         f"- Session Date: {today}\n\n"
-        f"You are the plan-milestones orchestrator for the `{repo}` repository.\n"
+        f"You are the plan orchestrator for the `{repo}` repository.\n"
         f"You are running in a headless temp directory (not inside the repo checkout).\n"
         f"IMPORTANT: The milestone title MUST be exactly `{version}` — do not shorten or "
         f"normalize it (e.g. do not use `v0.1` if the version is `v0.1.0`).\n\n"
@@ -4060,50 +4013,36 @@ def _run_plan_milestones(
         f"{dry_run_instruction}"
     )
 
-    skill_tmp = write_skill_tmp("plan-milestones")
-
     if dry_run:
         click.echo(
-            f"[dry-run] Dispatching plan-milestones agent for version "
+            f"[dry-run] Dispatching plan agent for version "
             f"{version!r} in repo {repo!r} (read-only — no GitHub writes)\n"
         )
 
     logger.log_conductor_event(
         run_id=checkpoint.run_id,
         phase="dispatch",
-        event_type="plan_milestones_start",
+        event_type="plan_start",
         payload={"repo": repo, "version": version},
         log_dir=config.log_dir.expanduser(),
     )
 
-    env = build_subprocess_env(config)
-
-    try:
-        result = runner.run(
-            prompt=base_prompt,
-            allowed_tools=["Bash"],
-            append_system_prompt_file=skill_tmp,
-            env=env,
-            max_turns=200,
-            timeout_seconds=config.agent_timeout_minutes * 60,
-            model=config.model,
-            prefix=f"[plan {version}] ",
-        )
-    finally:
-        skill_tmp.unlink(missing_ok=True)
-
-    logger.log_agent_transcript(
-        result.all_events,
-        f"plan-milestones-{version}",
-        session_id=(result.raw_result_event or {}).get("session_id"),
-        log_dir=config.log_dir.expanduser(),
+    result = _run_agent(
+        base_prompt,
+        "plan-worker",
+        ["Bash"],
+        200,
+        f"plan-{version}",
+        f"[plan {version}] ",
+        config,
     )
+
     _log_agent_cost(result, repo, "init", config, checkpoint, issue_number=None)
 
     logger.log_conductor_event(
         run_id=checkpoint.run_id,
         phase="dispatch",
-        event_type="plan_milestones_complete",
+        event_type="plan_complete",
         payload={
             "repo": repo,
             "version": version,
@@ -4121,7 +4060,7 @@ def _run_plan_milestones(
 
     if result.is_error:
         click.echo(
-            f"Plan-milestones completed with error: {result.subtype} / {result.error_code}",
+            f"Plan completed with error: {result.subtype} / {result.error_code}",
             err=True,
         )
         if result.stderr:
@@ -4141,7 +4080,7 @@ def _run_plan_milestones(
             click.echo("Verifying milestone was created…", err=True)
     else:
         if not dry_run:
-            click.echo(f"Plan-milestones complete for version '{version}'.")
+            click.echo(f"Plan complete for version '{version}'.")
 
     if dry_run:
         return
@@ -4149,14 +4088,14 @@ def _run_plan_milestones(
     # Post-validation: confirm the milestone was actually created.
     if not _milestone_exists(repo, version):
         click.echo(
-            f"Error: plan-milestones completed but milestone '{version}' was not created.\n"
+            f"Error: plan completed but milestone '{version}' was not created.\n"
             "The agent likely exited before finishing. Re-run to try again.",
             err=True,
         )
         raise SystemExit(1)
 
     # Report what was created.
-    _report_plan_milestones_output(repo=repo, milestone=version)
+    _report_plan_output(repo=repo, milestone=version)
 
 
 # ---------------------------------------------------------------------------
@@ -4245,7 +4184,7 @@ def _check_gate_before_stage(
         click.ClickException: If the prerequisite is not satisfied.
     """
     if stage == "design" and "research" not in stages_being_run:
-        open_count = _count_all_open_research_issues(repo, milestone)
+        open_count = _count_open_issues_by_label(repo, milestone, RESEARCH_LABEL)
         if open_count > 0:
             raise click.ClickException(
                 f"{open_count} open research issue(s) remain for milestone '{milestone}'. "
@@ -4261,7 +4200,7 @@ def _check_gate_before_stage(
             )
 
     if stage == "impl" and "scope" not in stages_being_run:
-        open_impl = _list_open_impl_issues(repo, milestone)
+        open_impl = _list_open_issues_by_label(repo, milestone, IMPL_LABEL)
         if not open_impl:
             raise click.ClickException(
                 f"No open impl issues found for milestone '{milestone}'. "
@@ -4471,7 +4410,7 @@ def run(
                     skip_checks=_plan_skip,
                 )
                 _upload_spec_to_repo(repo_ref, resolved_spec, stem)
-                _run_plan_milestones(
+                _run_plan(
                     repo=repo_ref,
                     version=ms,
                     config=_config,
@@ -4483,15 +4422,21 @@ def run(
             else:
                 # Completion check — skip if stage is already done
                 if not dry_run:
-                    if stage == "research" and _count_all_open_research_issues(repo_ref, ms) == 0:
+                    if stage == "research" and (
+                        _count_open_issues_by_label(repo_ref, ms, RESEARCH_LABEL) == 0
+                    ):
                         click.echo(f"[run] {stage} ({ms}): already complete, skipping", err=True)
                         continue
-                    if stage == "design" and _doc_exists_on_default_branch(
-                        repo_ref, f"docs/design/{ms}/HLD.md", default_branch
-                    ) and _count_all_open_design_issues(repo_ref, ms) == 0:
+                    if (
+                        stage == "design"
+                        and _doc_exists_on_default_branch(
+                            repo_ref, f"docs/design/{ms}/HLD.md", default_branch
+                        )
+                        and _count_open_issues_by_label(repo_ref, ms, DESIGN_LABEL) == 0
+                    ):
                         click.echo(f"[run] {stage} ({ms}): already complete, skipping", err=True)
                         continue
-                    if stage == "scope" and _list_open_impl_issues(repo_ref, ms):
+                    if stage == "scope" and _list_open_issues_by_label(repo_ref, ms, IMPL_LABEL):
                         click.echo(
                             f"[run] {stage} ({ms}): impl issues already exist, skipping", err=True
                         )

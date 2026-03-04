@@ -11,7 +11,6 @@ from brimstone import session
 from brimstone.cli import (
     UsageGovernor,
     _apply_headless_policy,
-    inject_skill,
     startup_sequence,
 )
 from brimstone.config import Config
@@ -53,53 +52,6 @@ def make_checkpoint(**overrides) -> Checkpoint:
     )
     defaults.update(overrides)
     return Checkpoint(**defaults)
-
-
-# ---------------------------------------------------------------------------
-# inject_skill
-# ---------------------------------------------------------------------------
-
-
-class TestInjectSkill:
-    def test_reads_correct_file_and_prepends_skill_text(self) -> None:
-        """inject_skill reads the named skill file and prepends it after base_prompt."""
-        fake_skill_content = "# Skill\nDo the thing."
-        base = "## Session Parameters\n- repo: owner/repo"
-
-        with patch.object(Path, "read_text", return_value=fake_skill_content):
-            result = inject_skill("research-worker", base)
-
-        assert result.startswith(base)
-        assert "\n\n---\n\n" in result
-        assert fake_skill_content in result
-
-    def test_raises_file_not_found_for_missing_skill(self) -> None:
-        """inject_skill raises FileNotFoundError for unknown skill names."""
-        with pytest.raises(FileNotFoundError):
-            inject_skill("nonexistent-skill-xyz", "base prompt")
-
-    def test_applies_headless_policy(self) -> None:
-        """inject_skill applies _apply_headless_policy to the skill text."""
-        fake_skill = "Ask the user before proceeding."
-        base = "base"
-
-        with patch.object(Path, "read_text", return_value=fake_skill):
-            result = inject_skill("research-worker", base)
-
-        assert "Ask the user" not in result
-        assert "Auto-resolve:" in result
-
-    def test_real_research_worker_skill_file_exists(self) -> None:
-        """The real research-worker.md skill file exists and is readable."""
-        result = inject_skill("research-worker", "base")
-        assert "---" in result
-        assert len(result) > 100
-
-    def test_real_impl_worker_skill_file_exists(self) -> None:
-        """The real impl-worker.md skill file exists and is readable."""
-        result = inject_skill("impl-worker", "base")
-        assert "---" in result
-        assert len(result) > 100
 
 
 # ---------------------------------------------------------------------------

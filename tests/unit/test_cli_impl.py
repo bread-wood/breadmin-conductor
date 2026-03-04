@@ -4,7 +4,7 @@ Tests cover:
 - Issue selection respects module isolation (active module blocked)
 - _extract_module extracts feat:* label correctly
 - _slugify produces branch-safe slugs
-- _list_open_impl_issues filters correctly (excludes research/pipeline/in-progress)
+- _list_open_issues_by_label filters correctly (excludes in-progress, assigned)
 - Sequential claiming with mock _gh
 - Dispatch with mock runner
 - CI monitoring state machine (pass/fail/conflict/timeout)
@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from brimstone.cli import (
+    IMPL_LABEL,
     UsageGovernor,
     _extract_module,
     _find_next_version,
@@ -30,7 +31,7 @@ from brimstone.cli import (
     _find_pr_for_issue,
     _get_pr_checks_status,
     _get_review_status,
-    _list_open_impl_issues,
+    _list_open_issues_by_label,
     _monitor_pr,
     _run_impl_worker,
     _slugify,
@@ -220,7 +221,7 @@ class TestExtractModule:
 
 
 # ---------------------------------------------------------------------------
-# _list_open_impl_issues
+# _list_open_issues_by_label (impl)
 # ---------------------------------------------------------------------------
 
 
@@ -228,7 +229,7 @@ class TestListOpenImplIssues:
     def _call(self, issues_json: str, returncode: int = 0) -> list[dict]:
         with patch("brimstone.cli._gh") as mock_gh:
             mock_gh.return_value = make_gh_result(stdout=issues_json, returncode=returncode)
-            return _list_open_impl_issues("owner/repo", "M2: Implementation")
+            return _list_open_issues_by_label("owner/repo", "M2: Implementation", IMPL_LABEL)
 
     def test_returns_empty_on_gh_failure(self) -> None:
         result = self._call("error", returncode=1)
@@ -237,24 +238,6 @@ class TestListOpenImplIssues:
     def test_returns_empty_on_invalid_json(self) -> None:
         result = self._call("not-json")
         assert result == []
-
-    def test_filters_out_research_issues(self) -> None:
-        issues = [
-            make_issue(number=1, labels=["stage/research"]),
-            make_issue(number=2, labels=["feat:config"]),
-        ]
-        result = self._call(json.dumps(issues))
-        assert len(result) == 1
-        assert result[0]["number"] == 2
-
-    def test_filters_out_pipeline_issues(self) -> None:
-        issues = [
-            make_issue(number=1, labels=["pipeline"]),
-            make_issue(number=2, labels=["feat:runner"]),
-        ]
-        result = self._call(json.dumps(issues))
-        assert len(result) == 1
-        assert result[0]["number"] == 2
 
     def test_filters_out_in_progress_issues(self) -> None:
         issues = [
@@ -669,54 +652,38 @@ class TestMonitorPr:
         # result would be False but we just ensure no exception and rebase not called
 
     def test_attempts_rebase_on_conflict(self) -> None:
-        """When conflict is detected, _rebase_branch is called."""
-        fail_checks = [{"name": "ci", "state": "completed", "bucket": "fail"}]
+        """Conflict detected at start of poll (before CI check) triggers rebase."""
         pass_checks = [{"name": "ci", "state": "completed", "bucket": "pass"}]
-        call_count = {"n": 0}
 
         def gh_side_effect(args, **kwargs):
-            call_count["n"] += 1
             args_str = " ".join(str(a) for a in args)
             if "checks" in args_str:
-                if call_count["n"] <= 2:
-                    return make_gh_result(stdout=json.dumps(fail_checks))
                 return make_gh_result(stdout=json.dumps(pass_checks))
-            elif "mergeable" in args_str:
-                return make_gh_result(
-                    stdout=json.dumps({"mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"})
-                )
             elif "reviews" in args_str:
                 return make_gh_result(stdout=json.dumps({"reviews": []}))
             elif "merge" in args_str:
                 return make_gh_result(returncode=0)
             return make_gh_result()
 
+        # Conflict on first poll only; no conflict on second poll → CI pass → merge
         with (
             patch("brimstone.cli._gh", side_effect=gh_side_effect),
+            patch("brimstone.cli._is_conflict_failure", side_effect=[True, False]),
             patch("brimstone.cli._rebase_branch", return_value=True) as mock_rebase,
             patch("brimstone.cli.logger.log_conductor_event"),
             patch("brimstone.cli.session.save"),
         ):
-            _monitor_pr(**self._make_monitor_kwargs(max_polls=10))
+            result = _monitor_pr(**self._make_monitor_kwargs(max_polls=10))
 
-        mock_rebase.assert_called()
+        assert result is True
+        mock_rebase.assert_called_once()
 
     def test_returns_false_after_rebase_limit_exceeded(self) -> None:
         """After _REBASE_RETRY_LIMIT rebase attempts, returns False."""
-        fail_checks = [{"name": "ci", "status": "completed", "conclusion": "failure"}]
-
-        def gh_side_effect(args, **kwargs):
-            args_str = " ".join(str(a) for a in args)
-            if "checks" in args_str:
-                return make_gh_result(stdout=json.dumps(fail_checks))
-            elif "mergeable" in args_str:
-                return make_gh_result(
-                    stdout=json.dumps({"mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"})
-                )
-            return make_gh_result()
-
+        # Conflict persists on every poll — rebase succeeds but conflict re-appears
         with (
-            patch("brimstone.cli._gh", side_effect=gh_side_effect),
+            patch("brimstone.cli._gh"),
+            patch("brimstone.cli._is_conflict_failure", return_value=True),
             patch("brimstone.cli._rebase_branch", return_value=True),
             patch("brimstone.cli.logger.log_conductor_event"),
         ):
@@ -749,20 +716,9 @@ class TestMonitorPr:
 
     def test_escalates_immediately_on_conflict_without_worktree(self) -> None:
         """When worktree_path is empty and conflict detected, escalates without rebase."""
-        fail_checks = [{"name": "ci", "status": "completed", "conclusion": "failure"}]
-
-        def gh_side_effect(args, **kwargs):
-            args_str = " ".join(str(a) for a in args)
-            if "checks" in args_str:
-                return make_gh_result(stdout=json.dumps(fail_checks))
-            elif "mergeable" in args_str:
-                return make_gh_result(
-                    stdout=json.dumps({"mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"})
-                )
-            return make_gh_result()
-
         with (
-            patch("brimstone.cli._gh", side_effect=gh_side_effect),
+            patch("brimstone.cli._gh"),
+            patch("brimstone.cli._is_conflict_failure", return_value=True),
             patch("brimstone.cli._rebase_branch") as mock_rebase,
             patch("brimstone.cli.logger.log_conductor_event"),
         ):
@@ -794,6 +750,34 @@ class TestMonitorPr:
 
         assert result is True
 
+    def test_conflict_detected_while_ci_pending_triggers_rebase(self) -> None:
+        """Conflict is caught on the first poll even while CI is still pending."""
+        pass_checks = [{"name": "ci", "state": "completed", "bucket": "pass"}]
+
+        def gh_side_effect(args, **kwargs):
+            args_str = " ".join(str(a) for a in args)
+            if "checks" in args_str:
+                return make_gh_result(stdout=json.dumps(pass_checks))
+            elif "reviews" in args_str:
+                return make_gh_result(stdout=json.dumps({"reviews": []}))
+            elif "merge" in args_str:
+                return make_gh_result(returncode=0)
+            return make_gh_result()
+
+        # Poll 1: CI would be pending, but conflict fires first → rebase
+        # Poll 2: no conflict → CI pass → merge
+        with (
+            patch("brimstone.cli._gh", side_effect=gh_side_effect),
+            patch("brimstone.cli._is_conflict_failure", side_effect=[True, False]),
+            patch("brimstone.cli._rebase_branch", return_value=True) as mock_rebase,
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
+        ):
+            result = _monitor_pr(**self._make_monitor_kwargs(max_polls=10))
+
+        assert result is True
+        mock_rebase.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # _run_impl_worker — Completion gate (no open issues → file pipeline issue)
@@ -809,7 +793,7 @@ class TestRunImplWorkerCompletionGate:
         checkpoint = make_checkpoint(milestone="MVP Implementation")
 
         with (
-            patch("brimstone.cli._list_open_impl_issues", return_value=[]),
+            patch("brimstone.cli._list_open_issues_by_label", return_value=[]),
             patch("brimstone.cli._gh") as mock_gh,
             patch("brimstone.cli.logger.log_conductor_event") as mock_log_event,
             patch("brimstone.cli.session.save"),
@@ -836,7 +820,7 @@ class TestRunImplWorkerCompletionGate:
         checkpoint = make_checkpoint(milestone="MVP Implementation")
 
         with (
-            patch("brimstone.cli._list_open_impl_issues", return_value=[]),
+            patch("brimstone.cli._list_open_issues_by_label", return_value=[]),
             patch("brimstone.cli._gh") as mock_gh,
             patch("brimstone.cli.logger.log_conductor_event"),
             patch("brimstone.cli.session.save"),
@@ -877,7 +861,7 @@ class TestRunImplWorkerClaiming:
         ]
 
         with (
-            patch("brimstone.cli._list_open_impl_issues", side_effect=[issues, [], []]),
+            patch("brimstone.cli._list_open_issues_by_label", side_effect=[issues, issues, [], []]),
             patch("brimstone.cli._claim_issue") as mock_claim,
             patch("brimstone.cli._create_worktree", return_value="/tmp/wt"),
             patch("brimstone.cli._dispatch_impl_agent") as mock_dispatch,
@@ -919,7 +903,7 @@ class TestRunImplWorkerClaiming:
         ]
 
         with (
-            patch("brimstone.cli._list_open_impl_issues", return_value=issues),
+            patch("brimstone.cli._list_open_issues_by_label", return_value=issues),
             patch("brimstone.cli._create_worktree") as mock_create,
             patch("brimstone.cli._claim_issue"),
             patch("brimstone.cli._gh") as mock_gh,
@@ -960,7 +944,7 @@ class TestRunImplWorkerRateLimitHandling:
         )
 
         with (
-            patch("brimstone.cli._list_open_impl_issues", side_effect=[issues, [], []]),
+            patch("brimstone.cli._list_open_issues_by_label", side_effect=[issues, issues, [], []]),
             patch("brimstone.cli._claim_issue"),
             patch("brimstone.cli._unclaim_issue") as mock_unclaim,
             patch("brimstone.cli._create_worktree", return_value="/tmp/wt"),

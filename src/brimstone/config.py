@@ -118,7 +118,7 @@ class Config(BaseSettings):
 
     # --- Model ---
     model: str = Field(
-        default="claude-opus-4-6",
+        default="claude-sonnet-4-6",
         description="Claude model ID passed to claude -p via --model",
     )
 
@@ -300,15 +300,24 @@ def build_subprocess_env(
     # Resolve the API key — either from the helper script or directly
     api_key = _resolve_api_key(config)
 
-    # Create a temp dir for Claude's config isolation.
-    claude_config_dir = tempfile.mkdtemp(prefix="brimstone-claude-config-")
+    # Create or use a temp dir for Claude's config isolation.
+    # When the caller supplies CLAUDE_CONFIG_DIR in extra, reuse that path so
+    # we don't create a temp dir that gets immediately overwritten and leaked.
+    if "CLAUDE_CONFIG_DIR" not in extra:
+        claude_config_dir = tempfile.mkdtemp(prefix="brimstone-claude-config-")
+    else:
+        claude_config_dir = extra["CLAUDE_CONFIG_DIR"]
+        os.makedirs(claude_config_dir, exist_ok=True)
+
     claude_home = Path(os.environ.get("HOME", "~")).expanduser() / ".claude"
 
     # Seed the statsig cache so the SDK doesn't hang on a cold-start network
     # fetch when cached evaluations are absent.
     real_statsig = claude_home / "statsig"
     if real_statsig.is_dir():
-        shutil.copytree(str(real_statsig), os.path.join(claude_config_dir, "statsig"))
+        shutil.copytree(
+            str(real_statsig), os.path.join(claude_config_dir, "statsig"), dirs_exist_ok=True
+        )
 
     # Write a minimal settings.json so Claude Code skips the first-run
     # dangerous-mode consent dialog (which blocks on /dev/tty when absent).

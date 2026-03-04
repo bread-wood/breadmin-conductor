@@ -26,9 +26,15 @@ from pathlib import Path
 # Tool set constants
 # ---------------------------------------------------------------------------
 
-TOOLS_RESEARCH: list[str] = ["gh", "bash", "read", "web_search"]
-TOOLS_DESIGN: list[str] = ["gh"]
-TOOLS_IMPL_AGENT: list[str] = ["gh", "bash", "read", "edit", "write", "Glob", "Grep"]
+TOOLS_RESEARCH: list[str] = ["Bash", "Read", "WebSearch"]
+TOOLS_DESIGN: list[str] = ["Bash", "Read", "Edit", "Write", "Glob", "Grep"]
+TOOLS_IMPL_AGENT: list[str] = ["Bash", "Read", "Edit", "Write", "Glob", "Grep"]
+
+# Always removed from model context across all agent types.
+TOOLS_DISALLOWED: list[str] = ["TodoWrite", "TodoRead", "Agent"]
+
+# Fallback model used on overload/rate-limit across all agent dispatches.
+FALLBACK_MODEL: str = "claude-haiku-4-5-20251001"
 
 # ---------------------------------------------------------------------------
 # RunResult dataclass
@@ -148,6 +154,9 @@ def run(
     timeout_seconds: float | None = None,
     model: str | None = None,
     prefix: str = "",
+    disallowed_tools: list[str] | None = None,
+    max_budget_usd: float | None = None,
+    fallback_model: str | None = None,
 ) -> RunResult:
     """Invoke ``claude -p`` as a subprocess and return a structured result.
 
@@ -209,6 +218,9 @@ def run(
         max_turns=max_turns,
         append_system_prompt_file=append_system_prompt_file,
         model=model,
+        disallowed_tools=disallowed_tools,
+        max_budget_usd=max_budget_usd,
+        fallback_model=fallback_model,
     )
 
     if dry_run:
@@ -298,6 +310,9 @@ def _assemble_command(
     max_turns: int,
     append_system_prompt_file: Path | None,
     model: str | None = None,
+    disallowed_tools: list[str] | None = None,
+    max_budget_usd: float | None = None,
+    fallback_model: str | None = None,
 ) -> list[str]:
     """Assemble the ``claude`` command list."""
     cmd: list[str] = ["claude", "-p", prompt]
@@ -327,6 +342,18 @@ def _assemble_command(
     # System prompt override: use append-system-prompt if file provided
     if append_system_prompt_file is not None:
         cmd += ["--append-system-prompt", str(append_system_prompt_file)]
+
+    # Remove tools entirely from model context
+    if disallowed_tools:
+        cmd += ["--disallowedTools", ",".join(disallowed_tools)]
+
+    # Per-agent USD spending ceiling
+    if max_budget_usd is not None:
+        cmd += ["--max-budget-usd", str(max_budget_usd)]
+
+    # Automatic retry with cheaper model on overload/rate-limit
+    if fallback_model:
+        cmd += ["--fallback-model", fallback_model]
 
     return cmd
 

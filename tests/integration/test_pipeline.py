@@ -56,9 +56,9 @@ def _fake_startup(
 _COMMON_PATCHES = {
     "resolve_repo": "brimstone.cli._resolve_repo",
     "milestone_exists": "brimstone.cli._milestone_exists",
-    "open_research": "brimstone.cli._count_all_open_research_issues",
+    "open_research": "brimstone.cli._count_open_issues_by_label",
     "doc_exists": "brimstone.cli._doc_exists_on_default_branch",
-    "open_impl": "brimstone.cli._list_open_impl_issues",
+    "open_impl": "brimstone.cli._list_open_issues_by_label",
     "plan_issues": "brimstone.cli._run_plan_issues",
     "default_branch": "brimstone.cli._get_default_branch_for_repo",
     "startup": "brimstone.cli.startup_sequence",

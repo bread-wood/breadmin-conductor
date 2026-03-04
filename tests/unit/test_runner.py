@@ -12,7 +12,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from brimstone.runner import (
+    FALLBACK_MODEL,
     TOOLS_DESIGN,
+    TOOLS_DISALLOWED,
     TOOLS_IMPL_AGENT,
     TOOLS_RESEARCH,
     RunResult,
@@ -21,6 +23,17 @@ from brimstone.runner import (
     _synthesise_result,
     run,
 )
+
+# ---------------------------------------------------------------------------
+# Module-level constants
+# ---------------------------------------------------------------------------
+
+
+def test_fallback_model_constant() -> None:
+    """FALLBACK_MODEL is defined and is a non-empty string."""
+    assert isinstance(FALLBACK_MODEL, str)
+    assert FALLBACK_MODEL != ""
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -116,15 +129,19 @@ def _make_select_side_effect(proc: MagicMock) -> Any:
 
 
 def test_tools_research_contains_expected_tools() -> None:
-    assert set(TOOLS_RESEARCH) == {"gh", "bash", "read", "web_search"}
+    assert set(TOOLS_RESEARCH) == {"Bash", "Read", "WebSearch"}
 
 
-def test_tools_design_contains_gh_only() -> None:
-    assert TOOLS_DESIGN == ["gh"]
+def test_tools_design_contains_expected_tools() -> None:
+    assert set(TOOLS_DESIGN) == {"Bash", "Read", "Edit", "Write", "Glob", "Grep"}
 
 
 def test_tools_impl_agent_contains_expected_tools() -> None:
-    assert set(TOOLS_IMPL_AGENT) == {"gh", "bash", "read", "edit", "write", "Glob", "Grep"}
+    assert set(TOOLS_IMPL_AGENT) == {"Bash", "Read", "Edit", "Write", "Glob", "Grep"}
+
+
+def test_tools_disallowed_contains_expected_tools() -> None:
+    assert set(TOOLS_DISALLOWED) == {"TodoWrite", "TodoRead", "Agent"}
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +206,84 @@ def test_assemble_command_no_append_system_prompt_when_none() -> None:
         append_system_prompt_file=None,
     )
     assert "--append-system-prompt" not in cmd
+
+
+def test_assemble_command_disallowed_tools() -> None:
+    """--disallowedTools flag is added with comma-joined tool names."""
+    cmd = _assemble_command(
+        prompt="x",
+        allowed_tools=["Bash"],
+        max_turns=10,
+        append_system_prompt_file=None,
+        disallowed_tools=["TodoWrite", "TodoRead", "Agent"],
+    )
+    assert "--disallowedTools" in cmd
+    idx = cmd.index("--disallowedTools")
+    assert cmd[idx + 1] == "TodoWrite,TodoRead,Agent"
+
+
+def test_assemble_command_disallowed_tools_absent_when_none() -> None:
+    """When disallowed_tools is None, --disallowedTools is absent."""
+    cmd = _assemble_command(
+        prompt="x",
+        allowed_tools=["Bash"],
+        max_turns=10,
+        append_system_prompt_file=None,
+        disallowed_tools=None,
+    )
+    assert "--disallowedTools" not in cmd
+
+
+def test_assemble_command_max_budget_usd() -> None:
+    """--max-budget-usd flag is added when max_budget_usd is provided."""
+    cmd = _assemble_command(
+        prompt="x",
+        allowed_tools=["Bash"],
+        max_turns=10,
+        append_system_prompt_file=None,
+        max_budget_usd=5.0,
+    )
+    assert "--max-budget-usd" in cmd
+    idx = cmd.index("--max-budget-usd")
+    assert cmd[idx + 1] == "5.0"
+
+
+def test_assemble_command_max_budget_usd_absent_when_none() -> None:
+    """When max_budget_usd is None, --max-budget-usd is absent."""
+    cmd = _assemble_command(
+        prompt="x",
+        allowed_tools=["Bash"],
+        max_turns=10,
+        append_system_prompt_file=None,
+        max_budget_usd=None,
+    )
+    assert "--max-budget-usd" not in cmd
+
+
+def test_assemble_command_fallback_model() -> None:
+    """--fallback-model flag is added when fallback_model is provided."""
+    cmd = _assemble_command(
+        prompt="x",
+        allowed_tools=["Bash"],
+        max_turns=10,
+        append_system_prompt_file=None,
+        fallback_model="claude-haiku-4-5-20251001",
+    )
+    assert "--fallback-model" in cmd
+    idx = cmd.index("--fallback-model")
+    assert cmd[idx + 1] == "claude-haiku-4-5-20251001"
+
+
+def test_assemble_command_fallback_model_absent_when_none() -> None:
+    """When fallback_model is None, --fallback-model is absent."""
+    cmd = _assemble_command(
+        prompt="x",
+        allowed_tools=["Bash"],
+        max_turns=10,
+        append_system_prompt_file=None,
+        fallback_model=None,
+    )
+    assert "--fallback-model" not in cmd
 
 
 # ---------------------------------------------------------------------------
