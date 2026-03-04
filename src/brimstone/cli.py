@@ -3899,7 +3899,7 @@ def _seed_spec(
     spec_path: Path,
     version: str,
     local_path: str,
-) -> None:
+) -> bool:
     """Copy *spec_path* into the target repo at ``docs/specs/<version>.md``.
 
     If the destination already exists, print a warning and skip the copy.
@@ -3911,6 +3911,9 @@ def _seed_spec(
         version:    Version name used to build the destination filename.
         local_path: Absolute path to the root of the target git repository.
 
+    Returns:
+        ``True`` if a commit was made, ``False`` if the spec already existed.
+
     Side effects:
         May create ``docs/specs/`` inside *local_path*, copy the spec file,
         and create a git commit.
@@ -3920,7 +3923,7 @@ def _seed_spec(
 
     if dest_file.exists():
         click.echo(f"Warning: {dest_file} already exists in target repo. Skipping spec copy.")
-        return
+        return False
 
     dest_dir.mkdir(parents=True, exist_ok=True)
     import shutil
@@ -3947,6 +3950,7 @@ def _seed_spec(
         text=True,
     )
     click.echo(f"Seeded spec into {dest_file} and committed.")
+    return True
 
 
 _BRIMSTONE_BOT = "yeast-bot"
@@ -4954,16 +4958,27 @@ def run(
                     skip_checks=_plan_skip,
                 )
                 if local_path is not None:
-                    _seed_spec(resolved_spec, stem, local_path)
-                    result = subprocess.run(
-                        ["git", "-C", local_path, "push"],
+                    # Pull before touching the local repo to avoid non-fast-forward push.
+                    pull = subprocess.run(
+                        ["git", "-C", local_path, "pull", "--rebase"],
                         capture_output=True,
                         text=True,
                     )
-                    if result.returncode != 0:
+                    if pull.returncode != 0:
                         raise click.ClickException(
-                            f"Failed to push spec to {repo_ref}: {result.stderr.strip()}"
+                            f"Failed to pull latest changes in {local_path}: {pull.stderr.strip()}"
                         )
+                    spec_committed = _seed_spec(resolved_spec, stem, local_path)
+                    if spec_committed:
+                        result = subprocess.run(
+                            ["git", "-C", local_path, "push"],
+                            capture_output=True,
+                            text=True,
+                        )
+                        if result.returncode != 0:
+                            raise click.ClickException(
+                                f"Failed to push spec to {repo_ref}: {result.stderr.strip()}"
+                            )
                 else:
                     _upload_spec_to_repo(repo_ref, resolved_spec, stem)
                 _run_plan_milestones(
