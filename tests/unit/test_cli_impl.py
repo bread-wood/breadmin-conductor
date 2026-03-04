@@ -1193,6 +1193,196 @@ class TestMonitorPrRebaseConfig:
 
 
 # ---------------------------------------------------------------------------
+# _monitor_pr — PRBead writes
+# ---------------------------------------------------------------------------
+
+
+class TestMonitorPrPrBeadWrites:
+    """Verify _monitor_pr() writes PRBead state transitions."""
+
+    def _make_store(self) -> MagicMock:
+        store = MagicMock()
+        store.read_work_bead.return_value = None
+        store.read_pr_bead.return_value = None
+        return store
+
+    def _make_monitor_kwargs(self, store: MagicMock, **overrides) -> dict:
+        defaults = dict(
+            pr_number=99,
+            branch="42-fix",
+            repo="owner/repo",
+            config=make_config(),
+            checkpoint=make_checkpoint(),
+            issue_number=42,
+            store=store,
+            poll_interval=0,
+        )
+        defaults.update(overrides)
+        return defaults
+
+    def test_writes_pr_bead_on_entry(self) -> None:
+        """PRBead with state='open' is written when _monitor_pr starts."""
+        store = self._make_store()
+        checks = [{"name": "ci", "state": "completed", "bucket": "pass"}]
+        reviews = {"reviews": []}
+        # Capture bead state at each write (PRBead is mutable — the same object is reused)
+        captured_states: list[str] = []
+
+        def capture_write(bead):
+            captured_states.append(bead.state)
+
+        store.write_pr_bead.side_effect = capture_write
+
+        def gh_side_effect(args, **kwargs):
+            if "checks" in args:
+                return make_gh_result(stdout=json.dumps(checks))
+            elif "reviews" in args:
+                return make_gh_result(stdout=json.dumps(reviews))
+            elif "merge" in args:
+                return make_gh_result(returncode=0)
+            return make_gh_result()
+
+        with (
+            patch("brimstone.cli._is_conflict_failure", return_value=False),
+            patch("brimstone.cli._gh", side_effect=gh_side_effect),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
+        ):
+            _monitor_pr(**self._make_monitor_kwargs(store))
+
+        # First write must have state='open' (entry write)
+        assert store.write_pr_bead.call_count >= 1
+        assert captured_states[0] == "open"
+        # Verify pr_number and issue_number on the bead passed to the first write
+        first_call_bead = store.write_pr_bead.call_args_list[0][0][0]
+        assert first_call_bead.pr_number == 99
+        assert first_call_bead.issue_number == 42
+
+    def test_does_not_dispatch_ci_fix(self) -> None:
+        """_dispatch_ci_fix_agent must NOT be called even when CI fails persistently."""
+        store = self._make_store()
+        fail_checks = [{"name": "ci", "status": "completed", "conclusion": "failure"}]
+
+        def gh_side_effect(args, **kwargs):
+            if "checks" in args:
+                return make_gh_result(stdout=json.dumps(fail_checks))
+            elif "mergeable" in str(args):
+                return make_gh_result(
+                    stdout=json.dumps({"mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"})
+                )
+            return make_gh_result()
+
+        with (
+            patch("brimstone.cli._is_conflict_failure", return_value=False),
+            patch("brimstone.cli._gh", side_effect=gh_side_effect),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli._dispatch_ci_fix_agent") as mock_ci_fix,
+            patch("brimstone.cli.session.save"),
+        ):
+            result = _monitor_pr(**self._make_monitor_kwargs(store, max_polls=10))
+
+        mock_ci_fix.assert_not_called()
+        assert result is False
+
+    def test_writes_ci_failing_bead_on_persistent_ci_failure(self) -> None:
+        """PRBead state is set to 'ci_failing' after two consecutive CI failures."""
+        store = self._make_store()
+        # Use bucket="fail" so _get_pr_checks_status returns "fail"
+        fail_checks = [{"name": "ci", "state": "completed", "bucket": "fail"}]
+        captured_states: list[str] = []
+
+        def capture_write(bead):
+            captured_states.append(bead.state)
+
+        store.write_pr_bead.side_effect = capture_write
+
+        def gh_side_effect(args, **kwargs):
+            if "checks" in args:
+                return make_gh_result(stdout=json.dumps(fail_checks))
+            return make_gh_result()
+
+        with (
+            patch("brimstone.cli._is_conflict_failure", return_value=False),
+            patch("brimstone.cli._gh", side_effect=gh_side_effect),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
+        ):
+            result = _monitor_pr(**self._make_monitor_kwargs(store, max_polls=10))
+
+        assert result is False
+        # The second CI failure should produce a "ci_failing" bead write
+        assert "ci_failing" in captured_states
+
+    def test_writes_merged_bead_on_success(self) -> None:
+        """PRBead state is set to 'merged' and merged_at is set when merge succeeds."""
+        store = self._make_store()
+        checks = [{"name": "ci", "state": "completed", "bucket": "pass"}]
+        reviews = {"reviews": []}
+
+        def gh_side_effect(args, **kwargs):
+            if "checks" in args:
+                return make_gh_result(stdout=json.dumps(checks))
+            elif "reviews" in args:
+                return make_gh_result(stdout=json.dumps(reviews))
+            elif "merge" in args:
+                return make_gh_result(returncode=0)
+            return make_gh_result()
+
+        with (
+            patch("brimstone.cli._is_conflict_failure", return_value=False),
+            patch("brimstone.cli._gh", side_effect=gh_side_effect),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
+        ):
+            result = _monitor_pr(**self._make_monitor_kwargs(store))
+
+        assert result is True
+        written_states = [c[0][0].state for c in store.write_pr_bead.call_args_list]
+        assert "merged" in written_states
+        # Find the merged bead and confirm merged_at is set
+        merged_bead = next(
+            c[0][0] for c in store.write_pr_bead.call_args_list if c[0][0].state == "merged"
+        )
+        assert merged_bead.merged_at is not None
+
+    def test_writes_conflict_bead_on_no_worktree(self) -> None:
+        """PRBead state is set to 'conflict' when conflict detected with no worktree."""
+        store = self._make_store()
+
+        with (
+            patch("brimstone.cli._is_conflict_failure", return_value=True),
+            patch("brimstone.cli._gh", return_value=make_gh_result()),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
+        ):
+            result = _monitor_pr(**self._make_monitor_kwargs(store, worktree_path=""))
+
+        assert result is False
+        written_states = [c[0][0].state for c in store.write_pr_bead.call_args_list]
+        assert "conflict" in written_states
+
+    def test_writes_abandoned_bead_on_timeout(self) -> None:
+        """PRBead state is set to 'abandoned' on CI monitoring timeout."""
+        store = self._make_store()
+        pending_checks = [{"name": "ci", "status": "in_progress", "conclusion": None}]
+
+        with (
+            patch("brimstone.cli._is_conflict_failure", return_value=False),
+            patch(
+                "brimstone.cli._gh",
+                return_value=make_gh_result(stdout=json.dumps(pending_checks)),
+            ),
+            patch("brimstone.cli.logger.log_conductor_event"),
+            patch("brimstone.cli.session.save"),
+        ):
+            result = _monitor_pr(**self._make_monitor_kwargs(store, max_polls=2))
+
+        assert result is False
+        written_states = [c[0][0].state for c in store.write_pr_bead.call_args_list]
+        assert "abandoned" in written_states
+
+
+# ---------------------------------------------------------------------------
 # _resume_stale_issues — worktree creation and cleanup
 # ---------------------------------------------------------------------------
 

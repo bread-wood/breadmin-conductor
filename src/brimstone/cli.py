@@ -30,7 +30,7 @@ from typing import Any
 import click
 
 from brimstone import health, logger, runner, session
-from brimstone.beads import BeadStore, WorkBead, make_bead_store
+from brimstone.beads import BeadStore, PRBead, WorkBead, make_bead_store
 from brimstone.config import (
     Config,
     build_subprocess_env,
@@ -650,6 +650,7 @@ def _resume_open_prs(
     default_branch: str = "main",
     repo_root: str = "",
     already_handled: set[int] | None = None,
+    store: BeadStore | None = None,
 ) -> None:
     """Monitor any open PRs for the milestone whose issue is not already in-progress.
 
@@ -733,6 +734,7 @@ def _resume_open_prs(
                 config=config,
                 checkpoint=checkpoint,
                 issue_number=issue_number,
+                store=store,
                 worktree_path=wt_path,
                 default_branch=default_branch,
             )
@@ -802,6 +804,7 @@ def _resume_stale_issues(
                     config=config,
                     checkpoint=checkpoint,
                     issue_number=stale_number,
+                    store=store,
                     worktree_path=wt_path,
                     default_branch=default_branch,
                 )
@@ -1901,6 +1904,7 @@ def _run_research_worker(
                     config=config,
                     checkpoint=checkpoint,
                     issue_number=issue_number,
+                    store=store,
                     worktree_path=worktree_path,
                     default_branch=default_branch,
                 )
@@ -2569,6 +2573,7 @@ def _monitor_pr(
     config: Config,
     checkpoint: Checkpoint,
     issue_number: int,
+    store: BeadStore | None = None,
     worktree_path: str = "",
     default_branch: str = "main",
     max_polls: int = _CI_MAX_POLLS,
@@ -2590,6 +2595,8 @@ def _monitor_pr(
         config:         Config instance for logging.
         checkpoint:     Checkpoint instance for logging.
         issue_number:   Original issue number (for logging).
+        store:          BeadStore for writing PRBead state transitions. If
+                        None, bead writes are skipped (backward-compat).
         worktree_path:  Absolute path to the worktree directory (for rebase).
                         If empty, rebase on conflict is skipped and the PR is
                         escalated to human review instead.
@@ -2604,10 +2611,18 @@ def _monitor_pr(
     checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
     rebase_attempts = 0
     ci_fail_count = 0
-    ci_fix_attempts = 0
-    review_fix_attempts = 0
-    _MAX_CI_FIX_ATTEMPTS = 2
-    _MAX_REVIEW_FIX_ATTEMPTS = 2
+
+    # Write initial PRBead
+    pr_bead = PRBead(
+        v=1,
+        pr_number=pr_number,
+        issue_number=issue_number,
+        branch=branch,
+        state="open",
+        created_at=datetime.now(UTC).isoformat(),
+    )
+    if store is not None:
+        store.write_pr_bead(pr_bead)
 
     for poll_idx in range(max_polls):
         time.sleep(poll_interval)
@@ -2628,6 +2643,9 @@ def _monitor_pr(
                     },
                     log_dir=config.log_dir.expanduser(),
                 )
+                pr_bead.state = "conflict"
+                if store is not None:
+                    store.write_pr_bead(pr_bead)
                 return False
 
             if rebase_attempts >= _REBASE_RETRY_LIMIT:
@@ -2642,6 +2660,9 @@ def _monitor_pr(
                     },
                     log_dir=config.log_dir.expanduser(),
                 )
+                pr_bead.state = "conflict"
+                if store is not None:
+                    store.write_pr_bead(pr_bead)
                 return False
 
             rebase_ok = _rebase_branch(branch, repo, worktree_path, default_branch, config=config)
@@ -2658,6 +2679,9 @@ def _monitor_pr(
                     },
                     log_dir=config.log_dir.expanduser(),
                 )
+                pr_bead.state = "conflict"
+                if store is not None:
+                    store.write_pr_bead(pr_bead)
                 return False
             # Rebase succeeded — continue polling so CI can re-run
             continue
@@ -2682,34 +2706,13 @@ def _monitor_pr(
             review_status = _get_review_status(repo, pr_number)
 
             if review_status == "changes_requested":
-                if review_fix_attempts >= _MAX_REVIEW_FIX_ATTEMPTS:
-                    logger.log_conductor_event(
-                        run_id=checkpoint.run_id,
-                        phase="review",
-                        event_type="human_escalate",
-                        payload={
-                            "pr_number": pr_number,
-                            "issue_number": issue_number,
-                            "reason": "review changes_requested after max fix attempts",
-                            "review_fix_attempts": review_fix_attempts,
-                        },
-                        log_dir=config.log_dir.expanduser(),
-                    )
-                    return False
-                result = _handle_pr_review_feedback(
-                    pr_number=pr_number,
-                    branch=branch,
-                    repo=repo,
-                    config=config,
-                    checkpoint=checkpoint,
-                    issue_number=issue_number,
-                )
-                review_fix_attempts += 1
-                if result == "fixed":
-                    continue  # wait for CI to re-run on new commit
-                elif result == "error":
-                    return False
-                # "no_feedback" → fall through to merge
+                # Record that review feedback is pending — do NOT dispatch a fix agent.
+                # Agents handle their own review feedback via updated skill files (PR 5).
+                pr_bead.state = "reviewing"
+                if store is not None:
+                    store.write_pr_bead(pr_bead)
+                # Continue polling — agent may push a fix commit
+                continue
 
             # Squash merge — review is approved, no_review, or feedback was addressed
             merge_result = _gh(
@@ -2718,7 +2721,19 @@ def _monitor_pr(
                 check=False,
             )
             if merge_result.returncode == 0:
-                # Record completion in checkpoint
+                pr_bead.state = "merged"
+                pr_bead.merged_at = datetime.now(UTC).isoformat()
+                if store is not None:
+                    store.write_pr_bead(pr_bead)
+                # Also update WorkBead to closed
+                if store is not None:
+                    work_bead = store.read_work_bead(issue_number)
+                    if work_bead is not None:
+                        work_bead.state = "closed"
+                        work_bead.closed_at = pr_bead.merged_at
+                        store.write_work_bead(work_bead)
+                    store.flush(f"brimstone: #{issue_number} merged via pr-{pr_number}")
+                # Keep legacy checkpoint update for backward-compat until PR 7b
                 checkpoint.completed_prs.append(pr_number)
                 session.save(checkpoint, checkpoint_path)
 
@@ -2751,22 +2766,17 @@ def _monitor_pr(
 
         elif ci_status == "fail":
             ci_fail_count += 1
-            if ci_fail_count == 1:
-                # First failure: may be transient — poll once more before acting.
-                pass
-            elif ci_fix_attempts < _MAX_CI_FIX_ATTEMPTS:
-                # Persistent failure: dispatch a CI fix agent and reset the counter.
-                ci_fix_attempts += 1
-                ci_fail_count = 0
-                _dispatch_ci_fix_agent(
-                    pr_number=pr_number,
-                    branch=branch,
-                    repo=repo,
-                    config=config,
-                    checkpoint=checkpoint,
-                    issue_number=issue_number,
-                )
+            if ci_fail_count <= 1:
+                # First failure: may be transient — poll once more
+                pr_bead.ci_state = "failing"
+                if store is not None:
+                    store.write_pr_bead(pr_bead)
             else:
+                # Persistent failure — escalate; agents should fix CI via updated skills (PR 5)
+                pr_bead.state = "ci_failing"
+                pr_bead.ci_state = "failing"
+                if store is not None:
+                    store.write_pr_bead(pr_bead)
                 logger.log_conductor_event(
                     run_id=checkpoint.run_id,
                     phase="ci_check",
@@ -2774,8 +2784,8 @@ def _monitor_pr(
                     payload={
                         "pr_number": pr_number,
                         "issue_number": issue_number,
-                        "reason": "ci failed after fix attempts",
-                        "ci_fix_attempts": ci_fix_attempts,
+                        "reason": "ci failed (persistent); agent should fix via skill",
+                        "ci_fail_count": ci_fail_count,
                     },
                     log_dir=config.log_dir.expanduser(),
                 )
@@ -2784,6 +2794,9 @@ def _monitor_pr(
         # ci_status == "pending": continue polling
 
     # Timeout
+    pr_bead.state = "abandoned"
+    if store is not None:
+        store.write_pr_bead(pr_bead)
     logger.log_conductor_event(
         run_id=checkpoint.run_id,
         phase="ci_check",
@@ -3581,6 +3594,7 @@ def _run_impl_worker(
             default_branch=default_branch,
             repo_root=repo_root,
             already_handled=handled,
+            store=store,
         )
         _startup_dep_checks(_list_open_issues_by_label(repo, milestone, IMPL_LABEL), repo)
 
@@ -3718,6 +3732,7 @@ def _run_impl_worker(
                     checkpoint=checkpoint,
                     worktree_path=worktree_path,
                     issue_number=issue_number,
+                    store=store,
                     default_branch=default_branch,
                 )
                 monitor_attempts += 1
@@ -3995,6 +4010,7 @@ def _run_design_worker(
             checkpoint=checkpoint,
             worktree_path=worktree_path,
             issue_number=hld_number,
+            store=store,
             default_branch=default_branch,
         )
         _remove_worktree(worktree_path, repo_root)
@@ -4126,6 +4142,7 @@ def _run_design_worker(
                     checkpoint=checkpoint,
                     worktree_path=worktree_path,
                     issue_number=issue_number,
+                    store=store,
                     default_branch=default_branch,
                 )
                 _remove_worktree(worktree_path, repo_root)
