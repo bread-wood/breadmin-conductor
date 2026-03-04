@@ -4533,6 +4533,12 @@ def run(
     # Resolve default branch once for gate checks
     default_branch = _get_default_branch_for_repo(repo_ref) if repo_ref and not dry_run else "main"
 
+    # Ensure all required labels exist on the repo before any stage runs.
+    # This is idempotent — safe to call on repos that went through `brimstone init`
+    # and on repos adopted or pointed at directly without init.
+    if not dry_run and repo_ref:
+        _ensure_labels(repo_ref)
+
     # -----------------------------------------------------------------------
     # Execute milestone-first: complete each milestone fully before starting
     # the next. This ensures implementation decisions from vN inform vN+1
