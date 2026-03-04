@@ -721,6 +721,17 @@ def _resume_open_prs(
         finally:
             if wt_path:
                 _remove_worktree(wt_path, repo_root)
+        # Drain the merge queue after each PR so queued merges land before the
+        # next PR's rebase (which would otherwise conflict with them).
+        if store is not None and repo_root:
+            _process_merge_queue(
+                repo=repo,
+                config=config,
+                checkpoint=checkpoint,
+                store=store,
+                default_branch=default_branch,
+                repo_root=repo_root,
+            )
 
 
 def _resume_stale_issues(
@@ -2349,6 +2360,7 @@ _FEAT_PREFIX = "feat:"
 # CI poll constants
 _CI_POLL_INTERVAL: int = 30  # seconds between gh pr checks polls
 _CI_MAX_POLLS: int = 60  # maximum polls before timeout (30 min)
+_CI_NO_CHECKS_GRACE: int = 3  # consecutive no_checks polls before treating as "no CI configured"
 _REBASE_RETRY_LIMIT: int = 3  # max rebase attempts before escalating
 
 
@@ -2571,7 +2583,9 @@ def _get_pr_checks_status(repo: str, pr_number: int) -> str:
         return "pending"
 
     if not checks:
-        return "pass"  # no CI configured — treat as green
+        # Empty list means checks haven't been queued yet (race after force-push)
+        # or truly no CI configured.  Callers use a grace counter to distinguish.
+        return "no_checks"
 
     statuses = []
     for check in checks:
@@ -2842,6 +2856,7 @@ def _monitor_pr(
     """
     rebase_attempts = 0
     ci_fail_count = 0
+    consecutive_no_checks = 0  # grace counter: empty CI after force-push vs no CI configured
 
     # Write initial PRBead
     pr_bead = PRBead(
@@ -2918,6 +2933,17 @@ def _monitor_pr(
             continue
 
         ci_status = _get_pr_checks_status(repo, pr_number)
+
+        # Handle the "no checks yet" case: distinguish a brief post-push race
+        # (CI not triggered yet) from "repo has no CI configured".
+        # After _CI_NO_CHECKS_GRACE consecutive no_checks polls, treat as pass.
+        if ci_status == "no_checks":
+            consecutive_no_checks += 1
+            if consecutive_no_checks < _CI_NO_CHECKS_GRACE:
+                continue  # wait for CI to appear
+            ci_status = "pass"  # grace exhausted — no CI configured
+        else:
+            consecutive_no_checks = 0  # reset when real checks appear
 
         logger.log_conductor_event(
             run_id=checkpoint.run_id,
@@ -3743,6 +3769,129 @@ def _dispatch_impl_agent(
     return issue, branch, worktree_path, result
 
 
+_SCAFFOLD_TITLE = "impl: project scaffold — pyproject.toml, package init, Makefile"
+_SCAFFOLD_BODY = """\
+## Context
+Establishes the project scaffold so parallel module impl workers never conflict on shared files.
+Must merge before any other impl issue begins.
+
+## Acceptance Criteria
+- [ ] `pyproject.toml` exists with correct package name, dependencies, and dev extras
+- [ ] `src/<pkg>/__init__.py` exists (may be empty)
+- [ ] `Makefile` exists with `test` and `lint` targets
+- [ ] `make test && make lint` pass on a clean checkout
+- [ ] README.md exists with package name, one-line description, and basic usage
+
+## Scope
+Files to create or modify:
+- `pyproject.toml` — package metadata, dependencies, dev tooling
+- `src/<pkg>/__init__.py` — package init
+- `Makefile` — test and lint targets
+- `README.md` — minimal project readme
+
+## Test Requirements
+- `make test` exits 0
+- `make lint` exits 0
+
+## Dependencies
+None — this is the foundation issue.
+
+## Key Design Decisions
+- All other impl workers are forbidden from creating `pyproject.toml` or package __init__.py;
+  they add module files only and declare deps in pyproject.toml via PR review if needed.
+"""
+
+
+def _ensure_impl_scaffold(
+    repo: str,
+    milestone: str,
+    store: BeadStore,
+) -> int | None:
+    """Ensure a scaffold impl issue exists and all other impl beads block on it.
+
+    Idempotent: if a scaffold issue (title contains "scaffold") already exists,
+    uses its number. Otherwise creates one. Then ensures every non-scaffold impl
+    bead has the scaffold issue number in its ``blocked_by`` list.
+
+    Returns the scaffold issue number, or None on failure.
+    """
+    result = _gh(
+        [
+            "issue",
+            "list",
+            "--state",
+            "open",
+            "--label",
+            IMPL_LABEL,
+            "--milestone",
+            milestone,
+            "--json",
+            "number,title",
+            "--limit",
+            "200",
+        ],
+        repo=repo,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        issues: list[dict] = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+    scaffold = next(
+        (i for i in issues if "scaffold" in i.get("title", "").lower()),
+        None,
+    )
+    if scaffold is None:
+        create = _gh(
+            [
+                "issue",
+                "create",
+                "--title",
+                _SCAFFOLD_TITLE,
+                "--label",
+                f"infra,{IMPL_LABEL},P1",
+                "--milestone",
+                milestone,
+                "--body",
+                _SCAFFOLD_BODY,
+            ],
+            repo=repo,
+            check=False,
+        )
+        if create.returncode != 0:
+            click.echo(
+                f"[impl-worker] Warning: could not create scaffold issue: {create.stderr}",
+                err=True,
+            )
+            return None
+        url = create.stdout.strip()
+        try:
+            scaffold_number = int(url.split("/")[-1])
+        except (ValueError, IndexError):
+            return None
+        click.echo(f"[impl-worker] Created scaffold issue #{scaffold_number}", err=True)
+    else:
+        scaffold_number = scaffold["number"]
+
+    # Seed beads so newly created scaffold issue gets a bead
+    _seed_work_beads(repo, milestone, IMPL_LABEL, "impl", store)
+
+    # Ensure every non-scaffold impl bead blocks on the scaffold
+    for bead in store.list_work_beads(milestone=milestone, stage="impl"):
+        if bead.issue_number == scaffold_number:
+            continue
+        if scaffold_number not in bead.blocked_by:
+            bead.blocked_by = [scaffold_number] + [
+                n for n in bead.blocked_by if n != scaffold_number
+            ]
+            store.write_work_bead(bead)
+
+    return scaffold_number
+
+
 def _run_impl_worker(
     repo: str,
     milestone: str,
@@ -3801,6 +3950,8 @@ def _run_impl_worker(
             store=store,
         )
         _startup_dep_checks(_list_open_issues_by_label(repo, milestone, IMPL_LABEL), repo)
+        if store is not None:
+            _ensure_impl_scaffold(repo=repo, milestone=milestone, store=store)
 
     if dry_run:
         if store is not None:
