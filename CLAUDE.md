@@ -9,6 +9,7 @@ One agent per module at a time. Each agent may only modify files within its assi
 
 | Module | Scope |
 |--------|-------|
+| `beads` | `src/brimstone/beads.py`, `~/.brimstone/beads/` |
 | `config` | `src/brimstone/config.py` |
 | `runner` | `src/brimstone/runner.py`, `src/brimstone/session.py` |
 | `health` | `src/brimstone/health.py` |

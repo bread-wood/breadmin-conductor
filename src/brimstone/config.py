@@ -119,7 +119,19 @@ class Config(BaseSettings):
     # --- Model ---
     model: str = Field(
         default="claude-sonnet-4-6",
-        description="Claude model ID passed to claude -p via --model",
+        description="Claude model ID for impl agents (default: claude-sonnet-4-6)",
+    )
+    research_model: str = Field(
+        default="claude-haiku-4-5-20251001",
+        description="Claude model ID for research agents (default: claude-haiku-4-5-20251001)",
+    )
+    design_model: str = Field(
+        default="claude-sonnet-4-6",
+        description="Claude model ID for design agents (default: claude-sonnet-4-6)",
+    )
+    scope_model: str = Field(
+        default="claude-haiku-4-5-20251001",
+        description="Claude model ID for scope/plan-issues agents (default: haiku)",
     )
 
     # --- Git / GitHub ---
@@ -156,6 +168,20 @@ class Config(BaseSettings):
             "Version name override for plan-milestones spec seeding. "
             "When None, the version is inferred from the spec filename stem."
         ),
+    )
+
+    # --- Bead storage ---
+    beads_dir: Path = Field(
+        default=Path("~/.brimstone/beads"),
+        description="Local bead storage root",
+    )
+    state_repo: str | None = Field(
+        default=None,
+        description="Optional 'owner/repo' for portable state (git-backed bead sync)",
+    )
+    state_repo_dir: Path = Field(
+        default=Path("~/.brimstone/state-repos"),
+        description="Clone directory for state repos",
     )
 
     # --- Health checks ---
