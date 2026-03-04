@@ -5185,7 +5185,7 @@ def _run_plan(
     dry_run: bool = False,
     spec_stem: str | None = None,
     spec_local_path: str | None = None,
-    store: "BeadStore | None" = None,
+    store: BeadStore | None = None,
 ) -> None:
     """Dispatch a single plan agent to create a milestone pair and seed issues.
 
