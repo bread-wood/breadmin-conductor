@@ -122,6 +122,13 @@ class RunResult:
     is the primary diagnostic signal for the 'missing_result_event' case.
     """
 
+    all_events: list[dict] = field(default_factory=list)
+    """
+    Full ordered list of stream-json events received from the subprocess stdout.
+    Includes assistant, user, tool_use, tool_result, result, and system events.
+    Used by logger.log_agent_transcript to write the per-session audit trail.
+    """
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -571,6 +578,7 @@ def _build_result_from_event(
         stderr=stderr_text,
         overage_detected=overage_detected,
         num_events=len(all_events),
+        all_events=all_events,
     )
 
 
@@ -614,6 +622,7 @@ def _synthesise_result(
         stderr=stderr_text,
         overage_detected=overage_detected,
         num_events=len(all_events),
+        all_events=all_events,
     )
 
 

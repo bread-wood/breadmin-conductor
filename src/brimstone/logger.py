@@ -1,18 +1,20 @@
 """Per-session JSONL logging and cost ledger.
 
-Three independent append-only JSONL write streams:
+Four independent append-only JSONL write streams:
 
-  {log_dir}/cost.jsonl               -- permanent cost ledger; file-locked for concurrent writes
-  {log_dir}/sessions/<session>.jsonl -- per-session execution log (single-writer, no lock)
-  {log_dir}/conductor/<run>.jsonl    -- conductor orchestration log (single-writer, no lock)
+  {log_dir}/cost.jsonl                  -- permanent cost ledger; file-locked for concurrent writes
+  {log_dir}/sessions/<session>.jsonl    -- per-session execution log (single-writer, no lock)
+  {log_dir}/conductor/<run>.jsonl       -- conductor orchestration log (single-writer, no lock)
+  {log_dir}/transcripts/<session>.jsonl -- raw stream-json agent transcript (single-writer, no lock)
 
 Public API
 ----------
-LogContext          -- frozen dataclass carrying per-invocation identity fields
-log_cost            -- append one entry to cost.jsonl
-log_session_event   -- append one structured event to sessions/<session-id>.jsonl
-log_conductor_event -- append one structured event to conductor/<run-id>.jsonl
-read_cost_ledger    -- read and optionally filter cost.jsonl; used by ``brimstone cost``
+LogContext             -- frozen dataclass carrying per-invocation identity fields
+log_cost               -- append one entry to cost.jsonl
+log_session_event      -- append one structured event to sessions/<session-id>.jsonl
+log_conductor_event    -- append one structured event to conductor/<run-id>.jsonl
+log_agent_transcript   -- write full stream-json event log for one agent invocation
+read_cost_ledger       -- read and optionally filter cost.jsonl; used by ``brimstone cost``
 
 Conductor event types (11 total)
 ---------------------------------
@@ -349,6 +351,53 @@ def log_conductor_event(
     }
     path = log_dir / "conductor" / f"{run_id}.jsonl"
     _append_unlocked(path, record)
+
+
+# ---------------------------------------------------------------------------
+# Agent transcript logging
+# ---------------------------------------------------------------------------
+
+
+def log_agent_transcript(
+    all_events: list[dict],
+    label: str,
+    *,
+    session_id: str | None,
+    log_dir: Path,
+) -> None:
+    """Write the full stream-json event transcript for one agent invocation.
+
+    Creates ``{log_dir}/transcripts/{session_id}.jsonl`` (or a timestamp-based
+    name if session_id is unavailable). The first line is a metadata header;
+    subsequent lines are the raw stream-json events, one per line.
+
+    Args:
+        all_events:  The complete ordered list of stream-json events from RunResult.
+        label:       Human-readable identifier, e.g. ``"research-42"`` or
+                     ``"plan-milestones"``.
+        session_id:  UUID from the result event (``raw_result_event["session_id"]``).
+                     Falls back to a timestamp string when None.
+        log_dir:     Resolved log root directory.
+    """
+    sid = session_id or _now_iso().replace(":", "-").replace(".", "-")
+    path = log_dir / "transcripts" / f"{sid}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines: list[str] = [
+        json.dumps(
+            {
+                "type": "transcript_meta",
+                "label": label,
+                "session_id": sid,
+                "timestamp": _now_iso(),
+                "num_events": len(all_events),
+            }
+        )
+    ]
+    for event in all_events:
+        lines.append(json.dumps(event))
+
+    path.write_text("\n".join(lines) + "\n")
 
 
 # ---------------------------------------------------------------------------
