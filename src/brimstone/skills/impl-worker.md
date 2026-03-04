@@ -100,29 +100,26 @@ As **each agent completes** (do not wait for the entire batch):
 
 1. **Clean up** its worktree.
 2. **Evaluate the result**:
-   - If the agent created a PR:
-     - Check CI: `gh pr checks <PR-number> --watch`
-     - Check review: `gh pr view <PR-number> --json reviews`
-     - If CI + review pass → squash merge:
-       ```bash
-       gh pr merge <PR-number> --squash --delete-branch
-       git pull origin $DEFAULT_BRANCH
-       ```
-     - If CI or review fails → attempt one fix cycle (rebase, address feedback,
-       push, re-check). If still failing after retry → abandon the issue:
-       ```bash
-       gh issue edit <N> --remove-assignee @me --remove-label in-progress
-       gh pr close <PR-number>
-       git push origin --delete <branch-name>
-       ```
-   - If the agent failed to create a PR → abandon the issue (unclaim, delete branch).
+   - Agents handle CI and review feedback themselves (they poll CI, fix failures up to 3 times,
+     and address CHANGES_REQUESTED reviews up to 2 times before stopping).
+   - If the agent created a PR and output `Done.`:
+     - Squash merge: `gh pr merge <PR-number> --squash --delete-branch`
+     - `git pull origin $DEFAULT_BRANCH`
+   - If the agent failed to create a PR → abandon the issue (unclaim, delete branch):
+     ```bash
+     gh issue edit <N> --remove-assignee @me --remove-label in-progress
+     git push origin --delete <branch-name>
+     ```
+   - If the agent left a comment saying CI/reviews still failing → abandon the issue:
+     ```bash
+     gh issue edit <N> --remove-assignee @me --remove-label in-progress
+     gh pr close <PR-number>
+     git push origin --delete <branch-name>
+     ```
 
-3. **Re-survey**: Check for newly unblocked issues (dependencies may have been
-   resolved by the merge just completed).
+3. **Re-survey**: Check for newly unblocked issues.
 
-4. **Fill freed slots**: If a module slot is now free AND unblocked work exists
-   for that module → claim and dispatch a new agent immediately (repeat Step 2
-   for just that issue).
+4. **Fill freed slots**: Claim and dispatch a new agent for the freed module slot.
 
 5. **Continue** until all agents have completed AND no new dispatchable work remains.
 

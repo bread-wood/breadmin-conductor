@@ -190,7 +190,17 @@ Launch sub-agents in parallel using `Agent(isolation: "worktree")`.
 >    <list issue numbers or 'none'>
 >    "
 >    ```
-> 11. STOP. Do not merge. The orchestrator monitors CI and merges when ready.
+> 11. Verify CI and reviews (REQUIRED):
+>    Research commits use `[skip ci]` so CI should pass immediately.
+>    Check that the PR is mergeable:
+>      `gh pr view <PR-number> --repo <owner>/<repo> --json mergeable,mergeStateStatus --jq '{mergeable,mergeStateStatus}'`
+>    If CHANGES_REQUESTED from a reviewer:
+>      Collect feedback: `gh pr view <PR-number> --repo <owner>/<repo> --json reviews`
+>      Address all feedback in ONE commit, push, re-request review.
+>      Max 2 review fix attempts.
+> 12. When CI passes + no CHANGES_REQUESTED outstanding:
+>    Output exactly one line: `Done.`
+>    Do NOT merge. The orchestrator handles merging.
 
 ### Step 3 — Merge & Requeue
 
@@ -198,8 +208,8 @@ As **each agent completes** (do not wait for the entire batch):
 
 1. **Clean up** its worktree: `git worktree remove --force <path>`
 2. **Find the PR** the agent created: `gh pr list --repo <owner>/<repo> --head <branch> --state open --json number`
-   - The brimstone orchestrator monitors and squash-merges it automatically via `gh pr merge --squash`.
-   - If running this skill manually: wait for CI (`gh pr checks <PR> --watch`), then `gh pr merge <PR> --squash --delete-branch`
+   - The research agent already verified CI and reviews are clean before stopping.
+   - The brimstone orchestrator squash-merges it: `gh pr merge <PR> --squash --delete-branch`
 3. **Pull**: `git pull origin $DEFAULT_BRANCH`
 4. **Verify follow-ups were created**: read the research doc's "Follow-Up Issues Spawned" section
    - If the agent created zero follow-ups, read the doc's "Follow-Up Recommendations" section yourself and decide if any warrant issues — if so, create them with `stage/research,<P0|P1|P2|P3>` labels
