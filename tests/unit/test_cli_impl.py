@@ -1726,9 +1726,7 @@ class TestDeaconScan:
         )
         return bead
 
-    def _make_work_bead(
-        self, issue_number: int = 7, claimed_at: str | None = None
-    ) -> MagicMock:
+    def _make_work_bead(self, issue_number: int = 7, claimed_at: str | None = None) -> MagicMock:
         from brimstone.beads import WorkBead
 
         if claimed_at is None:
