@@ -5185,6 +5185,7 @@ def _run_plan(
     dry_run: bool = False,
     spec_stem: str | None = None,
     spec_local_path: str | None = None,
+    store: "BeadStore | None" = None,
 ) -> None:
     """Dispatch a single plan agent to create a milestone pair and seed issues.
 
@@ -5202,24 +5203,23 @@ def _run_plan(
                          When None, falls back to ``version``.
         spec_local_path: Absolute path to the original spec file on disk. When provided,
                          the agent reads it directly; otherwise reads via GitHub API.
+        store:           Active BeadStore. When provided, used as source of truth to
+                         detect whether research beads already exist for this milestone.
     """
     if spec_stem is None:
         spec_stem = version
     checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
     today = date.today().isoformat()
 
-    # Skip plan if research issues already exist — plan already ran for this milestone.
-    if not dry_run:
-        try:
-            existing = _count_open_issues_by_label(repo, version, RESEARCH_LABEL)
-            if existing > 0:
-                click.echo(
-                    f"[plan] {existing} open research issue(s) already exist for {version!r}"
-                    " — plan stage skipped (already seeded)."
-                )
-                return
-        except Exception:
-            pass  # If the check fails, fall through and let the agent run normally
+    # Skip plan if research beads already exist — BeadStore is source of truth.
+    if not dry_run and store is not None:
+        existing_beads = store.list_work_beads(milestone=version, stage="research")
+        if existing_beads:
+            click.echo(
+                f"[plan] {len(existing_beads)} research bead(s) already exist for {version!r}"
+                " — plan stage skipped (already seeded)."
+            )
+            return
 
     # Skip plan if design is already underway (HLD merged → research issues
     # seeded in a prior run; re-filing them would block design with new research).
@@ -6088,6 +6088,7 @@ def run(
                     dry_run=False,
                     spec_stem=stem,
                     spec_local_path=str(resolved_spec),
+                    store=_store,
                 )
             else:
                 # Completion check — skip if stage is already done
