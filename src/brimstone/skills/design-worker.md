@@ -108,31 +108,43 @@ For each module in the CLAUDE.md module isolation table that needs a design doc:
 
 1. Read the module's scope from CLAUDE.md (which source files it covers).
 
-2. Create a new branch for this LLD:
+2. Check whether a prior-milestone LLD exists for this module:
+   ```bash
+   ls docs/design/*/lld/<module>.md 2>/dev/null
+   ```
+
+3. Create a new branch for this LLD:
    ```bash
    git checkout -b lld-<module>-<research-milestone-slug> origin/$DEFAULT_BRANCH
    ```
 
-3. Write `docs/design/lld/<module>.md` with:
-   - **Module overview** — one paragraph; what problem it solves; which entry points or workers use it
-   - **File paths and exports** — table of source files, their kinds (Python module, skill prompt, etc.), and what each exports or provides
-   - **Public interface** — function signatures with type hints, dataclass schemas, class definitions; no implementation detail
-   - **Data flows and sequence diagrams** — ASCII text-based diagrams showing how data moves through the module; include subprocess invocation patterns where relevant
-   - **Error handling** — which errors this module classifies, what it raises, what callers must handle
-   - **Test requirements** — what unit tests must exist, what integration tests are needed, what must be mocked
-   - **Constraints and non-goals** — what this module explicitly does not do; hard constraints from research findings
+4. Write `docs/design/<milestone>/lld/<module>.md`:
 
-4. Commit:
+   **If no prior LLD exists for this module** (first time this module is documented):
+   - **Module overview** — one paragraph; what problem it solves; which entry points or callers use it
+   - **Public interface** — function signatures with type hints, dataclass schemas, class definitions; no implementation detail
+   - **Data flows** — how data enters and leaves this module; ASCII diagrams where helpful
+   - **Error handling** — which errors this module raises, what callers must handle
+   - **Test requirements** — what must be unit-tested, what integration tests are needed, what to mock
+   - **Constraints and non-goals** — what this module explicitly does not do
+
+   **If a prior LLD exists** (this module was documented in an earlier milestone):
+   - Open with: `> Extends [v<X.Y.Z> LLD](../../../design/<prev-milestone>/lld/<module>.md). Only changes from that version are documented here.`
+   - Document **only the delta**: new interfaces, changed signatures, removed behaviour, new error cases, new test requirements
+   - Do **not** restate anything that is unchanged — if a function signature, error type, or test requirement is the same as the prior version, omit it entirely
+   - If a module is completely unchanged in this milestone, write a one-line doc: `No changes from [v<X.Y.Z>](../../../design/<prev-milestone>/lld/<module>.md).` — do not write a full LLD
+
+5. Commit:
    ```bash
-   git add docs/design/lld/<module>.md
-   git commit -m "docs: add LLD for <module> (<research-milestone>) [skip ci]"
+   git add docs/design/<milestone>/lld/<module>.md
+   git commit -m "docs: add LLD for <module> (<milestone>) [skip ci]"
    ```
 
-5. Push and create a PR:
+6. Push and create a PR:
    ```bash
-   git push -u origin lld-<module>-<research-milestone-slug>
+   git push -u origin lld-<module>-<milestone-slug>
    gh pr create --repo <owner>/<repo> \
-     --title "docs: LLD for <module> (<research-milestone>) [skip ci]" \
+     --title "docs: LLD for <module> (<milestone>) [skip ci]" \
      --label "stage/design" \
      --body "Closes #<issue-number>
 
@@ -167,4 +179,6 @@ gh issue create \
 - **No dispatching** — design-worker does not launch sub-agents
 - **One PR per doc** — HLD gets its own PR; each LLD gets its own PR; merge before writing the next
 - **No gold-plating** — document only what research explicitly determined; don't invent scope
+- **No retreading** — if a prior-milestone LLD exists, document only the delta; never restate unchanged interfaces, algorithms, or constraints
+- **No verbose test specs** — the test requirements section names what must be tested and what to mock; it does not write out full test functions or assertion code. That belongs in the impl issue, not the design doc. Two to five bullet points is the target length for test requirements.
 - Report progress: log each doc produced/merged as it happens
