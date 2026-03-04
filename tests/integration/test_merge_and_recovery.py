@@ -22,6 +22,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from brimstone.beads import (
+    BEAD_SCHEMA_VERSION,
     BeadStore,
     MergeQueue,
     MergeQueueEntry,
@@ -278,12 +279,19 @@ class TestImplWorkerBeadLifecycle:
         checkpoint = make_checkpoint(stage="impl")
         store = BeadStore(beads_dir=tmp_path / "beads" / "owner" / "repo")
 
-        issue = _impl_issue(42, "Add config parsing")
-        call_count = [0]
-
-        def open_issues(repo: str, milestone: str, label: str) -> list:
-            call_count[0] += 1
-            return [issue] if call_count[0] <= 2 else []
+        # Pre-seed the store with an open WorkBead for issue 42 (bead-based path)
+        open_bead = WorkBead(
+            v=BEAD_SCHEMA_VERSION,
+            issue_number=42,
+            title="Add config parsing",
+            milestone="v0.1.0",
+            stage="impl",
+            module="cli",
+            priority="P2",
+            state="open",
+            branch="",
+        )
+        store.write_work_bead(open_bead)
 
         written_work_beads: list[WorkBead] = []
         real_write = store.write_work_bead
@@ -304,17 +312,22 @@ class TestImplWorkerBeadLifecycle:
         ) -> tuple:
             return (issue, branch, worktree_path, fake_run_result())
 
+        def fake_monitor_pr(pr_number: int, issue_number: int, **kwargs: object) -> bool:
+            # Close the bead to let the pool terminate cleanly
+            bead = store.read_work_bead(issue_number)
+            if bead is not None:
+                bead.state = "closed"
+                real_write(bead)
+            return True
+
         with (
             patch("brimstone.cli._get_default_branch_for_repo", return_value="mainline"),
-            patch("brimstone.cli._list_open_issues_by_label", side_effect=open_issues),
-            patch(
-                "brimstone.cli._filter_unblocked",
-                side_effect=lambda issues, nums, store=None: issues,
-            ),
-            patch("brimstone.cli._sort_issues", side_effect=lambda issues: issues),
-            patch("brimstone.cli._extract_module", return_value="cli"),
             patch("brimstone.cli._gh", side_effect=_gh_side_effect),
             patch("brimstone.cli._dispatch_impl_agent", side_effect=fake_dispatch),
+            patch("brimstone.cli._find_pr_for_branch", return_value=99),
+            patch("brimstone.cli._monitor_pr", side_effect=fake_monitor_pr),
+            patch("brimstone.cli._process_merge_queue"),
+            patch("brimstone.cli._remove_worktree"),
             patch("brimstone.cli._count_all_issues_by_label", return_value=1),
         ):
             _run_impl_worker(

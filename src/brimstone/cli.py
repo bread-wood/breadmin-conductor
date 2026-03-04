@@ -31,6 +31,7 @@ import click
 
 from brimstone import health, logger, runner, session
 from brimstone.beads import (
+    BEAD_SCHEMA_VERSION,
     BeadStore,
     CampaignBead,
     MergeQueueEntry,
@@ -868,6 +869,73 @@ def _list_open_issues_by_label(repo: str, milestone: str, label: str) -> list[di
     ]
 
 
+def _seed_work_beads(
+    repo: str,
+    milestone: str,
+    label: str,
+    stage: str,
+    store: BeadStore,
+) -> None:
+    """Sync GitHub issues for *milestone*/*label* into the bead store.
+
+    Queries GitHub for all open issues (including in-progress) matching the
+    milestone and label, then creates a ``WorkBead(state="open")`` for any
+    issue that does not already have a bead. Existing beads are never
+    overwritten.
+
+    This is the only place GitHub is queried for issue existence. All
+    subsequent dispatch decisions read from the bead store.
+
+    Also picks up followup issues created by agents mid-run (e.g. a research
+    agent spinning off a new research task): the next ``_seed_work_beads``
+    call will create a bead for it and make it eligible for dispatch.
+    """
+    result = _gh(
+        [
+            "issue",
+            "list",
+            "--state",
+            "open",
+            "--label",
+            label,
+            "--milestone",
+            milestone,
+            "--json",
+            "number,title,body,labels,milestone",
+            "--limit",
+            "500",
+        ],
+        repo=repo,
+        check=False,
+    )
+    if result.returncode != 0:
+        return
+    try:
+        issues: list[dict] = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return
+    for issue in issues:
+        issue_number = issue.get("number")
+        if issue_number is None:
+            continue
+        if store.read_work_bead(issue_number) is not None:
+            continue  # bead already exists — never overwrite
+        body = issue.get("body") or ""
+        bead = WorkBead(
+            v=BEAD_SCHEMA_VERSION,
+            issue_number=issue_number,
+            title=issue.get("title", ""),
+            milestone=milestone,
+            stage=stage,
+            module=_extract_module(issue),
+            priority=_extract_priority(issue),
+            state="open",
+            branch="",
+            blocked_by=_parse_dependencies(body),
+        )
+        store.write_work_bead(bead)
+
+
 def _count_open_issues_by_label(repo: str, milestone: str, label: str) -> int:
     """Return count of all open issues (including in-progress) for a stage label."""
     result = _gh(
@@ -1209,24 +1277,33 @@ def _claim_issue(
         store:        Active BeadStore instance.  When set, writes a WorkBead before
                       the GitHub API call.
     """
-    if store is not None and issue is not None:
-        milestone_title = (issue.get("milestone") or {}).get("title", "")
-        body = issue.get("body") or ""
-        bead = WorkBead(
-            v=1,
-            issue_number=issue_number,
-            title=issue.get("title", ""),
-            milestone=milestone_title,
-            stage=_extract_stage(issue),
-            module=_extract_module(issue),
-            priority=_extract_priority(issue),
-            state="claimed",
-            branch=branch,
-            retry_count=0,
-            blocked_by=_parse_dependencies(body),
-            claimed_at=datetime.now(UTC).isoformat(),
-        )
-        store.write_work_bead(bead)
+    if store is not None:
+        existing = store.read_work_bead(issue_number)
+        if existing is not None:
+            # Bead was seeded — update in place
+            existing.state = "claimed"
+            existing.branch = branch
+            existing.claimed_at = datetime.now(UTC).isoformat()
+            store.write_work_bead(existing)
+        elif issue is not None:
+            # No seed bead — create from issue dict (fallback for unseeded stages)
+            milestone_title = (issue.get("milestone") or {}).get("title", "")
+            body = issue.get("body") or ""
+            bead = WorkBead(
+                v=BEAD_SCHEMA_VERSION,
+                issue_number=issue_number,
+                title=issue.get("title", ""),
+                milestone=milestone_title,
+                stage=_extract_stage(issue),
+                module=_extract_module(issue),
+                priority=_extract_priority(issue),
+                state="claimed",
+                branch=branch,
+                retry_count=0,
+                blocked_by=_parse_dependencies(body),
+                claimed_at=datetime.now(UTC).isoformat(),
+            )
+            store.write_work_bead(bead)
         store.flush(f"brimstone: claim #{issue_number}")
     _gh(
         [
@@ -1821,21 +1898,22 @@ def _run_research_worker(
     pool_size = config.max_concurrency or research_limits.get(config.subscription_tier, 3)
 
     if dry_run:
-        open_issues = _list_open_issues_by_label(repo, milestone, RESEARCH_LABEL)
-        blocking, _ = _classify_blocking_issues(
-            open_issues=open_issues,
-            repo=repo,
-            milestone=milestone,
-            config=config,
-            checkpoint=checkpoint,
-            dry_run=dry_run,
-            store=store,
-        )
-        for issue in blocking[:1]:
-            click.echo(
-                f"[dry-run] Would dispatch research agent for issue "
-                f"#{issue['number']}: {issue.get('title', '')}"
-            )
+        if store is not None:
+            _seed_work_beads(repo, milestone, RESEARCH_LABEL, "research", store)
+            open_beads = store.list_work_beads(state="open", milestone=milestone, stage="research")
+            eligible = [b for b in open_beads if not b.deferred]
+            for bead in eligible[:1]:
+                click.echo(
+                    f"[dry-run] Would dispatch research agent for issue "
+                    f"#{bead.issue_number}: {bead.title}"
+                )
+        else:
+            open_issues = _list_open_issues_by_label(repo, milestone, RESEARCH_LABEL)
+            for issue in open_issues[:1]:
+                click.echo(
+                    f"[dry-run] Would dispatch research agent for issue "
+                    f"#{issue['number']}: {issue.get('title', '')}"
+                )
         _run_completion_gate(
             repo=repo,
             milestone=milestone,
@@ -1849,76 +1927,167 @@ def _run_research_worker(
     with concurrent.futures.ThreadPoolExecutor(max_workers=pool_size) as executor:
 
         def _fill(active: dict) -> None:
-            open_issues = _list_open_issues_by_label(repo, milestone, RESEARCH_LABEL)
-            if not open_issues:
-                return
-            blocking, _ = _classify_blocking_issues(
-                open_issues=open_issues,
-                repo=repo,
-                milestone=milestone,
-                config=config,
-                checkpoint=checkpoint,
-                dry_run=False,
-                store=store,
-            )
-            if not blocking:
-                return
-            active_issue_numbers = {info[0]["number"] for info in active.values()}
-            open_issue_numbers = {i.get("number", 0) for i in open_issues}
-            unblocked = _filter_unblocked(blocking, open_issue_numbers, store=store)
-            ranked = _sort_issues(unblocked)
-            for issue in ranked:
-                if len(active) >= pool_size:
-                    break
-                if not gov.can_dispatch(1):
-                    break
-                issue_number = issue["number"]
-                if issue_number in active_issue_numbers:
-                    continue
-                slug = _slugify(issue.get("title", "")[:40])
-                branch_name = f"{issue_number}-{slug}"
-                _claim_issue(
-                    repo=repo,
-                    issue_number=issue_number,
-                    issue=issue,
-                    branch=branch_name,
-                    store=store,
+            if store is not None:
+                # Bead-based dispatch: seed from GitHub, then dispatch from bead store
+                _seed_work_beads(repo, milestone, RESEARCH_LABEL, "research", store)
+                open_beads = store.list_work_beads(
+                    state="open", milestone=milestone, stage="research"
                 )
-                session.save(checkpoint, checkpoint_path)
-                worktree_path = _create_worktree(branch_name, repo_root, default_branch)
-                if worktree_path is None:
-                    click.echo(
-                        f"[research-worker] Failed to create worktree for #{issue_number} "
-                        f"(branch={branch_name!r}) — unclaiming",
-                        err=True,
+                if not open_beads:
+                    return
+                eligible = [
+                    b
+                    for b in open_beads
+                    if b.state == "open"
+                    and not b.deferred
+                    and all(
+                        (dep_bead := store.read_work_bead(dep)) is not None
+                        and dep_bead.state == "closed"
+                        for dep in b.blocked_by
                     )
-                    _unclaim_issue(repo=repo, issue_number=issue_number, store=store)
-                    continue
-                logger.log_conductor_event(
-                    run_id=checkpoint.run_id,
-                    phase="claim",
-                    event_type="issue_claimed",
-                    payload={
-                        "issue_number": issue_number,
-                        "title": issue.get("title", ""),
-                        "branch": branch_name,
-                        "worktree": worktree_path,
-                    },
-                    log_dir=config.log_dir.expanduser(),
+                ]
+                if not eligible:
+                    return
+                active_issue_numbers = {slot[0]["number"] for slot in active.values()}
+                ranked_beads = sorted(
+                    eligible,
+                    key=lambda b: (_PRIORITY_ORDER.get(b.priority, 5), b.issue_number),
                 )
-                gov.record_dispatch(1)
-                future = executor.submit(
-                    _dispatch_research_agent,
-                    issue=issue,
-                    branch_name=branch_name,
-                    worktree_path=worktree_path,
-                    repo=repo,
-                    milestone=milestone,
-                    config=config,
-                    checkpoint=checkpoint,
+                for bead in ranked_beads:
+                    if len(active) >= pool_size:
+                        break
+                    if not gov.can_dispatch(1):
+                        break
+                    if bead.issue_number in active_issue_numbers:
+                        continue
+                    slug = _slugify(bead.title[:40])
+                    branch_name = f"{bead.issue_number}-{slug}"
+                    _claim_issue(
+                        repo=repo,
+                        issue_number=bead.issue_number,
+                        branch=branch_name,
+                        store=store,
+                    )
+                    session.save(checkpoint, checkpoint_path)
+                    worktree_path = _create_worktree(branch_name, repo_root, default_branch)
+                    if worktree_path is None:
+                        click.echo(
+                            f"[research-worker] Failed to create worktree for "
+                            f"#{bead.issue_number} (branch={branch_name!r}) — unclaiming",
+                            err=True,
+                        )
+                        _unclaim_issue(repo=repo, issue_number=bead.issue_number, store=store)
+                        continue
+                    # Fetch issue body from GitHub only at dispatch time
+                    _view = _gh(
+                        [
+                            "issue",
+                            "view",
+                            str(bead.issue_number),
+                            "--json",
+                            "body,number,title",
+                        ],
+                        repo=repo,
+                        check=False,
+                    )
+                    try:
+                        issue_data = json.loads(_view.stdout)
+                    except (json.JSONDecodeError, AttributeError):
+                        issue_data = {
+                            "number": bead.issue_number,
+                            "title": bead.title,
+                            "body": "",
+                        }
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="claim",
+                        event_type="issue_claimed",
+                        payload={
+                            "issue_number": bead.issue_number,
+                            "title": bead.title,
+                            "branch": branch_name,
+                            "worktree": worktree_path,
+                        },
+                        log_dir=config.log_dir.expanduser(),
+                    )
+                    gov.record_dispatch(1)
+                    future = executor.submit(
+                        _dispatch_research_agent,
+                        issue=issue_data,
+                        branch_name=branch_name,
+                        worktree_path=worktree_path,
+                        repo=repo,
+                        milestone=milestone,
+                        config=config,
+                        checkpoint=checkpoint,
+                    )
+                    active[future] = (issue_data, branch_name, worktree_path)
+                    active_issue_numbers.add(bead.issue_number)
+            else:
+                # Fallback: no bead store — use GitHub-based dispatch
+                open_issues = _list_open_issues_by_label(repo, milestone, RESEARCH_LABEL)
+                if not open_issues:
+                    return
+                blocking, _ = _classify_blocking_issues(
+                    open_issues, repo, milestone, config, checkpoint, store=None
                 )
-                active[future] = (issue, branch_name, worktree_path)
-                active_issue_numbers.add(issue_number)
+                if not blocking:
+                    return
+                active_issue_numbers = {slot[0]["number"] for slot in active.values()}
+                ranked = _sort_issues(blocking)
+                for issue in ranked:
+                    if len(active) >= pool_size:
+                        break
+                    if not gov.can_dispatch(1):
+                        break
+                    issue_number = issue["number"]
+                    if issue_number in active_issue_numbers:
+                        continue
+                    issue_title = issue.get("title", "")
+                    slug = _slugify(issue_title[:40])
+                    branch_name = f"{issue_number}-{slug}"
+                    _claim_issue(
+                        repo=repo,
+                        issue_number=issue_number,
+                        issue=issue,
+                        branch=branch_name,
+                        store=None,
+                    )
+                    session.save(checkpoint, checkpoint_path)
+                    worktree_path = _create_worktree(branch_name, repo_root, default_branch)
+                    if worktree_path is None:
+                        click.echo(
+                            f"[research-worker] Failed to create worktree for "
+                            f"#{issue_number} (branch={branch_name!r}) — unclaiming",
+                            err=True,
+                        )
+                        _unclaim_issue(repo=repo, issue_number=issue_number, store=None)
+                        continue
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="claim",
+                        event_type="issue_claimed",
+                        payload={
+                            "issue_number": issue_number,
+                            "title": issue_title,
+                            "branch": branch_name,
+                            "worktree": worktree_path,
+                        },
+                        log_dir=config.log_dir.expanduser(),
+                    )
+                    gov.record_dispatch(1)
+                    future = executor.submit(
+                        _dispatch_research_agent,
+                        issue=issue,
+                        branch_name=branch_name,
+                        worktree_path=worktree_path,
+                        repo=repo,
+                        milestone=milestone,
+                        config=config,
+                        checkpoint=checkpoint,
+                    )
+                    active[future] = (issue, branch_name, worktree_path)
+                    active_issue_numbers.add(issue_number)
 
         def _on_success(issue: dict, branch: str, worktree_path: str) -> None:
             issue_number = issue["number"]
@@ -1953,6 +2122,37 @@ def _run_research_worker(
                 )
 
         def _when_empty() -> bool:
+            if store is not None:
+                # Bead-based completion check
+                _seed_work_beads(repo, milestone, RESEARCH_LABEL, "research", store)
+                all_beads = store.list_work_beads(milestone=milestone, stage="research")
+                open_beads = [b for b in all_beads if b.state not in ("closed", "abandoned")]
+                if not open_beads:
+                    _run_completion_gate(
+                        repo=repo,
+                        milestone=milestone,
+                        open_issues=[],
+                        config=config,
+                        checkpoint=checkpoint,
+                        dry_run=False,
+                    )
+                    return True
+                blocking = [b for b in open_beads if not b.deferred]
+                if not blocking:
+                    deferred_issues = [
+                        {"number": b.issue_number, "title": b.title} for b in open_beads
+                    ]
+                    _run_completion_gate(
+                        repo=repo,
+                        milestone=milestone,
+                        open_issues=deferred_issues,
+                        config=config,
+                        checkpoint=checkpoint,
+                        dry_run=False,
+                    )
+                    return True
+                return False
+            # Fallback: no bead store — use GitHub-based completion check
             open_issues = _list_open_issues_by_label(repo, milestone, RESEARCH_LABEL)
             if not open_issues:
                 _run_completion_gate(
@@ -1964,20 +2164,14 @@ def _run_research_worker(
                     dry_run=False,
                 )
                 return True
-            blocking, non_blocking = _classify_blocking_issues(
-                open_issues=open_issues,
-                repo=repo,
-                milestone=milestone,
-                config=config,
-                checkpoint=checkpoint,
-                dry_run=False,
-                store=store,
+            blocking, deferred = _classify_blocking_issues(
+                open_issues, repo, milestone, config, checkpoint, store=None
             )
             if not blocking:
                 _run_completion_gate(
                     repo=repo,
                     milestone=milestone,
-                    open_issues=non_blocking,
+                    open_issues=deferred,
                     config=config,
                     checkpoint=checkpoint,
                     dry_run=False,
@@ -3606,92 +3800,217 @@ def _run_impl_worker(
         _startup_dep_checks(_list_open_issues_by_label(repo, milestone, IMPL_LABEL), repo)
 
     if dry_run:
-        open_issues = _list_open_issues_by_label(repo, milestone, IMPL_LABEL)
-        open_issue_numbers = {i.get("number", 0) for i in open_issues}
-        unblocked = _filter_unblocked(open_issues, open_issue_numbers, store=store)
-        ranked = _sort_issues(unblocked)
-        if not ranked:
-            click.echo("[dry-run] No open impl issues — implementation complete.")
-        else:
-            for issue in ranked:
-                issue_number = issue["number"]
-                issue_title = issue.get("title", "")
-                mod = _extract_module(issue)
-                branch = f"{issue_number}-{_slugify(issue_title)}"
-                click.echo(
-                    f"[dry-run] Would claim #{issue_number}: {issue_title!r} "
-                    f"(module={mod}, branch={branch})"
+        if store is not None:
+            _seed_work_beads(repo, milestone, IMPL_LABEL, "impl", store)
+            open_beads = store.list_work_beads(state="open", milestone=milestone, stage="impl")
+            eligible = [
+                b
+                for b in open_beads
+                if b.state == "open"
+                and not b.deferred
+                and all(
+                    (dep_bead := store.read_work_bead(dep)) is not None
+                    and dep_bead.state == "closed"
+                    for dep in b.blocked_by
                 )
-            click.echo("[dry-run] Would dispatch agents in parallel; stopping.")
+            ]
+            ranked_dry: list = sorted(
+                eligible,
+                key=lambda b: (_PRIORITY_ORDER.get(b.priority, 5), b.issue_number),
+            )
+            if not ranked_dry:
+                click.echo("[dry-run] No open impl issues — implementation complete.")
+            else:
+                for bead in ranked_dry:
+                    branch = f"{bead.issue_number}-{_slugify(bead.title[:40])}"
+                    click.echo(
+                        f"[dry-run] Would claim #{bead.issue_number}: {bead.title!r} "
+                        f"(module={bead.module}, branch={branch})"
+                    )
+                click.echo("[dry-run] Would dispatch agents in parallel; stopping.")
+        else:
+            open_issues = _list_open_issues_by_label(repo, milestone, IMPL_LABEL)
+            open_issue_numbers = {i.get("number", 0) for i in open_issues}
+            unblocked = _filter_unblocked(open_issues, open_issue_numbers, store=store)
+            ranked = _sort_issues(unblocked)
+            if not ranked:
+                click.echo("[dry-run] No open impl issues — implementation complete.")
+            else:
+                for issue in ranked:
+                    issue_number = issue["number"]
+                    issue_title = issue.get("title", "")
+                    mod = _extract_module(issue)
+                    branch = f"{issue_number}-{_slugify(issue_title)}"
+                    click.echo(
+                        f"[dry-run] Would claim #{issue_number}: {issue_title!r} "
+                        f"(module={mod}, branch={branch})"
+                    )
+                click.echo("[dry-run] Would dispatch agents in parallel; stopping.")
         return
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=pool_size) as executor:
 
         def _fill(active: dict) -> None:
-            open_issues = _list_open_issues_by_label(repo, milestone, IMPL_LABEL)
-            active_issue_numbers = {info[0]["number"] for info in active.values()}
-            open_issue_numbers = {i.get("number", 0) for i in open_issues}
-            unblocked = _filter_unblocked(open_issues, open_issue_numbers, store=store)
-            ranked = _sort_issues(unblocked)
-            for issue in ranked:
-                if len(active) >= pool_size:
-                    break
-                if not gov.can_dispatch(1):
-                    break
-                issue_number = issue["number"]
-                if issue_number in active_issue_numbers:
-                    continue
-                mod = _extract_module(issue)
-                if mod != "none" and mod in active_modules:
-                    continue
-                issue_title = issue.get("title", "")
-                branch = f"{issue_number}-{_slugify(issue_title)}"
-                _claim_issue(
-                    repo=repo,
-                    issue_number=issue_number,
-                    issue=issue,
-                    branch=branch,
-                    store=store,
+            if store is not None:
+                # Bead-based dispatch: seed from GitHub, then dispatch from bead store
+                _seed_work_beads(repo, milestone, IMPL_LABEL, "impl", store)
+                open_beads = store.list_work_beads(state="open", milestone=milestone, stage="impl")
+                if not open_beads:
+                    return
+                eligible = [
+                    b
+                    for b in open_beads
+                    if b.state == "open"
+                    and not b.deferred
+                    and all(
+                        (dep_bead := store.read_work_bead(dep)) is not None
+                        and dep_bead.state == "closed"
+                        for dep in b.blocked_by
+                    )
+                ]
+                if not eligible:
+                    return
+                active_issue_numbers = {slot[0]["number"] for slot in active.values()}
+                ranked_beads = sorted(
+                    eligible,
+                    key=lambda b: (_PRIORITY_ORDER.get(b.priority, 5), b.issue_number),
                 )
-                worktree_path = _create_worktree(branch, repo_root, default_branch)
-                if worktree_path is None:
-                    _unclaim_issue(repo=repo, issue_number=issue_number, store=store)
+                for bead in ranked_beads:
+                    if len(active) >= pool_size:
+                        break
+                    if not gov.can_dispatch(1):
+                        break
+                    if bead.issue_number in active_issue_numbers:
+                        continue
+                    mod = bead.module
+                    if mod != "none" and mod in active_modules:
+                        continue
+                    branch = f"{bead.issue_number}-{_slugify(bead.title[:40])}"
+                    _claim_issue(
+                        repo=repo,
+                        issue_number=bead.issue_number,
+                        branch=branch,
+                        store=store,
+                    )
+                    worktree_path = _create_worktree(branch, repo_root, default_branch)
+                    if worktree_path is None:
+                        _unclaim_issue(repo=repo, issue_number=bead.issue_number, store=store)
+                        logger.log_conductor_event(
+                            run_id=checkpoint.run_id,
+                            phase="claim",
+                            event_type="worktree_create_failed",
+                            payload={"issue_number": bead.issue_number, "branch": branch},
+                            log_dir=config.log_dir.expanduser(),
+                        )
+                        continue
+                    # Fetch issue body from GitHub only at dispatch time
+                    _view = _gh(
+                        ["issue", "view", str(bead.issue_number), "--json", "body,number,title"],
+                        repo=repo,
+                        check=False,
+                    )
+                    try:
+                        issue_data = json.loads(_view.stdout)
+                    except (json.JSONDecodeError, AttributeError):
+                        issue_data = {
+                            "number": bead.issue_number,
+                            "title": bead.title,
+                            "body": "",
+                        }
+                    session.save(checkpoint, checkpoint_path)
                     logger.log_conductor_event(
                         run_id=checkpoint.run_id,
                         phase="claim",
-                        event_type="worktree_create_failed",
-                        payload={"issue_number": issue_number, "branch": branch},
+                        event_type="issue_claimed",
+                        payload={
+                            "issue_number": bead.issue_number,
+                            "title": bead.title,
+                            "branch": branch,
+                            "module": mod,
+                        },
                         log_dir=config.log_dir.expanduser(),
                     )
-                    continue
-                session.save(checkpoint, checkpoint_path)
-                logger.log_conductor_event(
-                    run_id=checkpoint.run_id,
-                    phase="claim",
-                    event_type="issue_claimed",
-                    payload={
-                        "issue_number": issue_number,
-                        "title": issue_title,
-                        "branch": branch,
-                        "module": mod,
-                    },
-                    log_dir=config.log_dir.expanduser(),
-                )
-                gov.record_dispatch(1)
-                active_modules.add(mod)
-                future = executor.submit(
-                    _dispatch_impl_agent,
-                    issue=issue,
-                    branch=branch,
-                    worktree_path=worktree_path,
-                    module=mod,
-                    repo=repo,
-                    config=config,
-                    checkpoint=checkpoint,
-                    dry_run=False,
-                )
-                active[future] = (issue, branch, worktree_path, mod)
-                active_issue_numbers.add(issue_number)
+                    gov.record_dispatch(1)
+                    active_modules.add(mod)
+                    future = executor.submit(
+                        _dispatch_impl_agent,
+                        issue=issue_data,
+                        branch=branch,
+                        worktree_path=worktree_path,
+                        module=mod,
+                        repo=repo,
+                        config=config,
+                        checkpoint=checkpoint,
+                        dry_run=False,
+                    )
+                    active[future] = (issue_data, branch, worktree_path, mod)
+                    active_issue_numbers.add(bead.issue_number)
+            else:
+                # Fallback: no bead store — use GitHub-based dispatch
+                open_issues = _list_open_issues_by_label(repo, milestone, IMPL_LABEL)
+                active_issue_numbers = {info[0]["number"] for info in active.values()}
+                open_issue_numbers = {i.get("number", 0) for i in open_issues}
+                unblocked = _filter_unblocked(open_issues, open_issue_numbers, store=store)
+                ranked = _sort_issues(unblocked)
+                for issue in ranked:
+                    if len(active) >= pool_size:
+                        break
+                    if not gov.can_dispatch(1):
+                        break
+                    issue_number = issue["number"]
+                    if issue_number in active_issue_numbers:
+                        continue
+                    mod = _extract_module(issue)
+                    if mod != "none" and mod in active_modules:
+                        continue
+                    issue_title = issue.get("title", "")
+                    branch = f"{issue_number}-{_slugify(issue_title)}"
+                    _claim_issue(
+                        repo=repo,
+                        issue_number=issue_number,
+                        issue=issue,
+                        branch=branch,
+                        store=store,
+                    )
+                    worktree_path = _create_worktree(branch, repo_root, default_branch)
+                    if worktree_path is None:
+                        _unclaim_issue(repo=repo, issue_number=issue_number, store=store)
+                        logger.log_conductor_event(
+                            run_id=checkpoint.run_id,
+                            phase="claim",
+                            event_type="worktree_create_failed",
+                            payload={"issue_number": issue_number, "branch": branch},
+                            log_dir=config.log_dir.expanduser(),
+                        )
+                        continue
+                    session.save(checkpoint, checkpoint_path)
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="claim",
+                        event_type="issue_claimed",
+                        payload={
+                            "issue_number": issue_number,
+                            "title": issue_title,
+                            "branch": branch,
+                            "module": mod,
+                        },
+                        log_dir=config.log_dir.expanduser(),
+                    )
+                    gov.record_dispatch(1)
+                    active_modules.add(mod)
+                    future = executor.submit(
+                        _dispatch_impl_agent,
+                        issue=issue,
+                        branch=branch,
+                        worktree_path=worktree_path,
+                        module=mod,
+                        repo=repo,
+                        config=config,
+                        checkpoint=checkpoint,
+                        dry_run=False,
+                    )
+                    active[future] = (issue, branch, worktree_path, mod)
+                    active_issue_numbers.add(issue_number)
 
         def _on_success(issue: dict, branch: str, worktree_path: str) -> None:
             issue_number = issue["number"]
@@ -3784,14 +4103,48 @@ def _run_impl_worker(
             active_modules.discard(slot[3])
 
         def _when_empty() -> bool:
-            # Count ALL open impl issues — including in-progress ones. A non-zero
-            # count means at least one PR is unmerged (monitor failed or agent is
-            # still running), so do not declare completion.
+            if store is not None:
+                # Bead-based completion check
+                _seed_work_beads(repo, milestone, IMPL_LABEL, "impl", store)
+                all_beads = store.list_work_beads(milestone=milestone, stage="impl")
+                # Guard: if no impl beads exist, scope may never have run
+                if not all_beads:
+                    total_all = _count_all_issues_by_label(repo, milestone, IMPL_LABEL)
+                    if total_all == 0:
+                        raise click.ClickException(
+                            f"No stage/impl issues found for milestone '{milestone}' "
+                            "(open or closed). The scope stage may not have run or "
+                            "failed silently. Run `brimstone run --scope` first."
+                        )
+                open_beads = [b for b in all_beads if b.state not in ("closed", "abandoned")]
+                if not open_beads:
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="complete",
+                        event_type="stage_complete",
+                        payload={"milestone": milestone},
+                        log_dir=config.log_dir.expanduser(),
+                    )
+                    session.save(checkpoint, checkpoint_path)
+                    click.echo(f"Implementation milestone '{milestone}' complete.")
+                    return True
+                # Only deferred beads remain — non-blocking for stage gate
+                blocking = [b for b in open_beads if not b.deferred]
+                if not blocking:
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="complete",
+                        event_type="stage_complete",
+                        payload={"milestone": milestone},
+                        log_dir=config.log_dir.expanduser(),
+                    )
+                    session.save(checkpoint, checkpoint_path)
+                    click.echo(f"Implementation milestone '{milestone}' complete.")
+                    return True
+                return False
+            # Fallback: no bead store — use GitHub-based completion check
             total_open = _count_open_issues_by_label(repo, milestone, IMPL_LABEL)
             if total_open == 0:
-                # Guard: if no impl issues exist at all (open or closed), scope
-                # never ran or failed silently. Declaring "complete" here would
-                # be a false positive — raise instead.
                 total_all = _count_all_issues_by_label(repo, milestone, IMPL_LABEL)
                 if total_all == 0:
                     raise click.ClickException(
@@ -4349,74 +4702,22 @@ def _run_plan_issues(
 def _validate_spec_path(spec: str) -> Path:
     """Resolve and validate the ``--spec`` argument.
 
-    Accepts three forms:
-
-    * **Absolute path** — e.g. ``/path/to/spec.md``
-    * **Relative path** — e.g. ``./docs/spec.md`` or ``docs/spec.md`` (resolved
-      from cwd); must exist as a local file.
-    * **GitHub path** — ``owner/repo/path/to/spec.md`` (e.g.
-      ``bread-wood/brimstone-specs/brimstone/v0.2.0-hardened-core.md``).
-      Detected when the value does not start with ``/`` or ``./``, does not
-      exist as a local path, and contains at least two ``/`` separators.
-      The file is fetched via ``gh api`` and written to a temp file whose
-      path is returned.
+    Accepts a relative path (resolved from cwd) or an absolute path.  Fails
+    with a :exc:`click.ClickException` if the path does not exist or does not
+    end in ``.md``.
 
     Args:
         spec: Raw value of the ``--spec`` CLI option.
 
     Returns:
-        Resolved absolute :class:`~pathlib.Path` (local file or temp file for
-        GitHub-fetched content).
+        Resolved absolute :class:`~pathlib.Path`.
 
     Raises:
-        click.ClickException: If the path does not exist, cannot be fetched
-            from GitHub, or is not a ``.md`` file.
+        click.ClickException: If the path does not exist or is not a ``.md`` file.
     """
-    # Detect GitHub path: no leading / or ./, not an existing local file, and
-    # at least two slash segments (owner/repo/file…)
-    is_local_prefix = spec.startswith("/") or spec.startswith("./") or spec.startswith("../")
-    local_candidate = Path(spec).expanduser().resolve()
-
-    if not is_local_prefix and not local_candidate.exists() and spec.count("/") >= 2:
-        # GitHub path — parse owner/repo and file_path
-        parts = spec.split("/", 2)
-        owner, repo_name, file_path = parts[0], parts[1], parts[2]
-        api_path = f"repos/{owner}/{repo_name}/contents/{file_path}"
-
-        result = subprocess.run(
-            ["gh", "api", api_path, "--jq", ".content"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            detail = result.stderr.strip() or "empty response"
-            raise click.ClickException(
-                f"Could not fetch spec from GitHub ({owner}/{repo_name}/{file_path}): {detail}"
-            )
-
-        # Decode base64 content (GitHub API returns base64 with newlines)
-        decode_result = subprocess.run(
-            ["base64", "-d"],
-            input=result.stdout,
-            capture_output=True,
-            text=True,
-        )
-        if decode_result.returncode != 0:
-            raise click.ClickException(
-                f"Failed to decode spec content from GitHub: {decode_result.stderr.strip()}"
-            )
-
-        suffix = Path(file_path).suffix or ".md"
-        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False, mode="w", encoding="utf-8")
-        tmp.write(decode_result.stdout)
-        tmp.flush()
-        tmp.close()
-        resolved = Path(tmp.name)
-    else:
-        resolved = local_candidate
-        if not resolved.exists():
-            raise click.ClickException(f"Spec file not found: {resolved}")
-
+    resolved = Path(spec).expanduser().resolve()
+    if not resolved.exists():
+        raise click.ClickException(f"Spec file not found: {resolved}")
     if resolved.suffix.lower() != ".md":
         raise click.ClickException(f"Spec file must be a .md file, got: {resolved.name!r}")
     return resolved
@@ -5917,10 +6218,13 @@ def init(
     default_branch = _config.default_branch  # "mainline"
     rename_result = subprocess.run(
         [
-            "gh", "api",
+            "gh",
+            "api",
             f"repos/{repo_ref}/branches/main/rename",
-            "--method", "POST",
-            "--field", f"new_name={default_branch}",
+            "--method",
+            "POST",
+            "--field",
+            f"new_name={default_branch}",
         ],
         capture_output=True,
         text=True,

@@ -128,6 +128,13 @@ class CampaignBead:
     statuses: dict[str, str] = field(default_factory=dict)
     # status values: "pending" | "planning" | "researching" | "designing"
     #                | "scoping" | "implementing" | "shipped"
+    #
+    # Cross-repo milestone dependencies.
+    # Maps milestone name → list of "owner/repo:milestone" blockers that must
+    # be "shipped" before this milestone can begin.
+    # Example: {"v0.2.1-multi-model": ["bread-wood/brimstone:v0.2.0-hardened-core"]}
+    # Example: {"v0.1.0-knowledge-wire": ["bread-wood/moot:v0.4.0-council-spine"]}
+    milestone_blocked_by: dict[str, list[str]] = field(default_factory=dict)
     updated_at: str = ""
 
 
@@ -212,8 +219,13 @@ class BeadStore:
     # Lists
     # ------------------------------------------------------------------
 
-    def list_work_beads(self, state: str | None = None) -> list[WorkBead]:
-        """Return all WorkBeads, optionally filtered by *state*."""
+    def list_work_beads(
+        self,
+        state: str | None = None,
+        milestone: str | None = None,
+        stage: str | None = None,
+    ) -> list[WorkBead]:
+        """Return all WorkBeads, optionally filtered by *state*, *milestone*, and/or *stage*."""
         work_dir = self._beads_dir / "work"
         results: list[WorkBead] = []
         for p in sorted(work_dir.glob("*.json")):
@@ -221,8 +233,13 @@ class BeadStore:
                 bead = _load_work_bead(p)
             except BeadCorruptError:
                 continue
-            if state is None or bead.state == state:
-                results.append(bead)
+            if state is not None and bead.state != state:
+                continue
+            if milestone is not None and bead.milestone != milestone:
+                continue
+            if stage is not None and bead.stage != stage:
+                continue
+            results.append(bead)
         return results
 
     def list_pr_beads(self, state: str | None = None) -> list[PRBead]:
@@ -432,6 +449,7 @@ def _load_campaign_bead(path: Path) -> CampaignBead:
         milestones=data.get("milestones", []),
         current_index=data.get("current_index", 0),
         statuses=data.get("statuses", {}),
+        milestone_blocked_by=data.get("milestone_blocked_by", {}),
         updated_at=data.get("updated_at", ""),
     )
 
