@@ -1857,3 +1857,80 @@ class TestWatchdogScan:
             )
 
         mock_dispatch.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# End-of-run cost summary
+# ---------------------------------------------------------------------------
+
+
+class TestEndOfRunCostSummary:
+    """After each worker completes, the run command prints a cost summary line."""
+
+    def test_end_of_run_cost_summary_printed(self, tmp_path: Path) -> None:
+        """After impl worker completes, a cost summary line is echoed to stderr."""
+        import json as _json
+
+        from click.testing import CliRunner
+
+        from brimstone.cli import composer
+
+        _REPO = "owner/repo"
+        _MILESTONE = "v1.0"
+
+        # Prepare a log dir with a cost entry for the "impl" stage
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        cost_entry = {
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "session_id": "sess-1",
+            "run_id": "run-1",
+            "repo": _REPO,
+            "milestone": _MILESTONE,
+            "stage": "impl",
+            "issue_number": 1,
+            "model": "claude-sonnet-4-6",
+            "input_tokens": 1000,
+            "output_tokens": 500,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "num_turns": 3,
+            "duration_ms": 5000,
+            "is_error": False,
+            "error_subtype": None,
+            "total_cost_usd": 0.25,
+            "auth_mode": "api_key",
+            "web_search_requests": 0,
+        }
+        (log_dir / "cost.jsonl").write_text(_json.dumps(cost_entry) + "\n")
+
+        # Build a config-like object; override log_dir to use the temp path
+        config = make_config()
+        object.__setattr__(config, "log_dir", log_dir)
+        checkpoint = make_checkpoint()
+
+        with patch.dict("os.environ", MINIMAL_ENV, clear=False):
+            with (
+                patch("brimstone.cli._resolve_repo", return_value=_REPO),
+                patch("brimstone.cli._milestone_exists", return_value=True),
+                patch(
+                    "brimstone.cli._get_default_branch_for_repo",
+                    return_value="main",
+                ),
+                patch("brimstone.cli._count_open_issues_by_label", return_value=2),
+                patch("brimstone.cli._ensure_labels"),
+                patch(
+                    "brimstone.cli.startup_sequence",
+                    return_value=(config, checkpoint, MagicMock()),
+                ),
+                patch("brimstone.cli._run_impl_worker"),
+            ):
+                runner = CliRunner()
+                result = runner.invoke(
+                    composer,
+                    ["run", "--impl", "--repo", _REPO, "--milestone", _MILESTONE],
+                )
+
+        assert result.exit_code == 0, result.output
+        # click.echo(..., err=True) still appears in result.output for CliRunner
+        assert "[impl] cost:" in result.output

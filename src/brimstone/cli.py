@@ -4973,18 +4973,288 @@ def health_cmd(repo: str | None, as_json: bool) -> None:
 
 
 @brimstone.command("cost")
-def cost() -> None:
-    """Show cost ledger summary."""
+@click.option("--run", "run_id", default=None, help="Filter by run ID")
+@click.option(
+    "--stage",
+    default=None,
+    help="Filter by stage (research/design/scope/impl)",
+)
+@click.option("--repo", default=None, help="Filter by repo (owner/name)")
+@click.option("--milestone", default=None, help="Filter by milestone")
+@click.option(
+    "--breakdown",
+    type=click.Choice(["run", "stage", "model", "issue"]),
+    default=None,
+    help="Group results by this field",
+)
+def cost(
+    run_id: str | None,
+    stage: str | None,
+    repo: str | None,
+    milestone: str | None,
+    breakdown: str | None,
+) -> None:
+    """Show cost summary from the cost ledger."""
     config = load_config()
-    checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
-    _chk = session.load(checkpoint_path)
-    _config, _checkpoint, _store = startup_sequence(
-        config=config,
-        checkpoint_path=checkpoint_path,
-        milestone="",
-        stage="cost",
-    )
-    click.echo("Not yet implemented")
+    log_dir = config.log_dir.expanduser()
+
+    entries = logger.read_cost_ledger(log_dir, repo=repo, stage=stage)
+
+    # Apply additional filters in Python
+    if run_id is not None:
+        entries = [e for e in entries if e.get("run_id") == run_id]
+    if milestone is not None:
+        entries = [e for e in entries if e.get("milestone") == milestone]
+
+    if not entries:
+        click.echo("No cost data found.")
+        return
+
+    def _total_cost(ents: list[dict]) -> float:
+        return sum(e.get("total_cost_usd") or 0 for e in ents)
+
+    def _total_input(ents: list[dict]) -> int:
+        return sum(e.get("input_tokens") or 0 for e in ents)
+
+    def _total_output(ents: list[dict]) -> int:
+        return sum(e.get("output_tokens") or 0 for e in ents)
+
+    click.echo("Cost summary")
+    click.echo(f"  Entries : {len(entries)}")
+    click.echo(f"  Total   : ${_total_cost(entries):.4f}")
+    click.echo(f"  Input   : {_total_input(entries):,} tokens")
+    click.echo(f"  Output  : {_total_output(entries):,} tokens")
+
+    if breakdown:
+        # Group by the breakdown field
+        groups: dict[str, list[dict]] = {}
+        for e in entries:
+            key = str(e.get(breakdown) or "(unknown)")
+            groups.setdefault(key, []).append(e)
+
+        click.echo(f"\n  By {breakdown}:")
+        for key, group_entries in sorted(groups.items()):
+            n = len(group_entries)
+            click.echo(f"  {key:<12}  ${_total_cost(group_entries):.4f}  {n:>4} calls")
+
+
+@brimstone.command("report")
+@click.option("--repo", default=None)
+@click.option("--run", "run_id", default=None, help="Run ID (defaults to most recent)")
+@click.option("--milestone", default=None)
+@click.option(
+    "--post",
+    is_flag=True,
+    default=False,
+    help="Post report as GitHub issue comment",
+)
+def report(
+    repo: str | None,
+    run_id: str | None,
+    milestone: str | None,
+    post: bool,
+) -> None:
+    """Print a session report from BeadStore and cost ledger."""
+    config = load_config()
+    repo_ref = repo or config.github_repo
+    if not repo_ref:
+        click.echo("Error: --repo is required (or set github_repo in config)", err=True)
+        raise SystemExit(1)
+    _print_session_report(config, repo_ref, run_id, milestone, post)
+
+
+def _print_session_report(
+    config: Config,
+    repo: str,
+    run_id: str | None,
+    milestone: str | None,
+    post: bool,
+) -> None:
+    """Render a session report from BeadStore and cost ledger."""
+    log_dir = config.log_dir.expanduser()
+    store = make_bead_store(config, repo)
+
+    # Load cost entries
+    all_cost_entries = logger.read_cost_ledger(log_dir, repo=repo)
+    if milestone is not None:
+        all_cost_entries = [e for e in all_cost_entries if e.get("milestone") == milestone]
+
+    # Resolve run_id from most recent cost entry if not specified
+    effective_run_id = run_id
+    if effective_run_id is None and all_cost_entries:
+        effective_run_id = all_cost_entries[-1].get("run_id")
+
+    if effective_run_id is not None:
+        cost_entries = [e for e in all_cost_entries if e.get("run_id") == effective_run_id]
+    else:
+        cost_entries = all_cost_entries
+
+    total_cost = sum(e.get("total_cost_usd") or 0 for e in cost_entries)
+
+    # Load beads
+    work_beads = store.list_work_beads()
+    pr_beads = store.list_pr_beads()
+
+    # Filter by milestone if provided
+    if milestone is not None:
+        work_beads = [b for b in work_beads if b.milestone == milestone]
+
+    sep = "═" * 54
+    click.echo(sep)
+    click.echo("  brimstone session report")
+    header_parts = [f"Repo: {repo}"]
+    if milestone:
+        header_parts.append(f"Milestone: {milestone}")
+    click.echo(f"  {'  |  '.join(header_parts)}")
+    run_label = effective_run_id if effective_run_id else "(unknown)"
+    click.echo(f"  Run: {run_label}  |  Cost: ${total_cost:.2f}")
+    click.echo(sep)
+
+    # ISSUES table
+    click.echo("")
+    click.echo("ISSUES")
+    if not work_beads:
+        click.echo("  (none)")
+    else:
+        for wb in sorted(work_beads, key=lambda b: b.issue_number):
+            pr_info = "(no PR yet)"
+            if wb.pr_id:
+                # pr_id is like "pr-187" — extract number
+                try:
+                    pr_num = int(wb.pr_id.split("-", 1)[1])
+                    pr_bead = store.read_pr_bead(pr_num)
+                    if pr_bead:
+                        pr_info = f"PR #{pr_num}  {pr_bead.state}"
+                    else:
+                        pr_info = f"PR #{pr_num}"
+                except (IndexError, ValueError):
+                    pr_info = wb.pr_id
+            click.echo(f"  #{wb.issue_number:<4}  {wb.title:<26}  {wb.state:<12}  {pr_info}")
+
+    # PULL REQUESTS table
+    click.echo("")
+    click.echo("PULL REQUESTS")
+    if not pr_beads:
+        click.echo("  (none)")
+    else:
+        # Build per-PR cost map
+        pr_cost_map: dict[int, float] = {}
+        for e in cost_entries:
+            issue_num = e.get("issue_number")
+            if issue_num is None:
+                continue
+            # Find PR bead linked to this issue
+            for pb in pr_beads:
+                if pb.issue_number == issue_num:
+                    prev = pr_cost_map.get(pb.pr_number, 0.0)
+                    pr_cost_map[pb.pr_number] = prev + (e.get("total_cost_usd") or 0)
+
+        for pb in sorted(pr_beads, key=lambda b: b.pr_number):
+            pr_cost = pr_cost_map.get(pb.pr_number, 0.0)
+            fix_info = f"{pb.fix_attempts} fix attempts"
+            click.echo(
+                f"  PR #{pb.pr_number:<4}  {pb.branch:<20}"
+                f"  {pb.state:<14}  ${pr_cost:.2f}   {fix_info}"
+            )
+
+    # SUMMARY
+    click.echo("")
+    click.echo("SUMMARY")
+    state_counts: dict[str, int] = {}
+    for wb in work_beads:
+        state_counts[wb.state] = state_counts.get(wb.state, 0) + 1
+    issue_parts = [f"{cnt} {st}" for st, cnt in sorted(state_counts.items())]
+    issue_summary = "  |  ".join(issue_parts) if issue_parts else "(none)"
+    click.echo(f"  Issues:  {issue_summary}")
+
+    pr_state_counts: dict[str, int] = {}
+    for pb in pr_beads:
+        pr_state_counts[pb.state] = pr_state_counts.get(pb.state, 0) + 1
+    pr_parts = [f"{cnt} {st}" for st, cnt in sorted(pr_state_counts.items())]
+    pr_summary = "  |  ".join(pr_parts) if pr_parts else "(none)"
+    click.echo(f"  PRs:     {pr_summary}")
+    click.echo(f"  Cost:    ${total_cost:.2f} total")
+    click.echo(sep)
+
+    if post and milestone:
+        import subprocess as _subprocess
+
+        gh_result = _subprocess.run(
+            [
+                "gh",
+                "issue",
+                "list",
+                "--repo",
+                repo,
+                "--milestone",
+                milestone,
+                "--label",
+                "roadmap",
+                "--json",
+                "number",
+                "--limit",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        issue_list: list[dict] = []
+        try:
+            import json as _json
+
+            issue_list = _json.loads(gh_result.stdout or "[]")
+        except Exception:
+            issue_list = []
+
+        if not issue_list:
+            click.echo(
+                f"Warning: no roadmap tracking issue found for milestone "
+                f"{milestone!r}; skipping post.",
+                err=True,
+            )
+        else:
+            tracking_issue_number = issue_list[0]["number"]
+            # Build markdown body
+            run_md = effective_run_id or "(unknown)"
+            md_lines = [
+                "## brimstone session report",
+                (
+                    f"**Repo:** {repo}  |  **Milestone:** {milestone}"
+                    f"  |  **Run:** {run_md}  |  **Cost:** ${total_cost:.2f}"
+                ),
+                "",
+                "### Issues",
+                "| # | Title | State | PR |",
+                "|---|-------|-------|----|",
+            ]
+            for wb in sorted(work_beads, key=lambda b: b.issue_number):
+                pr_col = ""
+                if wb.pr_id:
+                    try:
+                        pr_num = int(wb.pr_id.split("-", 1)[1])
+                        pr_bead = store.read_pr_bead(pr_num)
+                        pr_col = f"PR #{pr_num} {pr_bead.state if pr_bead else ''}"
+                    except (IndexError, ValueError):
+                        pr_col = wb.pr_id
+                md_lines.append(f"| #{wb.issue_number} | {wb.title} | {wb.state} | {pr_col} |")
+
+            md_lines += ["", "### Summary", f"- Cost: ${total_cost:.2f}", ""]
+            body = "\n".join(md_lines)
+
+            _subprocess.run(
+                [
+                    "gh",
+                    "issue",
+                    "comment",
+                    str(tracking_issue_number),
+                    "--repo",
+                    repo,
+                    "--body",
+                    body,
+                ],
+                capture_output=True,
+                text=True,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -5460,6 +5730,22 @@ def run(
                             )
                             time.sleep(BACKOFF_SLEEP_SECONDS)
                         click.echo(f"[campaign] {ms} fully shipped.", err=True)
+
+                # Print per-stage cost summary
+                try:
+                    _entries = logger.read_cost_ledger(
+                        _config.log_dir.expanduser(),
+                        repo=repo_ref or "",
+                        stage=stage,
+                    )
+                    if _entries:
+                        _stage_cost = sum(e.get("total_cost_usd") or 0 for e in _entries)
+                        click.echo(
+                            f"[{stage}] cost: ${_stage_cost:.4f} ({len(_entries)} calls)",
+                            err=True,
+                        )
+                except AttributeError:
+                    pass
 
         # Mark milestone as shipped in campaign bead
         if is_campaign and not dry_run and campaign_store is not None:
