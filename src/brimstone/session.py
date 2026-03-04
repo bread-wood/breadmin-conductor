@@ -6,7 +6,7 @@ boundaries. Owns the checkpoint schema, atomic read/write, and backoff state.
 Issue/PR lifecycle tracking is migrating to bead files (src/brimstone/beads.py).
 The fields claimed_issues, open_prs, completed_prs, retry_counts, and
 dispatch_times are retained here for backward-compat while cli.py transitions;
-they will be removed once cli.py no longer writes to them (PR 7a).
+they will be removed once cli.py no longer writes to them (PR 7b).
 
 The functions record_dispatch(), is_agent_hung(), and classify_orphaned_issue()
 have been removed — their logic moves to BeadStore + Deacon (beads.py / cli.py).
@@ -30,7 +30,7 @@ from pathlib import Path
 # Module constant
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION: int = 2
+SCHEMA_VERSION: int = 3
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -77,7 +77,6 @@ class Checkpoint:
     timestamp: str
     # Legacy fields — will be removed once cli.py reads from BeadStore instead
     claimed_issues: dict[str, str] = field(default_factory=dict)
-    active_worktrees: list[str] = field(default_factory=list)
     open_prs: dict[str, int] = field(default_factory=dict)
     completed_prs: list[int] = field(default_factory=list)
     rate_limit_backoff_until: str | None = None
@@ -229,6 +228,11 @@ def _migrate(data: dict, *, from_version: int) -> dict:
         # once cli.py reads from BeadStore exclusively).
         version = 2
 
+    if version < 3:
+        # v2 → v3: drop active_worktrees (replaced by Deacon / BeadStore)
+        data.pop("active_worktrees", None)
+        version = 3
+
     data["schema_version"] = SCHEMA_VERSION
     return data
 
@@ -245,7 +249,6 @@ def _dict_to_checkpoint(data: dict) -> Checkpoint:
         stage=data.get("stage", ""),
         timestamp=data.get("timestamp", ""),
         claimed_issues=data.get("claimed_issues", {}),
-        active_worktrees=data.get("active_worktrees", []),
         open_prs=data.get("open_prs", {}),
         completed_prs=data.get("completed_prs", []),
         rate_limit_backoff_until=data.get("rate_limit_backoff_until"),
