@@ -49,6 +49,12 @@ DESIGN_LABEL: str = "stage/design"
 BACKOFF_SLEEP_SECONDS: int = 30
 STALL_MAX_ITERATIONS: int = 5  # 5 × BACKOFF_SLEEP_SECONDS = 2.5 min before escalation
 
+
+def _auth_mode(config: Config) -> str:
+    """Return 'api_key' if an Anthropic API key is configured, else 'subscription'."""
+    return "api_key" if config.anthropic_api_key else "subscription"
+
+
 # ---------------------------------------------------------------------------
 # Startup sequence
 # ---------------------------------------------------------------------------
@@ -767,6 +773,37 @@ def _list_in_progress_research_issues(repo: str, milestone: str) -> list[dict[st
             "open",
             "--label",
             f"{RESEARCH_LABEL},in-progress",
+            "--milestone",
+            milestone,
+            "--json",
+            "number,title",
+            "--limit",
+            "50",
+        ],
+        repo=repo,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+
+def _list_in_progress_impl_issues(repo: str, milestone: str) -> list[dict[str, Any]]:
+    """Return open impl issues with in-progress label for *milestone*.
+
+    Used at impl-worker startup to resume monitoring PRs from a previous run.
+    """
+    result = _gh(
+        [
+            "issue",
+            "list",
+            "--state",
+            "open",
+            "--label",
+            "stage/impl,in-progress",
             "--milestone",
             milestone,
             "--json",
@@ -1819,6 +1856,20 @@ def _run_research_worker(
                 gov.record_completion(1)
                 gov.record_result(result)
                 session.save(checkpoint, checkpoint_path)
+
+                logger.log_cost(
+                    result.raw_result_event or {},
+                    logger.LogContext(
+                        session_id=str(uuid.uuid4()),
+                        run_id=checkpoint.run_id,
+                        repo=repo,
+                        stage="research",
+                        issue_number=issue_number,
+                    ),
+                    log_dir=config.log_dir.expanduser(),
+                    model=config.model,
+                    auth_mode=_auth_mode(config),
+                )
 
                 logger.log_conductor_event(
                     run_id=checkpoint.run_id,
@@ -3074,6 +3125,34 @@ def _run_impl_worker(
     impl_limits: dict[str, int] = {"pro": 2, "max": 3, "max20x": 5}
     pool_size = config.max_concurrency or impl_limits.get(config.subscription_tier, 3)
 
+    # Resume: for any in-progress impl issues, find their PR and monitor it.
+    # If no PR exists, unclaim so the issue can be re-dispatched cleanly.
+    if not dry_run:
+        for stale in _list_in_progress_impl_issues(repo, milestone):
+            stale_number: int = stale["number"]
+            found = _find_pr_for_issue(repo, stale_number)
+            if found is not None:
+                pr_number, stale_branch = found
+                click.echo(
+                    f"[impl-worker] Resuming: monitoring PR #{pr_number}"
+                    f" for issue #{stale_number}",
+                    err=True,
+                )
+                _monitor_pr(
+                    pr_number=pr_number,
+                    branch=stale_branch,
+                    repo=repo,
+                    config=config,
+                    checkpoint=checkpoint,
+                    issue_number=stale_number,
+                )
+            else:
+                _unclaim_issue(repo, stale_number)
+                click.echo(
+                    f"[impl-worker] Unclaimed stale #{stale_number} (no open PR found)",
+                    err=True,
+                )
+
     if dry_run:
         open_issues = _list_open_impl_issues(repo, milestone)
         open_issue_numbers = {i.get("number", 0) for i in open_issues}
@@ -3261,6 +3340,20 @@ def _run_impl_worker(
                 gov.record_completion(1)
                 gov.record_result(result)
                 active_modules.discard(_module)
+
+                logger.log_cost(
+                    result.raw_result_event or {},
+                    logger.LogContext(
+                        session_id=str(uuid.uuid4()),
+                        run_id=checkpoint.run_id,
+                        repo=repo,
+                        stage="impl",
+                        issue_number=issue_number,
+                    ),
+                    log_dir=config.log_dir.expanduser(),
+                    model=config.model,
+                    auth_mode=_auth_mode(config),
+                )
 
                 logger.log_conductor_event(
                     run_id=checkpoint.run_id,
@@ -3522,6 +3615,20 @@ def _run_design_worker(
             checkpoint=checkpoint,
         )
 
+        logger.log_cost(
+            hld_result.raw_result_event or {},
+            logger.LogContext(
+                session_id=str(uuid.uuid4()),
+                run_id=checkpoint.run_id,
+                repo=repo,
+                stage="design",
+                issue_number=hld_number,
+            ),
+            log_dir=config.log_dir.expanduser(),
+            model=config.model,
+            auth_mode=_auth_mode(config),
+        )
+
         if hld_result.is_error:
             _unclaim_issue(repo=repo, issue_number=hld_number)
             _remove_worktree(worktree_path, repo_root)
@@ -3669,6 +3776,20 @@ def _run_design_worker(
                         _remove_worktree(wt, repo_root)
                         continue
 
+                    logger.log_cost(
+                        result.raw_result_event or {},
+                        logger.LogContext(
+                            session_id=str(uuid.uuid4()),
+                            run_id=checkpoint.run_id,
+                            repo=repo,
+                            stage="design",
+                            issue_number=issue_number,
+                        ),
+                        log_dir=config.log_dir.expanduser(),
+                        model=config.model,
+                        auth_mode=_auth_mode(config),
+                    )
+
                     if result.is_error:
                         click.echo(f"LLD agent for {module!r} failed: {result.subtype}", err=True)
                         _unclaim_issue(repo=repo, issue_number=issue_number)
@@ -3794,6 +3915,20 @@ def _run_plan_issues(
         )
     finally:
         skill_tmp.unlink(missing_ok=True)
+
+    logger.log_cost(
+        result.raw_result_event or {},
+        logger.LogContext(
+            session_id=str(uuid.uuid4()),
+            run_id=checkpoint.run_id,
+            repo=repo,
+            stage="scoping",
+            issue_number=None,
+        ),
+        log_dir=config.log_dir.expanduser(),
+        model=config.model,
+        auth_mode=_auth_mode(config),
+    )
 
     logger.log_conductor_event(
         run_id=checkpoint.run_id,
@@ -4500,6 +4635,20 @@ def _run_plan_milestones(
         )
     finally:
         skill_tmp.unlink(missing_ok=True)
+
+    logger.log_cost(
+        result.raw_result_event or {},
+        logger.LogContext(
+            session_id=str(uuid.uuid4()),
+            run_id=checkpoint.run_id,
+            repo=repo,
+            stage="init",
+            issue_number=None,
+        ),
+        log_dir=config.log_dir.expanduser(),
+        model=config.model,
+        auth_mode=_auth_mode(config),
+    )
 
     logger.log_conductor_event(
         run_id=checkpoint.run_id,
