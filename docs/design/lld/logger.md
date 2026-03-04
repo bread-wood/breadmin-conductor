@@ -10,7 +10,7 @@
 
 ## 1. Module Overview
 
-The `logger` module provides three independent JSONL write streams for conductor and its sub-agents: a permanent cost ledger, per-session execution logs, and a conductor orchestrator log. It exports a small write API and one dataclass. All consumers call these functions directly; nothing in this module reads or queries logs — that responsibility belongs to `cli.py` (`brimstone cost`).
+The `logger` module provides four independent JSONL write streams for brimstone and its sub-agents: a permanent cost ledger, per-session agent transcripts, a conductor orchestrator log, and a health log. It exports a small write API and one dataclass. All consumers call these functions directly; nothing in this module reads or queries logs — that responsibility belongs to `cli.py` (`brimstone cost`).
 
 **File path:** `src/brimstone/logger.py`
 
@@ -32,11 +32,21 @@ The `logger` module provides three independent JSONL write streams for conductor
 ~/.brimstone/
   logs/
     cost.jsonl                        ← cost ledger (permanent, append-only)
-    sessions/
-      <session-id>.jsonl              ← per-session execution log (one per claude -p run)
+    health.jsonl                      ← health check outcomes (permanent, append-only)
+    transcripts/
+      <session-id>.jsonl              ← per-agent transcript (one per claude -p run)
     conductor/
       <run-id>.jsonl                  ← orchestrator decisions and stage transitions
 ```
+
+**Four log streams:**
+
+| Stream | File | Audience |
+|--------|------|----------|
+| Cost ledger | `logs/cost.jsonl` | Billing reconciliation; `brimstone cost` CLI |
+| Agent transcripts | `logs/transcripts/<session-id>.jsonl` | Debugging; audit trail per agent invocation |
+| Conductor log | `logs/conductor/<run-id>.jsonl` | Orchestrator decisions; stage transitions; MergeQueue events |
+| Health log | `logs/health.jsonl` | Preflight check outcomes; yeast-bot collaborator status |
 
 ### 2.1 Directory Creation
 
