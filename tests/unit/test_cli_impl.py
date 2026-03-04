@@ -632,18 +632,15 @@ class TestMonitorPr:
         return defaults
 
     def test_passes_and_merges_when_ci_passes(self) -> None:
-        """When CI passes and no changes requested, squash merge is called."""
+        """When CI passes and no changes requested, PR is enqueued for merge."""
         checks = [{"name": "ci", "state": "completed", "bucket": "pass"}]
         reviews = {"reviews": []}
-        merge_result = make_gh_result(returncode=0)
 
         def gh_side_effect(args, **kwargs):
             if "checks" in args:
                 return make_gh_result(stdout=json.dumps(checks))
             elif "reviews" in args:
                 return make_gh_result(stdout=json.dumps(reviews))
-            elif "merge" in args:
-                return merge_result
             return make_gh_result()
 
         with (
@@ -702,11 +699,9 @@ class TestMonitorPr:
                 return make_gh_result(stdout=json.dumps(pass_checks))
             elif "reviews" in args_str:
                 return make_gh_result(stdout=json.dumps({"reviews": []}))
-            elif "merge" in args_str:
-                return make_gh_result(returncode=0)
             return make_gh_result()
 
-        # Conflict on first poll only; no conflict on second poll → CI pass → merge
+        # Conflict on first poll only; no conflict on second poll → CI pass → enqueue
         with (
             patch("brimstone.cli._gh", side_effect=gh_side_effect),
             patch("brimstone.cli._is_conflict_failure", side_effect=[True, False]),
@@ -732,9 +727,9 @@ class TestMonitorPr:
 
         assert result is False
 
-    def test_returns_false_on_merge_failure(self) -> None:
-        """When the squash merge command fails, returns False."""
-        checks = [{"name": "ci", "status": "completed", "conclusion": "success"}]
+    def test_returns_true_on_ci_pass_enqueues_instead_of_merge(self) -> None:
+        """When CI passes, _monitor_pr enqueues to MergeQueue and returns True (no inline merge)."""
+        checks = [{"name": "ci", "state": "completed", "bucket": "pass"}]
         reviews = {"reviews": []}
 
         def gh_side_effect(args, **kwargs):
@@ -743,17 +738,22 @@ class TestMonitorPr:
                 return make_gh_result(stdout=json.dumps(checks))
             elif "reviews" in args_str:
                 return make_gh_result(stdout=json.dumps(reviews))
-            elif "merge" in args_str:
-                return make_gh_result(returncode=1, stdout="")
             return make_gh_result()
 
         with (
-            patch("brimstone.cli._gh", side_effect=gh_side_effect),
+            patch("brimstone.cli._gh", side_effect=gh_side_effect) as mock_gh,
             patch("brimstone.cli.logger.log_conductor_event"),
         ):
             result = _monitor_pr(**self._make_monitor_kwargs())
 
-        assert result is False
+        # Should return True (enqueued), and _gh should NOT have been called with "pr merge"
+        assert result is True
+        merge_calls = [
+            c
+            for c in mock_gh.call_args_list
+            if len(c.args) > 0 and "pr" in c.args[0] and "merge" in c.args[0]
+        ]
+        assert merge_calls == []
 
     def test_escalates_immediately_on_conflict_without_worktree(self) -> None:
         """When worktree_path is empty and conflict detected, escalates without rebase."""
@@ -769,7 +769,7 @@ class TestMonitorPr:
         mock_rebase.assert_not_called()
 
     def test_merges_immediately_with_no_ci(self) -> None:
-        """When no CI checks are configured, PR should merge without waiting."""
+        """When no CI checks are configured, PR should be enqueued without waiting."""
         reviews = {"reviews": []}
 
         def gh_side_effect(args, **kwargs):
@@ -778,8 +778,6 @@ class TestMonitorPr:
                 return make_gh_result(stdout="[]")  # no checks
             elif "reviews" in args_str:
                 return make_gh_result(stdout=json.dumps(reviews))
-            elif "merge" in args_str:
-                return make_gh_result(returncode=0)
             return make_gh_result()
 
         with (
@@ -801,12 +799,10 @@ class TestMonitorPr:
                 return make_gh_result(stdout=json.dumps(pass_checks))
             elif "reviews" in args_str:
                 return make_gh_result(stdout=json.dumps({"reviews": []}))
-            elif "merge" in args_str:
-                return make_gh_result(returncode=0)
             return make_gh_result()
 
         # Poll 1: CI would be pending, but conflict fires first → rebase
-        # Poll 2: no conflict → CI pass → merge
+        # Poll 2: no conflict → CI pass → enqueue
         with (
             patch("brimstone.cli._gh", side_effect=gh_side_effect),
             patch("brimstone.cli._is_conflict_failure", side_effect=[True, False]),
@@ -1313,9 +1309,14 @@ class TestMonitorPrPrBeadWrites:
         # The second CI failure should produce a "ci_failing" bead write
         assert "ci_failing" in captured_states
 
-    def test_writes_merged_bead_on_success(self) -> None:
-        """PRBead state is set to 'merged' and merged_at is set when merge succeeds."""
+    def test_writes_merge_ready_bead_on_ci_pass(self) -> None:
+        """PRBead state is set to 'merge_ready' when CI passes (enqueued, not merged inline)."""
         store = self._make_store()
+        from brimstone.beads import MergeQueue
+
+        store.read_merge_queue.return_value = MergeQueue(
+            v=1, queue=[], updated_at="2026-01-01T00:00:00+00:00"
+        )
         checks = [{"name": "ci", "state": "completed", "bucket": "pass"}]
         reviews = {"reviews": []}
 
@@ -1324,8 +1325,6 @@ class TestMonitorPrPrBeadWrites:
                 return make_gh_result(stdout=json.dumps(checks))
             elif "reviews" in args:
                 return make_gh_result(stdout=json.dumps(reviews))
-            elif "merge" in args:
-                return make_gh_result(returncode=0)
             return make_gh_result()
 
         with (
@@ -1338,12 +1337,9 @@ class TestMonitorPrPrBeadWrites:
 
         assert result is True
         written_states = [c[0][0].state for c in store.write_pr_bead.call_args_list]
-        assert "merged" in written_states
-        # Find the merged bead and confirm merged_at is set
-        merged_bead = next(
-            c[0][0] for c in store.write_pr_bead.call_args_list if c[0][0].state == "merged"
-        )
-        assert merged_bead.merged_at is not None
+        assert "merge_ready" in written_states
+        # write_merge_queue should have been called with the enqueued entry
+        store.write_merge_queue.assert_called()
 
     def test_writes_conflict_bead_on_no_worktree(self) -> None:
         """PRBead state is set to 'conflict' when conflict detected with no worktree."""
@@ -1574,3 +1570,131 @@ class TestRunAgentConfigDirCleanup:
         call_args = mock_rmtree.call_args[0][0]
         assert "agent" in call_args
         assert "deadbeef" in call_args
+
+
+# ---------------------------------------------------------------------------
+# _process_merge_queue
+# ---------------------------------------------------------------------------
+
+
+class TestProcessMergeQueue:
+    """Verify _process_merge_queue() drains the queue and writes bead state."""
+
+    def _make_store(self, tmp_path: Path) -> MagicMock:
+        from brimstone.beads import MergeQueue, MergeQueueEntry
+
+        store = MagicMock()
+        entry = MergeQueueEntry(
+            pr_number=55,
+            issue_number=7,
+            branch="7-my-feature",
+            enqueued_at="2026-03-04T00:00:00+00:00",
+        )
+        queue = MergeQueue(v=1, queue=[entry], updated_at="2026-03-04T00:00:00+00:00")
+        store.read_merge_queue.return_value = queue
+        store.read_pr_bead.return_value = None
+        store.read_work_bead.return_value = None
+        return store
+
+    def test_merges_head_of_queue(self, tmp_path: Path) -> None:
+        """The head entry is merged and removed from the queue on success."""
+        from brimstone.cli import _process_merge_queue
+
+        store = self._make_store(tmp_path)
+        config = make_config()
+        object.__setattr__(config, "checkpoint_dir", tmp_path)
+        object.__setattr__(config, "log_dir", tmp_path)
+        checkpoint = make_checkpoint()
+
+        with (
+            patch("brimstone.cli._checkout_existing_branch_worktree", return_value=""),
+            patch(
+                "brimstone.cli._gh",
+                return_value=MagicMock(returncode=0, stdout="{}", stderr=""),
+            ),
+            patch("brimstone.cli.session.save"),
+            patch("brimstone.cli.logger.log_conductor_event"),
+        ):
+            _process_merge_queue(
+                repo="owner/repo",
+                config=config,
+                checkpoint=checkpoint,
+                store=store,
+                default_branch="mainline",
+                repo_root="/tmp/repo",
+            )
+
+        # Queue should have been written with empty list (head was merged)
+        store.write_merge_queue.assert_called()
+        final_queue = store.write_merge_queue.call_args[0][0]
+        assert final_queue.queue == [], "Queue should be empty after successful merge"
+
+    def test_empty_queue_is_noop(self, tmp_path: Path) -> None:
+        """An empty MergeQueue does nothing."""
+        from brimstone.beads import MergeQueue
+        from brimstone.cli import _process_merge_queue
+
+        store = MagicMock()
+        store.read_merge_queue.return_value = MergeQueue(
+            v=1, queue=[], updated_at="2026-01-01T00:00:00+00:00"
+        )
+        config = make_config()
+        object.__setattr__(config, "checkpoint_dir", tmp_path)
+        object.__setattr__(config, "log_dir", tmp_path)
+        checkpoint = make_checkpoint()
+
+        with patch("brimstone.cli._gh") as mock_gh:
+            _process_merge_queue(
+                repo="owner/repo",
+                config=config,
+                checkpoint=checkpoint,
+                store=store,
+                default_branch="mainline",
+                repo_root="/tmp/repo",
+            )
+            mock_gh.assert_not_called()
+
+    def test_monitor_pr_enqueues_instead_of_merging(self, tmp_path: Path) -> None:
+        """_monitor_pr should enqueue to MergeQueue instead of calling gh pr merge directly."""
+        from brimstone.beads import MergeQueue
+
+        store = MagicMock()
+        store.read_merge_queue.return_value = MergeQueue(
+            v=1, queue=[], updated_at="2026-01-01T00:00:00+00:00"
+        )
+        store.read_work_bead.return_value = None
+        config = make_config()
+        object.__setattr__(config, "checkpoint_dir", tmp_path)
+        object.__setattr__(config, "log_dir", tmp_path)
+        checkpoint = make_checkpoint()
+
+        with (
+            patch("brimstone.cli._is_conflict_failure", return_value=False),
+            patch("brimstone.cli._get_pr_checks_status", return_value="pass"),
+            patch("brimstone.cli._get_review_status", return_value="approved"),
+            patch("brimstone.cli._gh") as mock_gh,
+            patch("brimstone.cli.time.sleep"),
+            patch("brimstone.cli.session.save"),
+            patch("brimstone.cli.logger.log_conductor_event"),
+        ):
+            result = _monitor_pr(
+                pr_number=55,
+                branch="7-feature",
+                repo="owner/repo",
+                config=config,
+                checkpoint=checkpoint,
+                issue_number=7,
+                store=store,
+                poll_interval=0,
+            )
+
+        # _gh should NOT have been called with "pr merge"
+        merge_calls = [
+            call
+            for call in mock_gh.call_args_list
+            if len(call.args) > 0 and "merge" in str(call.args[0])
+        ]
+        assert merge_calls == [], "_gh should not be called with 'merge' — use queue instead"
+        # write_merge_queue should have been called (entry enqueued)
+        assert store.write_merge_queue.call_count >= 1
+        assert result is True

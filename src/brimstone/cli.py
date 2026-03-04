@@ -30,7 +30,13 @@ from typing import Any
 import click
 
 from brimstone import health, logger, runner, session
-from brimstone.beads import BeadStore, PRBead, WorkBead, make_bead_store
+from brimstone.beads import (
+    BeadStore,
+    MergeQueueEntry,
+    PRBead,
+    WorkBead,
+    make_bead_store,
+)
 from brimstone.config import (
     Config,
     build_subprocess_env,
@@ -1914,6 +1920,15 @@ def _run_research_worker(
                     err=True,
                 )
             _remove_worktree(worktree_path, repo_root)
+            if store is not None:
+                _process_merge_queue(
+                    repo=repo,
+                    config=config,
+                    checkpoint=checkpoint,
+                    store=store,
+                    default_branch=default_branch,
+                    repo_root=repo_root,
+                )
 
         def _when_empty() -> bool:
             open_issues = _list_open_issues_by_label(repo, milestone, RESEARCH_LABEL)
@@ -2608,7 +2623,6 @@ def _monitor_pr(
     Returns:
         True if the PR was successfully merged. False otherwise.
     """
-    checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
     rebase_attempts = 0
     ci_fail_count = 0
 
@@ -2714,55 +2728,39 @@ def _monitor_pr(
                 # Continue polling — agent may push a fix commit
                 continue
 
-            # Squash merge — review is approved, no_review, or feedback was addressed
-            merge_result = _gh(
-                ["pr", "merge", str(pr_number), "--squash", "--delete-branch"],
-                repo=repo,
-                check=False,
+            # Enqueue to MergeQueue — _process_merge_queue() does the actual merge
+            _now_str = datetime.now(UTC).isoformat()
+            if store is not None:
+                _queue = store.read_merge_queue()
+                _queue.queue.append(
+                    MergeQueueEntry(
+                        pr_number=pr_number,
+                        issue_number=issue_number,
+                        branch=branch,
+                        enqueued_at=_now_str,
+                    )
+                )
+                _queue.updated_at = _now_str
+                store.write_merge_queue(_queue)
+                pr_bead.state = "merge_ready"
+                store.write_pr_bead(pr_bead)
+                _work_bead = store.read_work_bead(issue_number)
+                if _work_bead is not None:
+                    _work_bead.state = "merge_ready"
+                    store.write_work_bead(_work_bead)
+            logger.log_conductor_event(
+                run_id=checkpoint.run_id,
+                phase="merge",
+                event_type="pr_merged",
+                payload={
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "branch": branch,
+                    "queued": True,
+                },
+                log_dir=config.log_dir.expanduser(),
             )
-            if merge_result.returncode == 0:
-                pr_bead.state = "merged"
-                pr_bead.merged_at = datetime.now(UTC).isoformat()
-                if store is not None:
-                    store.write_pr_bead(pr_bead)
-                # Also update WorkBead to closed
-                if store is not None:
-                    work_bead = store.read_work_bead(issue_number)
-                    if work_bead is not None:
-                        work_bead.state = "closed"
-                        work_bead.closed_at = pr_bead.merged_at
-                        store.write_work_bead(work_bead)
-                    store.flush(f"brimstone: #{issue_number} merged via pr-{pr_number}")
-                # Keep legacy checkpoint update for backward-compat until PR 7b
-                checkpoint.completed_prs.append(pr_number)
-                session.save(checkpoint, checkpoint_path)
-
-                logger.log_conductor_event(
-                    run_id=checkpoint.run_id,
-                    phase="merge",
-                    event_type="pr_merged",
-                    payload={
-                        "pr_number": pr_number,
-                        "issue_number": issue_number,
-                        "branch": branch,
-                    },
-                    log_dir=config.log_dir.expanduser(),
-                )
-                return True
-            else:
-                logger.log_conductor_event(
-                    run_id=checkpoint.run_id,
-                    phase="merge",
-                    event_type="human_escalate",
-                    payload={
-                        "pr_number": pr_number,
-                        "issue_number": issue_number,
-                        "reason": "squash merge failed",
-                        "stderr": merge_result.stderr,
-                    },
-                    log_dir=config.log_dir.expanduser(),
-                )
-                return False
+            return True
 
         elif ci_status == "fail":
             ci_fail_count += 1
@@ -2809,6 +2807,122 @@ def _monitor_pr(
         log_dir=config.log_dir.expanduser(),
     )
     return False
+
+
+def _process_merge_queue(
+    repo: str,
+    config: Config,
+    checkpoint: Checkpoint,
+    store: BeadStore,
+    default_branch: str,
+    repo_root: str,
+) -> None:
+    """Drain the MergeQueue — attempt to merge each enqueued PR in order.
+
+    For each entry in the queue:
+    1. Attempt rebase onto the default branch (in a temporary worktree).
+    2. If rebase fails, push the entry to the tail and break (Deacon handles
+       repeated failures).
+    3. If rebase succeeds, squash-merge and write merged bead state.
+
+    Args:
+        repo:           Repository in ``owner/repo`` format.
+        config:         Validated Config instance.
+        checkpoint:     Active Checkpoint instance (for logging).
+        store:          Active BeadStore for reading/writing bead state.
+        default_branch: Default branch name for rebase target.
+        repo_root:      Absolute path to the local repo clone for worktrees.
+    """
+    checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
+    queue = store.read_merge_queue()
+    if not queue.queue:
+        return
+
+    remaining: list[MergeQueueEntry] = list(queue.queue)
+
+    while remaining:
+        entry = remaining.pop(0)
+        pr_number = entry.pr_number
+        issue_number = entry.issue_number
+        branch = entry.branch
+
+        # Attempt rebase in a temporary worktree
+        wt_path = _checkout_existing_branch_worktree(branch, repo_root) or ""
+        if wt_path:
+            try:
+                rebase_ok = _rebase_branch(branch, repo, wt_path, default_branch, config=config)
+            finally:
+                _remove_worktree(wt_path, repo_root)
+            if not rebase_ok:
+                # Rebase failed — push to tail, stop processing
+                remaining.append(entry)
+                logger.log_conductor_event(
+                    run_id=checkpoint.run_id,
+                    phase="merge",
+                    event_type="human_escalate",
+                    payload={
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "reason": "rebase failed in merge queue; pushed to tail",
+                    },
+                    log_dir=config.log_dir.expanduser(),
+                )
+                break
+
+        # Squash-merge
+        merge_result = _gh(
+            ["pr", "merge", str(pr_number), "--squash", "--delete-branch"],
+            repo=repo,
+            check=False,
+        )
+
+        if merge_result.returncode == 0:
+            now_str = datetime.now(UTC).isoformat()
+            pr_bead = store.read_pr_bead(pr_number)
+            if pr_bead is not None:
+                pr_bead.state = "merged"
+                pr_bead.merged_at = now_str
+                store.write_pr_bead(pr_bead)
+            work_bead = store.read_work_bead(issue_number)
+            if work_bead is not None:
+                work_bead.state = "closed"
+                work_bead.closed_at = now_str
+                store.write_work_bead(work_bead)
+            # Keep legacy checkpoint update for backward-compat until PR 7b
+            checkpoint.completed_prs.append(pr_number)
+            session.save(checkpoint, checkpoint_path)
+            store.flush(f"brimstone: #{issue_number} merged via pr-{pr_number}")
+            logger.log_conductor_event(
+                run_id=checkpoint.run_id,
+                phase="merge",
+                event_type="pr_merged",
+                payload={
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "branch": branch,
+                },
+                log_dir=config.log_dir.expanduser(),
+            )
+        else:
+            logger.log_conductor_event(
+                run_id=checkpoint.run_id,
+                phase="merge",
+                event_type="human_escalate",
+                payload={
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "reason": "squash merge failed",
+                    "stderr": merge_result.stderr[:500] if merge_result.stderr else "",
+                },
+                log_dir=config.log_dir.expanduser(),
+            )
+            # Remove from queue — won't be retried automatically
+            # (Deacon or human intervention needed)
+
+    # Write updated queue (with processed entries removed, remaining intact)
+    queue.queue = remaining
+    queue.updated_at = datetime.now(UTC).isoformat()
+    store.write_merge_queue(queue)
 
 
 def _dispatch_ci_fix_agent(
@@ -3764,6 +3878,15 @@ def _run_impl_worker(
                     },
                     log_dir=config.log_dir.expanduser(),
                 )
+            if store is not None:
+                _process_merge_queue(
+                    repo=repo,
+                    config=config,
+                    checkpoint=checkpoint,
+                    store=store,
+                    default_branch=default_branch,
+                    repo_root=repo_root,
+                )
 
         def _on_release(slot: tuple) -> None:
             active_modules.discard(slot[3])
@@ -4014,6 +4137,15 @@ def _run_design_worker(
             default_branch=default_branch,
         )
         _remove_worktree(worktree_path, repo_root)
+        if store is not None:
+            _process_merge_queue(
+                repo=repo,
+                config=config,
+                checkpoint=checkpoint,
+                store=store,
+                default_branch=default_branch,
+                repo_root=repo_root,
+            )
         if not merged:
             click.echo(
                 f"Error: HLD PR #{pr_number} did not merge. Manual intervention required.",
@@ -4154,6 +4286,15 @@ def _run_design_worker(
                         f"Warning: LLD PR #{pr_number} for {module!r} did not merge."
                         " Manual intervention required.",
                         err=True,
+                    )
+                if store is not None:
+                    _process_merge_queue(
+                        repo=repo,
+                        config=config,
+                        checkpoint=checkpoint,
+                        store=store,
+                        default_branch=default_branch,
+                        repo_root=repo_root,
                     )
 
             def _when_lld_empty() -> bool:
