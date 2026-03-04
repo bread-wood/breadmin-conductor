@@ -4760,7 +4760,11 @@ def _check_gate_before_stage(
     "--all",
     "do_all",
     is_flag=True,
-    help="Run all pipeline stages in order (research → design → scope → impl)",
+    help=(
+        "Run all pipeline stages in order. "
+        "With --spec: plan → research → design → scope → impl. "
+        "Without --spec: research → design → scope → impl."
+    ),
 )
 @click.option(
     "--milestone",
@@ -4821,6 +4825,8 @@ def run(
     # -----------------------------------------------------------------------
     if do_all:
         stages: list[str] = ["research", "design", "scope", "impl"]
+        if spec:
+            stages = ["plan"] + stages
     else:
         stages = [
             s
