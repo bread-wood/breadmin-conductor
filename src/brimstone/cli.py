@@ -3680,7 +3680,10 @@ def _dispatch_impl_agent(
         f"7. Commit with message referencing the issue\n"
         f"8. git push -u origin {branch}\n"
         f'9. Create PR: gh pr create --repo {repo} --title "{issue_title}" '
-        f'--label "{feat_label}" --body "Closes #{issue_number}"\n'
+        f'--label "{feat_label}" '
+        f'--body "Closes #{issue_number}\\n\\n'
+        f"## Summary\\n<1-3 sentences: what was implemented and key decisions>\\n\\n"
+        f'## Test plan\\n<bullet list of what was tested>"\n'
         f"10. After `gh pr create`, poll CI (max 60 attempts × 30s = 30 min):\n"
         f"    Loop: gh pr checks <PR-number> --json name,bucket --jq '[.[] | {{name,bucket}}]'\n"
         f"    Wait 30s between polls: sleep 30\n"
