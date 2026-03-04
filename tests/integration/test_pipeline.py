@@ -20,7 +20,6 @@ The completion-skip checks (already done) run for every --all invocation.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -76,7 +75,7 @@ class TestPipelineSingleStage:
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch(_COMMON_PATCHES["resolve_repo"], return_value=(_REPO, str(git_repo))),
+                patch(_COMMON_PATCHES["resolve_repo"], return_value=_REPO),
                 patch(_COMMON_PATCHES["milestone_exists"], return_value=True),
                 patch(_COMMON_PATCHES["open_research"], return_value=3),
                 patch(_COMMON_PATCHES["default_branch"], return_value="mainline"),
@@ -108,7 +107,7 @@ class TestPipelineSingleStage:
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch(_COMMON_PATCHES["resolve_repo"], return_value=(_REPO, str(git_repo))),
+                patch(_COMMON_PATCHES["resolve_repo"], return_value=_REPO),
                 patch(_COMMON_PATCHES["milestone_exists"], return_value=True),
                 # Gate: research complete
                 patch(_COMMON_PATCHES["open_research"], return_value=0),
@@ -144,7 +143,7 @@ class TestPipelineGateEnforcement:
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch(_COMMON_PATCHES["resolve_repo"], return_value=(_REPO, str(git_repo))),
+                patch(_COMMON_PATCHES["resolve_repo"], return_value=_REPO),
                 patch(_COMMON_PATCHES["milestone_exists"], return_value=True),
                 patch(_COMMON_PATCHES["open_research"], return_value=2),
                 patch(_COMMON_PATCHES["default_branch"], return_value="mainline"),
@@ -162,7 +161,7 @@ class TestPipelineGateEnforcement:
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch(_COMMON_PATCHES["resolve_repo"], return_value=(_REPO, str(git_repo))),
+                patch(_COMMON_PATCHES["resolve_repo"], return_value=_REPO),
                 patch(_COMMON_PATCHES["milestone_exists"], return_value=True),
                 patch(_COMMON_PATCHES["doc_exists"], return_value=False),
                 patch(_COMMON_PATCHES["default_branch"], return_value="mainline"),
@@ -181,7 +180,7 @@ class TestPipelineGateEnforcement:
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch(_COMMON_PATCHES["resolve_repo"], return_value=(_REPO, str(git_repo))),
+                patch(_COMMON_PATCHES["resolve_repo"], return_value=_REPO),
                 patch(_COMMON_PATCHES["milestone_exists"], return_value=True),
                 # Research still open, HLD not on branch — but --all should bypass gates
                 patch(_COMMON_PATCHES["open_research"], return_value=2),
@@ -221,7 +220,7 @@ class TestPipelineAllStages:
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch(_COMMON_PATCHES["resolve_repo"], return_value=(_REPO, str(git_repo))),
+                patch(_COMMON_PATCHES["resolve_repo"], return_value=_REPO),
                 patch(_COMMON_PATCHES["milestone_exists"], return_value=True),
                 patch(_COMMON_PATCHES["open_research"], return_value=3),
                 patch(_COMMON_PATCHES["doc_exists"], return_value=False),
@@ -259,7 +258,7 @@ class TestPipelineAllStages:
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch(_COMMON_PATCHES["resolve_repo"], return_value=(_REPO, str(git_repo))),
+                patch(_COMMON_PATCHES["resolve_repo"], return_value=_REPO),
                 patch(_COMMON_PATCHES["milestone_exists"], return_value=True),
                 # Research done
                 patch(_COMMON_PATCHES["open_research"], return_value=0),
@@ -297,7 +296,7 @@ class TestPipelineAllStages:
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch(_COMMON_PATCHES["resolve_repo"], return_value=(_REPO, str(git_repo))),
+                patch(_COMMON_PATCHES["resolve_repo"], return_value=_REPO),
                 patch(_COMMON_PATCHES["milestone_exists"], return_value=True),
                 patch(_COMMON_PATCHES["open_research"], return_value=0),
                 # HLD already merged
@@ -333,7 +332,7 @@ class TestPipelineAllStages:
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch(_COMMON_PATCHES["resolve_repo"], return_value=(_REPO, str(git_repo))),
+                patch(_COMMON_PATCHES["resolve_repo"], return_value=_REPO),
                 patch(_COMMON_PATCHES["milestone_exists"], return_value=False),
                 patch(_COMMON_PATCHES["default_branch"], return_value="mainline"),
             ):
@@ -346,29 +345,27 @@ class TestPipelineAllStages:
 
 
 class TestPipelineRepoResolution:
-    def test_resolve_repo_chdir_into_local_path(self, git_repo: Path, tmp_path: Path) -> None:
-        """When _resolve_repo returns a local path, cwd must be changed to it."""
+    def test_resolve_repo_passes_repo_to_worker(self, git_repo: Path, tmp_path: Path) -> None:
+        """_resolve_repo result is passed as repo= to the worker, not used for os.chdir."""
         cli_runner = CliRunner()
-        cwd_at_dispatch: list[str] = []
+        repo_at_dispatch: list[str] = []
 
-        def capture_cwd(**kw: object) -> None:
-            cwd_at_dispatch.append(os.getcwd())
+        def capture_repo(**kw: object) -> None:
+            repo_at_dispatch.append(str(kw.get("repo", "")))
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch(_COMMON_PATCHES["resolve_repo"], return_value=(_REPO, str(git_repo))),
+                patch(_COMMON_PATCHES["resolve_repo"], return_value=_REPO),
                 patch(_COMMON_PATCHES["milestone_exists"], return_value=True),
                 patch(_COMMON_PATCHES["open_research"], return_value=3),
                 patch(_COMMON_PATCHES["default_branch"], return_value="mainline"),
                 patch(_COMMON_PATCHES["startup"], side_effect=_fake_startup),
-                patch(_COMMON_PATCHES["research_worker"], side_effect=capture_cwd),
+                patch(_COMMON_PATCHES["research_worker"], side_effect=capture_repo),
             ):
                 cli_runner.invoke(
                     composer,
                     ["run", "--research", "--repo", "owner/repo", "--milestone", "v0.1.0"],
                 )
 
-        assert cwd_at_dispatch, "Research worker must have been invoked"
-        assert cwd_at_dispatch[0] == str(git_repo), (
-            f"cwd must be the local repo path, got {cwd_at_dispatch[0]!r}"
-        )
+        assert repo_at_dispatch, "Research worker must have been invoked"
+        assert repo_at_dispatch[0] == _REPO

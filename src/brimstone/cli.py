@@ -400,144 +400,36 @@ def _ensure_remote(repo_path: str, name: str) -> None:
         raise click.ClickException(f"git remote add failed for '{repo_path}':\n{add_remote.stderr}")
 
 
-def _scaffold_new_repo(name: str) -> str:
-    """Create a new local directory, init git, and push to GitHub as a private repo.
-
-    Steps:
-      1. Create ``<name>/`` directory with a minimal README.md and .gitignore
-      2. ``git init``, ``git add .``, ``git commit -m "init"``
-      3. ``gh repo create <name> --private --source=. --push``
-
-    If the directory already exists and is a git repository, the scaffold is
-    treated as already complete — ``_ensure_remote`` is called to guarantee a
-    remote is configured, and the path is returned immediately.
-
-    If ``gh repo create`` fails because the repository name already exists on
-    GitHub, the error is treated as success and ``_ensure_remote`` is called to
-    configure the remote if needed.
-
-    Args:
-        name: Repository name (no slashes). Used for directory and GitHub repo names.
-
-    Returns:
-        Absolute path to the newly-created (or already-existing) local directory.
-
-    Raises:
-        click.ClickException: If directory creation, git init, or gh repo create fails.
-    """
-    repo_path = os.path.abspath(name)
-
-    if os.path.exists(repo_path):
-        if _is_git_repo(repo_path):
-            # Already scaffolded — reuse as-is, ensure remote is configured.
-            _ensure_remote(repo_path, name)
-            return repo_path
-        raise click.ClickException(
-            f"Directory '{repo_path}' already exists but is not a git repository. "
-            "Remove it or choose a different name."
-        )
-
-    try:
-        os.makedirs(repo_path)
-    except OSError as exc:
-        raise click.ClickException(f"Failed to create directory '{repo_path}': {exc}") from exc
-
-    # Write a minimal README
-    readme_path = os.path.join(repo_path, "README.md")
-    with open(readme_path, "w", encoding="utf-8") as fh:
-        fh.write(f"# {name}\n\nInitialized by brimstone.\n")
-
-    # Write a minimal .gitignore
-    gitignore_path = os.path.join(repo_path, ".gitignore")
-    with open(gitignore_path, "w", encoding="utf-8") as fh:
-        fh.write("__pycache__/\n*.pyc\n.env\n")
-
-    # git init
-    init = subprocess.run(
-        ["git", "init"],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-    )
-    if init.returncode != 0:
-        raise click.ClickException(f"git init failed in '{repo_path}':\n{init.stderr}")
-
-    # git add .
-    add = subprocess.run(
-        ["git", "add", "."],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-    )
-    if add.returncode != 0:
-        raise click.ClickException(f"git add failed in '{repo_path}':\n{add.stderr}")
-
-    # git commit
-    commit = subprocess.run(
-        ["git", "commit", "-m", "init"],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-    )
-    if commit.returncode != 0:
-        raise click.ClickException(f"git commit failed in '{repo_path}':\n{commit.stderr}")
-
-    # gh repo create
-    create = subprocess.run(
-        ["gh", "repo", "create", name, "--private", "--source=.", "--push"],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-    )
-    if create.returncode != 0:
-        if "Name already exists" in create.stderr or "already exists" in create.stderr.lower():
-            _ensure_remote(repo_path, name)
-        else:
-            raise click.ClickException(f"gh repo create failed for '{name}':\n{create.stderr}")
-
-    return repo_path
-
-
-def _resolve_repo(repo_arg: str | None) -> tuple[str, str | None]:
-    """Resolve the ``--repo`` argument to a (repo_ref, local_path) pair.
-
-    The ``repo_ref`` is what gets passed to ``gh --repo``.  ``local_path`` is
-    the working directory for ``git`` commands (or ``None`` when the repo is
-    purely remote and already cloned via ``gh``).
+def _resolve_repo(repo_arg: str | None) -> str:
+    """Resolve the ``--repo`` argument to an ``owner/name`` string.
 
     Resolution rules
     ----------------
     1. ``repo_arg`` is ``None`` (no ``--repo`` flag)
-       → validate that cwd is a git repo; raise ClickException if not.
-       → return (github_remote_from_cwd, cwd)
+       → infer ``owner/name`` from cwd git remote; raise ClickException if
+         cwd is not a git repo or has no GitHub remote.
 
-    2. ``repo_arg`` contains ``/`` and matches ``owner/name``
-       → treat as an existing remote repo; no local scaffolding.
-       → return (repo_arg, None)
+    2. ``repo_arg`` matches ``owner/name``
+       → use as-is.
 
-    3. ``repo_arg`` is a plain name with no ``/`` (no directory separators)
-       → scaffold a new private GitHub repo called ``name``.
-       → return (owner/name, abs_path_to_new_dir)
+    3. ``repo_arg`` is a bare name (no ``/``)
+       → resolve via ``gh repo view <name>``; raise ClickException if not found.
 
-    4. ``repo_arg`` is a path that contains ``os.sep`` or starts with ``.``
-       → treat as a local directory path; fail if not a git repo.
-       → return (github_remote_from_path, abs_path)
+    4. ``repo_arg`` looks like a local path (starts with ``.`` or ``/``, or
+       contains ``os.sep``)
+       → raise ClickException — local paths are not accepted.
 
     Args:
         repo_arg: Raw value of the ``--repo`` CLI option, or ``None``.
 
     Returns:
-        A ``(repo_ref, local_path)`` tuple where:
-        - ``repo_ref`` is a ``owner/name`` string (for ``gh --repo``) or an
-          empty string when the repo can only be identified by its local path.
-        - ``local_path`` is the absolute filesystem path, or ``None`` for a
-          purely remote operation.
+        An ``owner/name`` string for use with ``gh --repo``.
 
     Raises:
-        click.ClickException: On validation failure or scaffold error.
+        click.ClickException: On validation failure or lookup error.
     """
     # -----------------------------------------------------------------------
-    # Case 1: No --repo flag → operate on cwd
+    # Case 1: No --repo flag → infer from cwd git remote
     # -----------------------------------------------------------------------
     if repo_arg is None:
         cwd = os.getcwd()
@@ -546,72 +438,39 @@ def _resolve_repo(repo_arg: str | None) -> tuple[str, str | None]:
                 "current directory is not a git repository.\n"
                 "Run from inside a git repo, or pass --repo <owner/name>."
             )
-        # Try to infer owner/name from the remote URL
-        repo_ref = _infer_github_repo_from_path(cwd) or ""
-        return repo_ref, cwd
+        repo_ref = _infer_github_repo_from_path(cwd)
+        if not repo_ref:
+            raise click.ClickException(
+                "Could not infer GitHub repo from current directory remote.\n"
+                "Pass --repo <owner/name> explicitly."
+            )
+        return repo_ref
 
     # -----------------------------------------------------------------------
-    # Case 2: Looks like "owner/name" — exactly two non-empty parts separated
-    # by a single "/" with no leading ".", no leading "/", and no additional "/"
-    # characters (so "a/b/c" or "./foo/bar" fall through to Case 3).
+    # Case 2: Local path guard — reject before slug check
+    # -----------------------------------------------------------------------
+    if repo_arg.startswith(".") or repo_arg.startswith("/") or "\\" in repo_arg:
+        raise click.ClickException(f"Use 'owner/name' format, not a local path. Got: {repo_arg!r}")
+
+    # -----------------------------------------------------------------------
+    # Case 3: Looks like "owner/name"
     # -----------------------------------------------------------------------
     _github_slug_re = re.compile(r"^[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+$")
     if _github_slug_re.match(repo_arg):
-        return repo_arg, None
+        return repo_arg
 
     # -----------------------------------------------------------------------
-    # Case 3: Looks like a local path (starts with . or / or contains multiple
-    # path components that are not a two-part GitHub slug)
+    # Case 4: Bare name (no slash) — look up on GitHub
     # -----------------------------------------------------------------------
-    if repo_arg.startswith(".") or repo_arg.startswith("/") or "/" in repo_arg:
-        abs_path = os.path.abspath(repo_arg)
-        if not os.path.isdir(abs_path):
-            raise click.ClickException(f"'{repo_arg}' is not a directory.")
-        if not _is_git_repo(abs_path):
-            raise click.ClickException(
-                f"'{abs_path}' is not a git repository.\n"
-                "Pass --repo <owner/name> to use a remote repo, or run from inside a git repo."
-            )
-        repo_ref = _infer_github_repo_from_path(abs_path) or ""
-        return repo_ref, abs_path
-
-    # -----------------------------------------------------------------------
-    # Case 4: Plain name with no slashes.
-    # -----------------------------------------------------------------------
-
-    # Sub-case 4a: If we're already inside a git repo whose remote name
-    # matches repo_arg, use the cwd — don't scaffold a nested directory.
-    cwd = os.getcwd()
-    if _is_git_repo(cwd):
-        cwd_remote = _infer_github_repo_from_path(cwd)
-        if cwd_remote and cwd_remote.split("/")[-1] == repo_arg:
-            return cwd_remote, cwd
-
-    # Sub-case 4a2: Check if there's a subdirectory named repo_arg in cwd
-    # (common layout: ~/dev/github/ → ~/dev/github/calculator).
-    candidate = os.path.join(cwd, repo_arg)
-    if os.path.isdir(candidate) and _is_git_repo(candidate):
-        candidate_remote = _infer_github_repo_from_path(candidate)
-        if candidate_remote and candidate_remote.split("/")[-1] == repo_arg:
-            return candidate_remote, candidate
-
-    # Sub-case 4b: Check if the repo already exists on GitHub (gh repo view).
-    # If it does, use it as a remote-only reference — no local scaffolding.
-    # Only scaffold when the repo genuinely does not exist yet.
     view_result = subprocess.run(
         ["gh", "repo", "view", repo_arg, "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
         capture_output=True,
         text=True,
     )
     if view_result.returncode == 0 and view_result.stdout.strip():
-        # Repo already exists on GitHub — use it as a remote reference
-        return view_result.stdout.strip(), None
+        return view_result.stdout.strip()
 
-    # Repo does not exist — scaffold it
-    local_path = _scaffold_new_repo(repo_arg)
-    # After scaffolding, infer the remote owner/name
-    repo_ref = _infer_github_repo_from_path(local_path) or repo_arg
-    return repo_ref, local_path
+    raise click.ClickException(f"Repo '{repo_arg}' not found on GitHub. Use 'owner/name' format.")
 
 
 def _infer_github_repo_from_path(path: str) -> str | None:
@@ -2922,41 +2781,34 @@ def _get_repo_root() -> str:
     return os.getcwd()
 
 
-def _ensure_worktree_repo(repo: str) -> tuple[str, str | None]:
-    """Return (repo_root, tmp_parent_to_cleanup) for worktree operations.
+def _ensure_worktree_repo(repo: str) -> tuple[str, str]:
+    """Clone *repo* to a temp directory and return ``(repo_root, tmp_parent_to_cleanup)``.
 
-    For remote repos (owner/name), clones the repo to a fresh temp directory
-    so that worktrees are created inside the correct repository.  The caller
-    must delete ``tmp_parent_to_cleanup`` when done.
-
-    For local paths the existing git root is used (no cloning).
+    Clones the remote repo (owner/name) to a fresh temp directory so that
+    worktrees are created inside the correct repository.  The caller must
+    delete ``tmp_parent_to_cleanup`` when done.
 
     Args:
-        repo: Repository reference — either ``owner/name`` (remote) or a
-              local path that is already a git repo.
+        repo: GitHub repository in ``owner/name`` format.
 
     Returns:
-        ``(repo_root, tmp_parent)`` where ``tmp_parent`` is the temp directory
-        to remove after the caller is done, or ``None`` for local repos.
+        ``(clone_path, tmp_parent)`` where ``tmp_parent`` is the temp directory
+        to remove after the caller is done.
     """
-    if "/" in repo and not os.path.isabs(repo):
-        # Remote GitHub repo in owner/name format — clone to temp dir.
-        parent = tempfile.mkdtemp(prefix="brimstone-")
-        repo_name = repo.split("/")[-1]
-        clone_path = os.path.join(parent, repo_name)
-        result = subprocess.run(
-            ["gh", "repo", "clone", repo, clone_path],
-            capture_output=True,
-            text=True,
+    parent = tempfile.mkdtemp(prefix="brimstone-")
+    repo_name = repo.split("/")[-1]
+    clone_path = os.path.join(parent, repo_name)
+    result = subprocess.run(
+        ["gh", "repo", "clone", repo, clone_path],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        shutil.rmtree(parent, ignore_errors=True)
+        raise click.ClickException(
+            f"Failed to clone {repo} for worktree operations: {result.stderr.strip()}"
         )
-        if result.returncode != 0:
-            shutil.rmtree(parent, ignore_errors=True)
-            raise click.ClickException(
-                f"Failed to clone {repo} for worktree operations: {result.stderr.strip()}"
-            )
-        return clone_path, parent
-    # Local path or already inside the target repo.
-    return _get_repo_root(), None
+    return clone_path, parent
 
 
 def _dispatch_design_agent(
@@ -3895,64 +3747,6 @@ def _validate_spec_path(spec: str) -> Path:
     return resolved
 
 
-def _seed_spec(
-    spec_path: Path,
-    version: str,
-    local_path: str,
-) -> bool:
-    """Copy *spec_path* into the target repo at ``docs/specs/<version>.md``.
-
-    If the destination already exists, print a warning and skip the copy.
-    Otherwise, create the directory, copy the file, ``git add``, and
-    ``git commit`` with a deterministic message.
-
-    Args:
-        spec_path:  Resolved absolute path to the source spec file.
-        version:    Version name used to build the destination filename.
-        local_path: Absolute path to the root of the target git repository.
-
-    Returns:
-        ``True`` if a commit was made, ``False`` if the spec already existed.
-
-    Side effects:
-        May create ``docs/specs/`` inside *local_path*, copy the spec file,
-        and create a git commit.
-    """
-    dest_dir = Path(local_path) / "docs" / "specs"
-    dest_file = dest_dir / f"{version}.md"
-
-    if dest_file.exists():
-        click.echo(f"Warning: {dest_file} already exists in target repo. Skipping spec copy.")
-        return False
-
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    import shutil
-
-    shutil.copy2(spec_path, dest_file)
-
-    subprocess.run(
-        ["git", "-C", local_path, "add", str(dest_file)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    subprocess.run(
-        [
-            "git",
-            "-C",
-            local_path,
-            "commit",
-            "-m",
-            f"docs: seed spec from {spec_path}",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    click.echo(f"Seeded spec into {dest_file} and committed.")
-    return True
-
-
 _BRIMSTONE_BOT = "yeast-bot"
 
 _CI_WORKFLOW_TEMPLATE = """\
@@ -4146,21 +3940,19 @@ def _upload_spec_to_repo(repo: str, spec_path: Path, version: str) -> None:
     click.echo(f"Uploaded spec to {repo}/{remote_path}")
 
 
-def _setup_ci(repo: str, config: Config, dry_run: bool, local_path: str | None = None) -> None:
-    """Commit a default CI workflow and inject ANTHROPIC_API_KEY as a GitHub Actions secret.
+def _setup_ci(repo: str, config: Config, dry_run: bool) -> None:
+    """Upload a default CI workflow and inject ANTHROPIC_API_KEY as a GitHub Actions secret.
 
-    When *local_path* is provided the workflow is written to disk and staged as
-    a git commit (no push — caller is responsible for pushing).  Falls back to
-    the GitHub Contents API for remote-only repos where no local checkout exists.
-
+    Uses the GitHub Contents API to commit the workflow directly — no local clone required.
     Non-fatal: emits warnings on failure so ``init`` can continue.
 
     Args:
-        repo:       GitHub repository in ``owner/repo`` format.
-        config:     Validated Config instance (provides default_branch and anthropic_api_key).
-        dry_run:    If True, print what would happen without executing.
-        local_path: Absolute path to a local clone of *repo* (or None for API fallback).
+        repo:    GitHub repository in ``owner/repo`` format.
+        config:  Validated Config instance (provides default_branch and anthropic_api_key).
+        dry_run: If True, print what would happen without executing.
     """
+    import base64
+
     workflow_path = ".github/workflows/ci.yml"
     branch = config.default_branch
     workflow_content = _CI_WORKFLOW_TEMPLATE.format(branch=branch)
@@ -4170,49 +3962,26 @@ def _setup_ci(repo: str, config: Config, dry_run: bool, local_path: str | None =
         click.echo(f"[dry-run] would set ANTHROPIC_API_KEY secret on {repo}")
         return
 
-    if local_path is not None:
-        full_path = Path(local_path) / workflow_path
-        if full_path.exists():
-            click.echo("CI workflow already exists, skipping")
-        else:
-            full_path.parent.mkdir(parents=True, exist_ok=True)
-            full_path.write_text(workflow_content)
-            subprocess.run(
-                ["git", "-C", local_path, "add", str(full_path)],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            subprocess.run(
-                ["git", "-C", local_path, "commit", "-m", "ci: add default CI workflow"],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            click.echo(f"Committed CI workflow ({workflow_path})")
+    check = _gh(["api", f"repos/{repo}/contents/{workflow_path}"], check=False)
+    if check.returncode == 0:
+        click.echo(f"CI workflow already exists in {repo}, skipping upload")
     else:
-        import base64
-
-        check = _gh(["api", f"repos/{repo}/contents/{workflow_path}"], check=False)
-        if check.returncode == 0:
-            click.echo(f"CI workflow already exists in {repo}, skipping upload")
-        else:
-            encoded = base64.b64encode(workflow_content.encode()).decode()
-            payload: dict = {"message": "ci: add default CI workflow", "content": encoded}
-            api_path = f"repos/{repo}/contents/{workflow_path}"
-            result = subprocess.run(
-                ["gh", "api", api_path, "-X", "PUT", "--input", "-"],
-                input=json.dumps(payload),
-                capture_output=True,
-                text=True,
+        encoded = base64.b64encode(workflow_content.encode()).decode()
+        payload: dict = {"message": "ci: add default CI workflow", "content": encoded}
+        api_path = f"repos/{repo}/contents/{workflow_path}"
+        result = subprocess.run(
+            ["gh", "api", api_path, "-X", "PUT", "--input", "-"],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            click.echo(
+                f"Warning: could not push CI workflow to {repo}: {result.stderr.strip()}",
+                err=True,
             )
-            if result.returncode != 0:
-                click.echo(
-                    f"Warning: could not push CI workflow to {repo}: {result.stderr.strip()}",
-                    err=True,
-                )
-            else:
-                click.echo(f"Pushed CI workflow to {repo}/{workflow_path}")
+        else:
+            click.echo(f"Pushed CI workflow to {repo}/{workflow_path}")
 
     # Inject ANTHROPIC_API_KEY as a GitHub Actions secret
     result = subprocess.run(
@@ -4236,60 +4005,6 @@ def _setup_ci(repo: str, config: Config, dry_run: bool, local_path: str | None =
         )
     else:
         click.echo(f"Set ANTHROPIC_API_KEY secret on {repo}")
-
-
-def _run_initialize(
-    repo_ref: str,
-    local_path: str | None,
-    version: str,
-    spec: str | None,
-    dry_run: bool = False,
-) -> None:
-    """Set up the target repository and optionally seed the spec file.
-
-    This is the first pipeline stage.  It is purely a Python operation —
-    no Claude agent is dispatched.
-
-    - If ``local_path`` is None (remote-only repo), spec seeding is skipped
-      with a warning.
-    - If ``spec`` is provided and ``local_path`` is available, copies the spec
-      to ``docs/specs/<version>.md`` and commits it (idempotent).
-    - If ``spec`` is None and no spec file exists locally, prints a reminder
-      but does not fail — the operator must seed the spec before plan-milestones
-      can succeed.
-
-    Args:
-        repo_ref:   Resolved ``owner/name`` repository reference.
-        local_path: Absolute path to the local repo clone (or None for remote-only).
-        version:    Version identifier (e.g. ``"MVP"``).
-        spec:       Absolute path to a spec file to seed (or None).
-        dry_run:    If True, print intent without executing.
-    """
-    if dry_run:
-        click.echo(f"[dry-run] initialize: repo={repo_ref!r}, version={version!r}, spec={spec!r}")
-        return
-
-    if spec is not None:
-        if local_path is None:
-            click.echo(
-                "Warning: --spec provided but no local repo path is available "
-                "(remote-only repos require a local checkout). Spec seeding skipped."
-            )
-        else:
-            _seed_spec(Path(spec), version, local_path)
-    elif local_path is not None:
-        spec_file = Path(local_path) / "docs" / "specs" / f"{version}.md"
-        if not spec_file.exists():
-            click.echo(
-                f"Warning: No spec found at {spec_file}. "
-                "plan-milestones will fail until a spec is committed. "
-                "Pass --spec <path> or commit the spec manually."
-            )
-
-    if not dry_run:
-        _ensure_labels(repo_ref)
-
-    click.echo(f"initialize: repo={repo_ref!r} version={version!r} ready.")
 
 
 # ---------------------------------------------------------------------------
@@ -4450,7 +4165,6 @@ def _run_plan_milestones(
     version: str,
     config: Config,
     checkpoint: Checkpoint,
-    local_path: str | None = None,
     dry_run: bool = False,
     spec_stem: str | None = None,
     spec_local_path: str | None = None,
@@ -4466,13 +4180,11 @@ def _run_plan_milestones(
         version:         Milestone name (e.g. ``"v0.1.0-cold-start"``).
         config:          Validated Config instance.
         checkpoint:      Active Checkpoint instance.
-        local_path:      Absolute path to the local repo checkout (or None for remote-only).
         dry_run:         If True, print the prompt length without executing.
         spec_stem:       Filename stem of the spec file (e.g. ``"v0.1.x-cold-start"``).
                          When None, falls back to ``version``.
         spec_local_path: Absolute path to the original spec file on disk. When provided,
-                         the agent is told to read directly from this path, which is
-                         more reliable than deriving a path from local_path or the API.
+                         the agent reads it directly; otherwise reads via GitHub API.
     """
     if spec_stem is None:
         spec_stem = version
@@ -4481,10 +4193,6 @@ def _run_plan_milestones(
 
     if spec_local_path is not None:
         spec_read_instruction = f"Read the spec from the local file:\n  cat {spec_local_path}"
-    elif local_path is not None:
-        spec_read_instruction = (
-            f"Read the spec from the local checkout:\n  cat {local_path}/docs/specs/{spec_stem}.md"
-        )
     else:
         spec_read_instruction = (
             f"Read the spec using the GitHub API:\n"
@@ -4648,7 +4356,7 @@ def composer() -> None:
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 def health_cmd(repo: str | None, as_json: bool) -> None:
     """Run preflight checks."""
-    repo_ref, _local_path = _resolve_repo(repo)
+    repo_ref = _resolve_repo(repo)
     overrides: dict = {}
     if repo_ref:
         overrides["github_repo"] = repo_ref
@@ -4740,9 +4448,8 @@ def _check_gate_before_stage(
     "--repo",
     default=None,
     help=(
-        "Target repository. Accepts: 'owner/name' (existing remote), "
-        "'name' (new private repo to scaffold), 'path/to/local/dir' (local git repo), "
-        "or omit to operate on the current working directory."
+        "Target repository. Accepts: 'owner/name' (remote repo), "
+        "or omit to infer from the current working directory's git remote."
     ),
 )
 @click.option(
@@ -4772,10 +4479,12 @@ def _check_gate_before_stage(
 )
 @click.option(
     "--milestone",
-    default=None,
+    multiple=True,
     help=(
-        "Milestone name to operate on. Required for --research / --design / --impl. "
-        "Optional for --plan (inferred from spec filename if omitted)."
+        "Milestone name to operate on. Repeat to run multiple milestones in sequence. "
+        "Required for --research / --design / --impl. "
+        "Optional for --plan (inferred from spec filename) and for --all with --spec "
+        "(milestones inferred from spec filenames when omitted)."
     ),
 )
 @click.option(
@@ -4798,7 +4507,7 @@ def run(
     do_scope: bool,
     do_impl: bool,
     do_all: bool,
-    milestone: str | None,
+    milestone: tuple[str, ...],
     spec: tuple[str, ...],
     model: str | None,
     max_budget: float | None,
@@ -4823,6 +4532,8 @@ def run(
       brimstone run --scope --impl --milestone "v0.1.0"
 
       brimstone run --all --milestone "v0.1.0" --dry-run
+
+      brimstone run --all --spec v0.3.0.md --spec v0.4.0.md --repo owner/repo
     """
     # -----------------------------------------------------------------------
     # Determine ordered stages to run
@@ -4853,34 +4564,28 @@ def run(
     if "plan" in stages and not spec:
         raise click.UsageError("--spec is required when --plan is specified")
 
-    # --milestone is required for all stages except plan (milestone inferred from spec stem)
+    # Resolve spec paths eagerly so errors surface before any network calls
+    resolved_specs = [_validate_spec_path(s) for s in spec]
+
+    # Determine the effective milestone list for non-plan stages.
+    # When --all is used with --spec and no explicit --milestone, infer from spec stems.
     non_plan_stages = [s for s in stages if s != "plan"]
-    if non_plan_stages and not milestone:
-        raise click.UsageError(
-            f"--milestone is required for: {', '.join(f'--{s}' for s in non_plan_stages)}"
-        )
+    if non_plan_stages:
+        if milestone:
+            effective_milestones: tuple[str, ...] = milestone
+        elif resolved_specs and do_all:
+            effective_milestones = tuple(p.stem for p in resolved_specs)
+        else:
+            raise click.UsageError(
+                f"--milestone is required for: {', '.join(f'--{s}' for s in non_plan_stages)}"
+            )
+    else:
+        effective_milestones = milestone  # may be empty; only plan stage runs
 
     # -----------------------------------------------------------------------
     # Resolve repo and build base config
     # -----------------------------------------------------------------------
-    repo_ref, local_path = _resolve_repo(repo)
-    if local_path is not None:
-        os.chdir(local_path)
-    elif repo_ref:
-        # Remote owner/name repo: clone into a temp dir so workers can create
-        # git worktrees. _get_repo_root() inside each worker will then return
-        # the clone root rather than brimstone's own source tree.
-        tmp_clone = tempfile.mkdtemp(prefix="brimstone-repo-")
-        click.echo(f"[run] Cloning {repo_ref} into {tmp_clone}…", err=True)
-        clone_result = subprocess.run(
-            ["gh", "repo", "clone", repo_ref, tmp_clone],
-            capture_output=True,
-            text=True,
-        )
-        if clone_result.returncode != 0:
-            raise click.ClickException(f"Failed to clone {repo_ref}:\n{clone_result.stderr}")
-        local_path = tmp_clone
-        os.chdir(local_path)
+    repo_ref = _resolve_repo(repo)
 
     overrides: dict = {
         "github_repo": repo_ref or None,
@@ -4893,19 +4598,16 @@ def run(
     config = load_config(**overrides)
     checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
 
-    # Validate all spec paths eagerly so errors surface before any network calls
-    resolved_specs = [_validate_spec_path(s) for s in spec]
-
     # -----------------------------------------------------------------------
-    # Milestone check: must exist for all non-plan stages
+    # Milestone existence check for all non-plan stages
     # -----------------------------------------------------------------------
     if not dry_run and non_plan_stages:
-        assert milestone is not None  # validated above
-        if not _milestone_exists(repo_ref, milestone):
-            raise click.ClickException(
-                f"Milestone '{milestone}' not found on {repo_ref}. "
-                "Run `brimstone run --plan --repo <repo> --spec <path>` to create it."
-            )
+        for ms in effective_milestones:
+            if not _milestone_exists(repo_ref, ms):
+                raise click.ClickException(
+                    f"Milestone '{ms}' not found on {repo_ref}. "
+                    "Run `brimstone run --plan --repo <repo> --spec <path>` to create it."
+                )
 
     # Resolve default branch once for gate checks
     default_branch = _get_default_branch_for_repo(repo_ref) if repo_ref and not dry_run else "main"
@@ -4916,28 +4618,8 @@ def run(
     for stage in stages:
         click.echo(f"\n── Stage: {stage} ──", err=True)
 
-        # Completion check — skip if stage is already done (non-plan stages only)
-        if not dry_run and stage != "plan":
-            assert milestone is not None  # guaranteed by validation above
-            if stage == "research" and _count_all_open_research_issues(repo_ref, milestone) == 0:
-                click.echo(f"[run] {stage}: already complete, skipping", err=True)
-                continue
-            if stage == "design" and _doc_exists_on_default_branch(
-                repo_ref, f"docs/design/{milestone}/HLD.md", default_branch
-            ):
-                click.echo(f"[run] {stage}: already complete, skipping", err=True)
-                continue
-            if stage == "scope" and _list_open_impl_issues(repo_ref, milestone):
-                click.echo(f"[run] {stage}: impl issues already exist, skipping", err=True)
-                continue
-
-        # Gate check — only when prerequisite is not also in this run (skip for plan)
-        if not dry_run and stage != "plan":
-            assert milestone is not None  # guaranteed by validation above
-            _check_gate_before_stage(stage, stages, repo_ref, milestone, default_branch)
-
         if stage == "plan":
-            # Plan loops over every spec, inferring milestone from stem when not explicit.
+            # Plan loops over every spec, inferring milestone from stem.
             _plan_skip = frozenset({"yeast-bot is repo collaborator"})
             for resolved_spec in resolved_specs:
                 ms = resolved_spec.stem
@@ -4957,36 +4639,12 @@ def run(
                     stage=stage,
                     skip_checks=_plan_skip,
                 )
-                if local_path is not None:
-                    # Pull before touching the local repo to avoid non-fast-forward push.
-                    pull = subprocess.run(
-                        ["git", "-C", local_path, "pull", "--rebase"],
-                        capture_output=True,
-                        text=True,
-                    )
-                    if pull.returncode != 0:
-                        raise click.ClickException(
-                            f"Failed to pull latest changes in {local_path}: {pull.stderr.strip()}"
-                        )
-                    spec_committed = _seed_spec(resolved_spec, stem, local_path)
-                    if spec_committed:
-                        result = subprocess.run(
-                            ["git", "-C", local_path, "push"],
-                            capture_output=True,
-                            text=True,
-                        )
-                        if result.returncode != 0:
-                            raise click.ClickException(
-                                f"Failed to push spec to {repo_ref}: {result.stderr.strip()}"
-                            )
-                else:
-                    _upload_spec_to_repo(repo_ref, resolved_spec, stem)
+                _upload_spec_to_repo(repo_ref, resolved_spec, stem)
                 _run_plan_milestones(
                     repo=repo_ref,
                     version=ms,
                     config=_config,
                     checkpoint=_checkpoint,
-                    local_path=local_path,
                     dry_run=False,
                     spec_stem=stem,
                     spec_local_path=str(resolved_spec),
@@ -4994,50 +4652,71 @@ def run(
             if dry_run:
                 continue
         else:
-            # research / design / impl — milestone is guaranteed non-None here
-            assert milestone is not None
-            if dry_run:
-                click.echo(f"[dry-run] would run {stage} for milestone={milestone!r}", err=True)
-                continue
-            _config, _checkpoint = startup_sequence(
-                config=config,
-                checkpoint_path=checkpoint_path,
-                milestone=milestone,
-                stage=stage,
-                skip_checks=frozenset(),
-            )
-            if stage == "research":
-                _run_research_worker(
-                    repo=repo_ref,
-                    milestone=milestone,
-                    config=_config,
-                    checkpoint=_checkpoint,
-                    dry_run=False,
+            # research / design / scope / impl — loop over all effective milestones
+            for ms in effective_milestones:
+                # Completion check — skip if stage is already done
+                if not dry_run:
+                    if stage == "research" and _count_all_open_research_issues(repo_ref, ms) == 0:
+                        click.echo(f"[run] {stage} ({ms}): already complete, skipping", err=True)
+                        continue
+                    if stage == "design" and _doc_exists_on_default_branch(
+                        repo_ref, f"docs/design/{ms}/HLD.md", default_branch
+                    ):
+                        click.echo(f"[run] {stage} ({ms}): already complete, skipping", err=True)
+                        continue
+                    if stage == "scope" and _list_open_impl_issues(repo_ref, ms):
+                        click.echo(
+                            f"[run] {stage} ({ms}): impl issues already exist, skipping", err=True
+                        )
+                        continue
+
+                # Gate check — only when prerequisite is not also in this run
+                if not dry_run:
+                    _check_gate_before_stage(stage, stages, repo_ref, ms, default_branch)
+
+                if dry_run:
+                    click.echo(f"[dry-run] would run {stage} for milestone={ms!r}", err=True)
+                    continue
+
+                _config, _checkpoint = startup_sequence(
+                    config=config,
+                    checkpoint_path=checkpoint_path,
+                    milestone=ms,
+                    stage=stage,
+                    skip_checks=frozenset(),
                 )
-            elif stage == "design":
-                _run_design_worker(
-                    repo=repo_ref,
-                    milestone=milestone,
-                    config=_config,
-                    checkpoint=_checkpoint,
-                    dry_run=False,
-                )
-            elif stage == "scope":
-                _run_plan_issues(
-                    repo=repo_ref,
-                    milestone=milestone,
-                    config=_config,
-                    checkpoint=_checkpoint,
-                    dry_run=False,
-                )
-            elif stage == "impl":
-                _run_impl_worker(
-                    repo=repo_ref,
-                    milestone=milestone,
-                    config=_config,
-                    checkpoint=_checkpoint,
-                    dry_run=False,
-                )
+                if stage == "research":
+                    _run_research_worker(
+                        repo=repo_ref,
+                        milestone=ms,
+                        config=_config,
+                        checkpoint=_checkpoint,
+                        dry_run=False,
+                    )
+                elif stage == "design":
+                    _run_design_worker(
+                        repo=repo_ref,
+                        milestone=ms,
+                        config=_config,
+                        checkpoint=_checkpoint,
+                        dry_run=False,
+                    )
+                elif stage == "scope":
+                    _run_plan_issues(
+                        repo=repo_ref,
+                        milestone=ms,
+                        config=_config,
+                        checkpoint=_checkpoint,
+                        dry_run=False,
+                    )
+                elif stage == "impl":
+                    _run_impl_worker(
+                        repo=repo_ref,
+                        milestone=ms,
+                        config=_config,
+                        checkpoint=_checkpoint,
+                        dry_run=False,
+                    )
 
 
 @composer.command("init")
@@ -5089,7 +4768,7 @@ def init(
 
     if dry_run:
         click.echo(f"[dry-run] would create repo {repo_ref} on GitHub (if missing)")
-        click.echo(f"[dry-run] would clone {repo_ref} and push CI workflow")
+        click.echo(f"[dry-run] would upload CI workflow to {repo_ref} via GitHub API")
         click.echo(f"[dry-run] would add {_BRIMSTONE_BOT} as collaborator on {repo_ref}")
         click.echo(f"[dry-run] would create issue labels on {repo_ref}")
         click.echo(f"[dry-run] would set branch protection on {repo_ref}")
@@ -5110,40 +4789,16 @@ def init(
         else:
             click.echo(f"Warning: could not create {repo_ref}: {stderr}", err=True)
 
-    # ── 2. Clone to a temp directory ─────────────────────────────────────────
-    tmp_clone = tempfile.mkdtemp(prefix="brimstone-init-")
-    click.echo(f"Cloning {repo_ref} into {tmp_clone}…")
-    clone_result = subprocess.run(
-        ["gh", "repo", "clone", repo_ref, tmp_clone],
-        capture_output=True,
-        text=True,
-    )
-    if clone_result.returncode != 0:
-        raise click.ClickException(f"Failed to clone {repo_ref}:\n{clone_result.stderr.strip()}")
-    local_path: str | None = tmp_clone
-
-    # ── 3. Add yeast-bot as collaborator ────────────────────────────────────
+    # ── 2. Add yeast-bot as collaborator ────────────────────────────────────
     _add_brimstone_bot_collaborator(repo_ref)
 
-    # ── 4. Install CI workflow (commit into clone, then push) ────────────────
-    _setup_ci(repo_ref, _config, dry_run=False, local_path=local_path)
-    push_result = subprocess.run(
-        ["git", "-C", local_path, "push"],
-        capture_output=True,
-        text=True,
-    )
-    if push_result.returncode != 0:
-        click.echo(
-            f"Warning: could not push CI workflow to {repo_ref}: {push_result.stderr.strip()}",
-            err=True,
-        )
-    else:
-        click.echo(f"Pushed CI workflow to {repo_ref}")
+    # ── 3. Install CI workflow via GitHub Contents API (no local clone needed) ──
+    _setup_ci(repo_ref, _config, dry_run=False)
 
-    # ── 5. Create issue labels ───────────────────────────────────────────────
+    # ── 4. Create issue labels ───────────────────────────────────────────────
     _ensure_labels(repo_ref)
 
-    # ── 6. Branch protection (non-fatal) ────────────────────────────────────
+    # ── 5. Branch protection (non-fatal) ────────────────────────────────────
     _add_branch_protection(repo_ref, _config.default_branch)
 
     click.echo(

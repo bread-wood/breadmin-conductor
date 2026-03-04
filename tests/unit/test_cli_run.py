@@ -55,7 +55,7 @@ class TestRunHelp:
 class TestRunRequiresStage:
     def test_no_stage_flags_produces_error(self) -> None:
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
-            with patch("brimstone.cli._resolve_repo", return_value=(_REPO, None)):
+            with patch("brimstone.cli._resolve_repo", return_value=_REPO):
                 with patch("brimstone.cli._milestone_exists", return_value=True):
                     runner = CliRunner()
                     result = runner.invoke(
@@ -86,7 +86,7 @@ class TestRunMilestoneCheck:
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", return_value=False),
                 patch("brimstone.cli._run_research_worker", side_effect=fake_research),
             ):
@@ -105,7 +105,7 @@ class TestRunMilestoneCheck:
         """If the milestone exists, stages run normally."""
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._count_all_open_research_issues", return_value=3),
                 patch("brimstone.cli.startup_sequence", return_value=(object(), object())),
@@ -128,7 +128,7 @@ class TestRunMilestoneCheck:
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", side_effect=fake_check),
             ):
                 runner = CliRunner()
@@ -161,7 +161,7 @@ class TestRunCompletionSkip:
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._count_all_open_research_issues", return_value=0),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
@@ -186,7 +186,7 @@ class TestRunCompletionSkip:
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
                 patch("brimstone.cli._count_all_open_research_issues", return_value=0),
@@ -217,7 +217,7 @@ class TestRunGates:
         """--design without --research aborts if there are open research issues."""
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
                 patch("brimstone.cli._doc_exists_on_default_branch", return_value=False),
@@ -236,7 +236,7 @@ class TestRunGates:
         """--impl without --design aborts if HLD.md is missing."""
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
                 patch("brimstone.cli._doc_exists_on_default_branch", return_value=False),
@@ -257,7 +257,7 @@ class TestRunGates:
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
                 patch("brimstone.cli._count_all_open_research_issues", return_value=2),
@@ -297,7 +297,7 @@ class TestRunGates:
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
                 patch("brimstone.cli._count_all_open_research_issues", return_value=1),
@@ -342,7 +342,7 @@ class TestRunScopeStage:
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
                 patch("brimstone.cli._doc_exists_on_default_branch", return_value=True),
@@ -366,7 +366,7 @@ class TestRunScopeStage:
         """--impl without prior --scope must fail with a clear error."""
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
                 patch("brimstone.cli._doc_exists_on_default_branch", return_value=True),
@@ -386,7 +386,7 @@ class TestRunScopeStage:
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
                 patch("brimstone.cli._doc_exists_on_default_branch", return_value=True),
@@ -421,7 +421,7 @@ class TestRunDryRun:
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
-                patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))),
+                patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch(
                     "brimstone.cli._run_research_worker",
                     side_effect=lambda **kw: workers_called.append("research"),
@@ -456,7 +456,7 @@ class TestRunDryRun:
     def test_dry_run_succeeds_when_running_inside_claude_code(self, tmp_path: Path) -> None:
         """brimstone run must succeed even when CLAUDECODE=1 is set (running inside Claude Code)."""
         with patch.dict("os.environ", {**MINIMAL_ENV, "CLAUDECODE": "1"}, clear=False):
-            with patch("brimstone.cli._resolve_repo", return_value=(_REPO, str(tmp_path))):
+            with patch("brimstone.cli._resolve_repo", return_value=_REPO):
                 runner = CliRunner()
                 result = runner.invoke(
                     composer,

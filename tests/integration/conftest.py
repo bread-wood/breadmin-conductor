@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -96,6 +96,28 @@ def restore_cwd() -> None:  # type: ignore[return]
 
 
 # ---------------------------------------------------------------------------
+# _ensure_worktree_repo mock
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def mock_worktree_repo(git_repo: Path) -> None:  # type: ignore[return]
+    """Patch _ensure_worktree_repo to use the test's local git repo.
+
+    Workers call _ensure_worktree_repo(repo) to clone the remote repo for
+    worktree operations.  In integration tests we skip the real clone and
+    point the worker at the already-initialised ``git_repo`` fixture instead.
+    The second return value (tmp_parent cleanup) is None so the worker's
+    ``if _clone_dir: shutil.rmtree(...)`` guard does not delete the fixture.
+    """
+    with patch(
+        "brimstone.cli._ensure_worktree_repo",
+        return_value=(str(git_repo), None),
+    ):
+        yield
+
+
+# ---------------------------------------------------------------------------
 # Config / Checkpoint factories
 # ---------------------------------------------------------------------------
 
@@ -149,4 +171,5 @@ def fake_run_result(*, is_error: bool = False) -> MagicMock:
     result.subtype = "error_unknown" if is_error else "success"
     result.error_code = "unknown_error" if is_error else None
     result.exit_code = 1 if is_error else 0
+    result.raw_result_event = None
     return result
