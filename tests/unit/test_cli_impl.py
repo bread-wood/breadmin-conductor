@@ -1698,3 +1698,221 @@ class TestProcessMergeQueue:
         # write_merge_queue should have been called (entry enqueued)
         assert store.write_merge_queue.call_count >= 1
         assert result is True
+
+
+# ---------------------------------------------------------------------------
+# TestDeaconScan
+# ---------------------------------------------------------------------------
+
+
+class TestDeaconScan:
+    """Verify _deacon_scan() zombie detection and recovery/exhaustion logic."""
+
+    def _make_pr_bead(self, issue_number: int = 7, fix_attempts: int = 0) -> MagicMock:
+        from brimstone.beads import PRBead
+
+        bead = PRBead(
+            v=1,
+            pr_number=55,
+            issue_number=issue_number,
+            branch=f"{issue_number}-feature",
+            state="ci_failing",
+            ci_state="failing",
+            conflict_state=None,
+            fix_attempts=fix_attempts,
+            feedback=[],
+            created_at="2026-03-04T00:00:00+00:00",
+            merged_at=None,
+        )
+        return bead
+
+    def _make_work_bead(self, issue_number: int = 7, claimed_at: str | None = None) -> MagicMock:
+        from brimstone.beads import WorkBead
+
+        if claimed_at is None:
+            # Default: 2 hours ago (well past DEACON_TIMEOUT_MINUTES=45)
+            from datetime import UTC, datetime, timedelta
+
+            claimed_at = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+        return WorkBead(
+            v=1,
+            issue_number=issue_number,
+            title="Test issue",
+            milestone="v0.1.0",
+            stage="impl",
+            module="cli",
+            priority="P2",
+            state="claimed",
+            branch=f"{issue_number}-feature",
+            pr_id="pr-55",
+            retry_count=0,
+            claimed_at=claimed_at,
+            closed_at=None,
+        )
+
+    def test_no_zombies_does_nothing(self, tmp_path: Path) -> None:
+        """When no beads exist, scan is a no-op."""
+        from brimstone.cli import _deacon_scan
+
+        store = MagicMock()
+        store.list_pr_beads.return_value = []
+        config = make_config(log_dir=tmp_path)
+        checkpoint = make_checkpoint()
+
+        with patch("brimstone.cli.logger.log_conductor_event") as mock_log:
+            _deacon_scan(
+                repo="owner/repo",
+                config=config,
+                checkpoint=checkpoint,
+                store=store,
+                active_issue_numbers=set(),
+                default_branch="mainline",
+            )
+
+        mock_log.assert_not_called()
+        store.write_pr_bead.assert_not_called()
+
+    def test_active_issue_skipped(self, tmp_path: Path) -> None:
+        """An issue currently in an active future is NOT treated as a zombie."""
+        from brimstone.cli import _deacon_scan
+
+        pr_bead = self._make_pr_bead(issue_number=7)
+        store = MagicMock()
+        store.list_pr_beads.return_value = [pr_bead]
+        config = make_config(log_dir=tmp_path)
+        checkpoint = make_checkpoint()
+
+        with patch("brimstone.cli._dispatch_recovery_agent") as mock_dispatch:
+            _deacon_scan(
+                repo="owner/repo",
+                config=config,
+                checkpoint=checkpoint,
+                store=store,
+                active_issue_numbers={7},  # issue 7 is active
+                default_branch="mainline",
+            )
+
+        mock_dispatch.assert_not_called()
+
+    def test_merged_bead_skipped(self, tmp_path: Path) -> None:
+        """A PRBead with state='merged' is never treated as a zombie."""
+        from brimstone.beads import PRBead
+        from brimstone.cli import _deacon_scan
+
+        pr_bead = PRBead(
+            v=1,
+            pr_number=55,
+            issue_number=7,
+            branch="7-feature",
+            state="merged",
+            ci_state=None,
+            conflict_state=None,
+            fix_attempts=0,
+            feedback=[],
+            created_at="2026-03-04T00:00:00+00:00",
+            merged_at="2026-03-04T01:00:00+00:00",
+        )
+        store = MagicMock()
+        store.list_pr_beads.return_value = [pr_bead]
+        config = make_config(log_dir=tmp_path)
+        checkpoint = make_checkpoint()
+
+        with patch("brimstone.cli._dispatch_recovery_agent") as mock_dispatch:
+            _deacon_scan(
+                repo="owner/repo",
+                config=config,
+                checkpoint=checkpoint,
+                store=store,
+                active_issue_numbers=set(),
+                default_branch="mainline",
+            )
+
+        mock_dispatch.assert_not_called()
+
+    def test_zombie_detected_dispatches_recovery(self, tmp_path: Path) -> None:
+        """A timed-out, non-active issue triggers _dispatch_recovery_agent."""
+        from brimstone.cli import _deacon_scan
+
+        pr_bead = self._make_pr_bead(issue_number=7, fix_attempts=0)
+        work_bead = self._make_work_bead(issue_number=7)
+        store = MagicMock()
+        store.list_pr_beads.return_value = [pr_bead]
+        store.read_work_bead.return_value = work_bead
+        config = make_config(log_dir=tmp_path)
+        checkpoint = make_checkpoint()
+
+        with (
+            patch("brimstone.cli._dispatch_recovery_agent") as mock_dispatch,
+            patch("brimstone.cli.logger.log_conductor_event"),
+        ):
+            _deacon_scan(
+                repo="owner/repo",
+                config=config,
+                checkpoint=checkpoint,
+                store=store,
+                active_issue_numbers=set(),
+                default_branch="mainline",
+            )
+
+        mock_dispatch.assert_called_once_with(
+            pr_bead, work_bead, "owner/repo", config, checkpoint, store
+        )
+
+    def test_zombie_at_max_attempts_exhausts_issue(self, tmp_path: Path) -> None:
+        """A zombie at DEACON_MAX_FIX_ATTEMPTS calls _exhaust_issue instead of recovery."""
+        from brimstone.cli import DEACON_MAX_FIX_ATTEMPTS, _deacon_scan
+
+        pr_bead = self._make_pr_bead(issue_number=7, fix_attempts=DEACON_MAX_FIX_ATTEMPTS)
+        work_bead = self._make_work_bead(issue_number=7)
+        store = MagicMock()
+        store.list_pr_beads.return_value = [pr_bead]
+        store.read_work_bead.return_value = work_bead
+        config = make_config(log_dir=tmp_path)
+        checkpoint = make_checkpoint()
+
+        with (
+            patch("brimstone.cli._exhaust_issue") as mock_exhaust,
+            patch("brimstone.cli._dispatch_recovery_agent") as mock_dispatch,
+            patch("brimstone.cli.logger.log_conductor_event"),
+        ):
+            _deacon_scan(
+                repo="owner/repo",
+                config=config,
+                checkpoint=checkpoint,
+                store=store,
+                active_issue_numbers=set(),
+                default_branch="mainline",
+            )
+
+        mock_exhaust.assert_called_once()
+        mock_dispatch.assert_not_called()
+        # Verify reason string mentions max attempts
+        call_args = mock_exhaust.call_args
+        assert "max fix attempts" in call_args[0][2] or "max fix attempts" in str(call_args)
+
+    def test_recent_claim_not_a_zombie(self, tmp_path: Path) -> None:
+        """An issue claimed only 5 minutes ago is NOT a zombie."""
+        from datetime import UTC, datetime, timedelta
+
+        from brimstone.cli import _deacon_scan
+
+        pr_bead = self._make_pr_bead(issue_number=7)
+        recent_claimed_at = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+        work_bead = self._make_work_bead(issue_number=7, claimed_at=recent_claimed_at)
+        store = MagicMock()
+        store.list_pr_beads.return_value = [pr_bead]
+        store.read_work_bead.return_value = work_bead
+        config = make_config(log_dir=tmp_path)
+        checkpoint = make_checkpoint()
+
+        with patch("brimstone.cli._dispatch_recovery_agent") as mock_dispatch:
+            _deacon_scan(
+                repo="owner/repo",
+                config=config,
+                checkpoint=checkpoint,
+                store=store,
+                active_issue_numbers=set(),
+                default_branch="mainline",
+            )
+
+        mock_dispatch.assert_not_called()

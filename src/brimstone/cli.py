@@ -56,6 +56,9 @@ DESIGN_LABEL: str = "stage/design"
 IMPL_LABEL: str = "stage/impl"
 BACKOFF_SLEEP_SECONDS: int = 30
 STALL_MAX_ITERATIONS: int = 5  # 5 × BACKOFF_SLEEP_SECONDS = 2.5 min before escalation
+DEACON_INTERVAL: int = 5  # run deacon scan every N pool iterations
+DEACON_TIMEOUT_MINUTES: float = 45.0
+DEACON_MAX_FIX_ATTEMPTS: int = 3
 
 
 def _auth_mode(config: Config) -> str:
@@ -1586,6 +1589,7 @@ def _run_persistent_pool(
     # In-memory fallback retry tracker used when store is None.
     _retry_counts: dict[int, int] = {}
     stall_count: int = 0
+    _deacon_tick: int = 0
     active: dict = {}
 
     fill_fn(active)
@@ -1744,6 +1748,18 @@ def _run_persistent_pool(
             # Success — delegate PR monitoring, triage, and worktree cleanup to on_success
             on_success(_issue, _branch, _worktree_path)
             session.save(checkpoint, checkpoint_path)
+
+        _deacon_tick += 1
+        if store is not None and _deacon_tick % DEACON_INTERVAL == 0:
+            active_numbers = {active[f][0]["number"] for f in active}
+            _deacon_scan(
+                repo=repo,
+                config=config,
+                checkpoint=checkpoint,
+                store=store,
+                active_issue_numbers=active_numbers,
+                default_branch="",
+            )
 
         fill_fn(active)
 
@@ -2933,6 +2949,182 @@ def _process_merge_queue(
     queue.queue = remaining
     queue.updated_at = datetime.now(UTC).isoformat()
     store.write_merge_queue(queue)
+
+
+def _dispatch_recovery_agent(
+    pr_bead: PRBead,
+    work_bead: WorkBead,
+    repo: str,
+    config: Config,
+    checkpoint: Checkpoint,
+    store: BeadStore,
+) -> None:
+    """Dispatch a recovery sub-agent for a zombie PR (timed-out, no active future).
+
+    Gathers PR diff, review comments, and latest CI logs, then runs a fix
+    agent.  Increments ``pr_bead.fix_attempts`` and writes the updated bead
+    before returning so repeated failures are capped by
+    :data:`DEACON_MAX_FIX_ATTEMPTS`.
+
+    Args:
+        pr_bead:    The PRBead for the stalled PR.
+        work_bead:  The WorkBead for the stalled issue.
+        repo:       Repository in ``owner/repo`` format.
+        config:     Validated Config instance.
+        checkpoint: Active Checkpoint instance (for logging).
+        store:      Active BeadStore for bead updates.
+    """
+    pr_number = pr_bead.pr_number
+    branch = pr_bead.branch
+    issue_number = pr_bead.issue_number
+
+    # Gather context
+    diff_result = _gh(
+        ["pr", "diff", str(pr_number)],
+        repo=repo,
+        check=False,
+    )
+    diff_text = (diff_result.stdout or "")[:3000]
+
+    reviews_result = _gh(
+        ["pr", "view", str(pr_number), "--json", "reviews,comments"],
+        repo=repo,
+        check=False,
+    )
+    reviews_text = (reviews_result.stdout or "")[:2000]
+
+    run_list = _gh(
+        ["run", "list", "--branch", branch, "--limit", "1", "--json", "databaseId"],
+        repo=repo,
+        check=False,
+    )
+    failure_logs = "(could not retrieve CI logs)"
+    try:
+        runs = json.loads(run_list.stdout or "[]")
+        if runs:
+            run_id_val = runs[0]["databaseId"]
+            log_result = _gh(
+                ["run", "view", str(run_id_val), "--log-failed"],
+                repo=repo,
+                check=False,
+            )
+            if log_result.returncode == 0 and log_result.stdout:
+                failure_logs = log_result.stdout[:4000]
+    except (json.JSONDecodeError, KeyError, IndexError):
+        pass
+
+    issue_result = _gh(
+        ["issue", "view", str(issue_number), "--json", "title,body"],
+        repo=repo,
+        check=False,
+    )
+    issue_text = (issue_result.stdout or "")[:2000]
+
+    prompt = (
+        f"You are recovering a stalled PR #{pr_number} in repository `{repo}`.\n"
+        f"Branch: `{branch}`\n"
+        f"Original issue #{issue_number}:\n```\n{issue_text}\n```\n\n"
+        f"PR diff (truncated):\n```diff\n{diff_text}\n```\n\n"
+        f"Review comments:\n```json\n{reviews_text}\n```\n\n"
+        f"Latest CI failure logs:\n```\n{failure_logs}\n```\n\n"
+        f"Steps:\n"
+        f"1. Clone the repo: WORK=$(mktemp -d) && gh repo clone {repo} $WORK\n"
+        f"2. cd $WORK && git checkout {branch} && git pull origin {branch}\n"
+        f"3. Diagnose issues from the diff, reviews, and CI logs above.\n"
+        f"4. Fix ALL issues in a single commit. Stay within files already on the branch.\n"
+        f"5. Verify: uv run ruff check && uv run pytest\n"
+        f"6. git add -A && git commit -m 'fix: deacon recovery on PR #{pr_number}' && git push\n"
+        f"7. STOP. Output exactly: Done.\n"
+    )
+
+    logger.log_conductor_event(
+        run_id=checkpoint.run_id,
+        phase="deacon",
+        event_type="recovery_dispatched",
+        payload={
+            "pr_number": pr_number,
+            "issue_number": issue_number,
+            "branch": branch,
+            "fix_attempts": pr_bead.fix_attempts,
+        },
+        log_dir=config.log_dir.expanduser(),
+    )
+
+    env = build_subprocess_env(config)
+    runner.run(
+        prompt=prompt,
+        allowed_tools=["Bash"],
+        env=env,
+        max_turns=60,
+        timeout_seconds=config.agent_timeout_minutes * 60,
+        model=config.model,
+        prefix=f"[deacon {branch}] ",
+    )
+
+    pr_bead.fix_attempts += 1
+    store.write_pr_bead(pr_bead)
+
+
+def _deacon_scan(
+    repo: str,
+    config: Config,
+    checkpoint: Checkpoint,
+    store: BeadStore,
+    active_issue_numbers: set[int],
+    default_branch: str,
+) -> None:
+    """Scan for zombie PRs and dispatch recovery agents or exhaust issues.
+
+    A zombie is a WorkBead with ``state="claimed"`` and ``claimed_at`` older
+    than :data:`DEACON_TIMEOUT_MINUTES` whose ``issue_number`` is NOT in the
+    set of currently-active futures.
+
+    For each zombie:
+    - If ``pr_bead.fix_attempts >= DEACON_MAX_FIX_ATTEMPTS``: exhaust the issue.
+    - Otherwise: dispatch a recovery agent via :func:`_dispatch_recovery_agent`.
+
+    Args:
+        repo:                 Repository in ``owner/repo`` format.
+        config:               Validated Config instance.
+        checkpoint:           Active Checkpoint instance (for logging).
+        store:                Active BeadStore for reading/writing bead state.
+        active_issue_numbers: Issue numbers currently being processed by live futures.
+        default_branch:       Default branch name (unused here, kept for future use).
+    """
+    for pr_bead in store.list_pr_beads():
+        if pr_bead.state == "merged":
+            continue
+        if pr_bead.issue_number in active_issue_numbers:
+            continue  # agent is still running — not a zombie
+
+        work_bead = store.read_work_bead(pr_bead.issue_number)
+        if not work_bead or not work_bead.claimed_at:
+            continue
+
+        claimed_dt = datetime.fromisoformat(work_bead.claimed_at)
+        elapsed_min = (datetime.now(UTC) - claimed_dt).total_seconds() / 60
+        if elapsed_min < DEACON_TIMEOUT_MINUTES:
+            continue
+
+        # Zombie detected
+        logger.log_conductor_event(
+            run_id=checkpoint.run_id,
+            phase="deacon",
+            event_type="zombie_detected",
+            payload={
+                "issue_number": pr_bead.issue_number,
+                "pr_number": pr_bead.pr_number,
+                "elapsed_minutes": round(elapsed_min, 1),
+                "fix_attempts": pr_bead.fix_attempts,
+            },
+            log_dir=config.log_dir.expanduser(),
+        )
+
+        if pr_bead.fix_attempts >= DEACON_MAX_FIX_ATTEMPTS:
+            reason = f"deacon: max fix attempts ({DEACON_MAX_FIX_ATTEMPTS}) exceeded"
+            _exhaust_issue(repo, pr_bead.issue_number, reason, store)
+        else:
+            _dispatch_recovery_agent(pr_bead, work_bead, repo, config, checkpoint, store)
 
 
 def _dispatch_ci_fix_agent(
