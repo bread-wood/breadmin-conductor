@@ -286,6 +286,20 @@ def test_assemble_command_fallback_model_absent_when_none() -> None:
     assert "--fallback-model" not in cmd
 
 
+def test_assemble_command_fallback_model_absent_when_equals_model() -> None:
+    """--fallback-model absent when fallback_model == model (claude rejects identical pairs)."""
+    model = "claude-haiku-4-5-20251001"
+    cmd = _assemble_command(
+        prompt="x",
+        allowed_tools=["Bash"],
+        max_turns=10,
+        append_system_prompt_file=None,
+        model=model,
+        fallback_model=model,
+    )
+    assert "--fallback-model" not in cmd
+
+
 # ---------------------------------------------------------------------------
 # run() — dry-run
 # ---------------------------------------------------------------------------
