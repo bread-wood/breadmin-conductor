@@ -122,7 +122,9 @@ def _make_work_bead(
 class TestMonitorPrToMergeQueueDrain:
     """_monitor_pr enqueues; _process_merge_queue drains and updates beads."""
 
-    def test_happy_path_bead_states_after_drain(self, git_repo: Path, tmp_path: Path) -> None:
+    def test_happy_path_bead_states_after_drain(
+        self, git_repo: Path, tmp_path: Path
+    ) -> None:
         """Full happy path: CI passes → enqueued → squash-merged → beads closed.
 
         _monitor_pr writes a PRBead and enqueues a MergeQueueEntry.
@@ -211,7 +213,9 @@ class TestMonitorPrToMergeQueueDrain:
             f"WorkBead.state must be 'closed', got {work_bead_after.state!r}"
         )
 
-    def test_merge_failure_leaves_pr_bead_unchanged(self, git_repo: Path, tmp_path: Path) -> None:
+    def test_merge_failure_leaves_pr_bead_unchanged(
+        self, git_repo: Path, tmp_path: Path
+    ) -> None:
         """If squash-merge fails, PRBead state is not updated and queue is cleared."""
         os.chdir(git_repo)
         config = make_config(tmp_path)
@@ -294,8 +298,7 @@ class TestImplWorkerBeadLifecycle:
 
         store.write_work_bead = spy_write_work_bead  # type: ignore[method-assign]
 
-        # _dispatch_impl_agent is called in a ThreadPoolExecutor; its return value
-        # is unpacked as (issue, branch, worktree_path, result).
+        # _dispatch_impl_agent returns (issue, branch, worktree_path, result)
         def fake_dispatch(
             issue: dict,
             branch: str,
@@ -428,14 +431,8 @@ class TestWatchdogScanExhaustion:
         work_bead = _make_work_bead(issue_number=7, state="claimed", claimed_at=old_claim)
         store.write_work_bead(work_bead)
 
-        # _unclaim_issue calls _gh(["issue", "view", ..., "--json", "assignees"])
-        # and parses stdout as JSON — provide a real string to avoid MagicMock errors.
-        gh_result = MagicMock()
-        gh_result.returncode = 0
-        gh_result.stdout = '{"assignees": []}'
-
         with (
-            patch("brimstone.cli._gh", return_value=gh_result),
+            patch("brimstone.cli._gh", side_effect=_gh_side_effect),
             patch("brimstone.cli.logger.log_conductor_event"),
             patch("brimstone.cli.session.save"),
         ):

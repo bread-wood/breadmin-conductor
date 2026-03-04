@@ -7,22 +7,23 @@
 
 ## 1. System Overview
 
-brimstone is a Python CLI orchestrator that automates multi-stage GitHub issue workstreams using Claude Code in headless `-p` mode. It runs as a single orchestrator process (`brimstone run`) that coordinates isolated Claude Code sub-agents across four pipeline stages:
+brimstone is a Python CLI orchestrator that automates multi-stage GitHub issue workstreams using Claude Code in headless `-p` mode. It runs as a single orchestrator process (`brimstone run`) that coordinates isolated Claude Code sub-agents across five pipeline stages:
 
 ```
-scope → research → design → impl
+plan → research → design → scope → impl
 ```
 
 | Stage | Entry point | Produces |
 |-------|-------------|---------|
-| `scope` | `brimstone run --stage scope` | `stage/research` GitHub issues decomposed from a spec |
+| `plan` | `brimstone run --stage plan` | GitHub milestone + `stage/research` issues seeded from spec |
 | `research` | `brimstone run --stage research` | `docs/research/<N>-<slug>.md` per issue |
 | `design` | `brimstone run --stage design` | `docs/design/HLD.md` + `docs/design/lld/<module>.md` |
+| `scope` | `brimstone run --stage scope` | `stage/impl` issues decomposed from HLD/LLD docs |
 | `impl` | `brimstone run --stage impl` | Merged PRs, working code |
 
 Each stage's output is the next stage's input. Design and issue decomposition are explicitly separated: the design stage produces design documents; scope decomposes those into actionable GitHub issues.
 
-**What it is not:** brimstone is not a general-purpose AI agent framework. It is purpose-built for the workstream: scope → research → design → implement.
+**What it is not:** brimstone is not a general-purpose AI agent framework. It is purpose-built for the workstream: plan → research → design → scope → implement.
 
 ---
 

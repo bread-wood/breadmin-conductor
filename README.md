@@ -4,9 +4,10 @@ brimstone — autonomous GitHub issue workstream orchestrator
 
 ## How It Works
 
-brimstone runs a four-stage pipeline (scope → research → design → impl) against a target
-GitHub repo by invoking Claude Code sub-agents in isolated git worktrees. Each stage reads
-the previous stage's output from GitHub issues and docs, then produces the next stage's input.
+brimstone runs a five-stage pipeline (plan → research → design → scope → impl) against a
+target GitHub repo by invoking Claude Code sub-agents in isolated git worktrees. Each stage
+reads the previous stage's output from GitHub issues and docs, then produces the next stage's
+input.
 Bead files (`~/.brimstone/beads/`) provide durable state so that the orchestrator survives
 restarts and rate-limit backoffs. A Watchdog loop detects zombie agents and dispatches recovery
 sub-agents automatically. A MergeQueue ensures sequential squash merges to keep the commit
@@ -31,11 +32,14 @@ uv sync
 ## Quick Start
 
 ```bash
-# Scope a milestone (decompose a spec into research issues)
-brimstone run --stage scope --repo OWNER/REPO --milestone v0.2.0
+# Run all stages from a spec file (milestone inferred from filename)
+brimstone run specs/v0.2.0-function-library.md --repo OWNER/REPO
 
-# Run the full impl pipeline (research + design handled separately first)
-brimstone run --stage impl --repo OWNER/REPO --milestone v0.2.0
+# Or run stages individually in order:
+brimstone run --stage research --repo OWNER/REPO --milestone v0.2.0
+brimstone run --stage design   --repo OWNER/REPO --milestone v0.2.0
+brimstone run --stage scope    --repo OWNER/REPO --milestone v0.2.0
+brimstone run --stage impl     --repo OWNER/REPO --milestone v0.2.0
 ```
 
 ## `--repo` Resolution
