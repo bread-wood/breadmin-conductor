@@ -77,8 +77,8 @@ class TestNew:
 
     def test_mutable_defaults_are_empty(self) -> None:
         c = new("owner/repo", "main", "MVP Impl", "impl")
-        # Legacy fields still present until cli.py migrates to BeadStore (PR 7a)
-        assert c.active_worktrees == []
+        assert c.claimed_issues == {}
+        assert c.completed_prs == []
 
     def test_optional_fields_are_none(self) -> None:
         c = new("owner/repo", "main", "MVP Impl", "impl")
@@ -89,8 +89,13 @@ class TestNew:
         """Two Checkpoint instances must not share mutable containers."""
         c1 = new("owner/repo", "main", "A", "impl")
         c2 = new("owner/repo", "main", "B", "impl")
-        c1.active_worktrees.append("branch-1")
-        assert "branch-1" not in c2.active_worktrees
+        c1.claimed_issues["1"] = "1-branch"
+        assert "1" not in c2.claimed_issues
+
+    def test_active_worktrees_removed(self) -> None:
+        """active_worktrees was removed in schema v3 — must not exist on Checkpoint."""
+        c = new("owner/repo", "main", "MVP Impl", "impl")
+        assert not hasattr(c, "active_worktrees")
 
 
 # ---------------------------------------------------------------------------
@@ -111,14 +116,13 @@ class TestSaveLoadRoundTrip:
         assert loaded.milestone == cp.milestone
         assert loaded.stage == cp.stage
         assert loaded.schema_version == cp.schema_version
-        assert loaded.active_worktrees == cp.active_worktrees
         assert loaded.rate_limit_backoff_until == cp.rate_limit_backoff_until
         assert loaded.last_error == cp.last_error
 
     def test_round_trip_preserves_populated_fields(
         self, cp: Checkpoint, checkpoint_path: Path
     ) -> None:
-        cp.active_worktrees = ["12-other-branch"]
+        cp.completed_prs = [55, 56]
         cp.last_error = {
             "code": 1,
             "subtype": "error_during_execution",
@@ -130,7 +134,7 @@ class TestSaveLoadRoundTrip:
         loaded = load(checkpoint_path)
 
         assert loaded is not None
-        assert loaded.active_worktrees == ["12-other-branch"]
+        assert loaded.completed_prs == [55, 56]
         assert loaded.last_error is not None
         assert loaded.last_error["subtype"] == "error_during_execution"
 
@@ -201,8 +205,8 @@ class TestLoadVersionChecks:
         with pytest.raises(CheckpointVersionError):
             load(future_file)
 
-    def test_v0_to_v2_migration(self, tmp_path: Path) -> None:
-        """A v0 checkpoint (no dispatch_times) migrates to v2 cleanly."""
+    def test_v0_to_v3_migration(self, tmp_path: Path) -> None:
+        """v0 checkpoint migrates to v3: dispatch_times added, active_worktrees dropped."""
         v0_file = tmp_path / "v0.checkpoint.json"
         data = {
             "schema_version": 0,
@@ -227,9 +231,10 @@ class TestLoadVersionChecks:
         assert result is not None
         assert result.dispatch_times == {}
         assert result.schema_version == SCHEMA_VERSION
+        assert not hasattr(result, "active_worktrees")
 
-    def test_v1_to_v2_migration(self, tmp_path: Path) -> None:
-        """A v1 checkpoint migrates to v2 without data loss."""
+    def test_v1_to_v3_migration(self, tmp_path: Path) -> None:
+        """A v1 checkpoint migrates to v3, dropping active_worktrees."""
         v1_file = tmp_path / "v1.checkpoint.json"
         data = {
             "schema_version": 1,
@@ -253,8 +258,37 @@ class TestLoadVersionChecks:
         result = load(v1_file)
         assert result is not None
         assert result.schema_version == SCHEMA_VERSION
-        # All legacy fields preserved (still on Checkpoint for backward-compat)
-        assert result.active_worktrees == ["7-branch"]
+        assert not hasattr(result, "active_worktrees")
+        # Other legacy fields still present for backward-compat
+        assert result.claimed_issues == {"7": "7-branch"}
+
+    def test_v2_to_v3_migration(self, tmp_path: Path) -> None:
+        """A v2 checkpoint migrates to v3, dropping active_worktrees."""
+        v2_file = tmp_path / "v2.checkpoint.json"
+        data = {
+            "schema_version": 2,
+            "run_id": "abc-789",
+            "session_id": "",
+            "repo": "o/r",
+            "default_branch": "main",
+            "milestone": "M",
+            "stage": "impl",
+            "timestamp": "2026-03-04T00:00:00+00:00",
+            "claimed_issues": {"5": "5-branch"},
+            "active_worktrees": ["5-branch"],
+            "open_prs": {},
+            "completed_prs": [],
+            "rate_limit_backoff_until": None,
+            "retry_counts": {},
+            "last_error": None,
+            "dispatch_times": {},
+        }
+        v2_file.write_text(json.dumps(data), encoding="utf-8")
+        result = load(v2_file)
+        assert result is not None
+        assert result.schema_version == SCHEMA_VERSION
+        assert not hasattr(result, "active_worktrees")
+        assert result.claimed_issues == {"5": "5-branch"}
 
 
 # ---------------------------------------------------------------------------
@@ -281,12 +315,12 @@ class TestAtomicWrite:
         tmp_path.write_text("CORRUPT DATA", encoding="utf-8")
 
         # A new save should overwrite the .tmp and produce a valid checkpoint
-        cp.active_worktrees.append("99-new-branch")
+        cp.completed_prs.append(99)
         save(cp, checkpoint_path)
 
         loaded = load(checkpoint_path)
         assert loaded is not None
-        assert "99-new-branch" in loaded.active_worktrees
+        assert 99 in loaded.completed_prs
 
 
 # ---------------------------------------------------------------------------
