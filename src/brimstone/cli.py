@@ -22,6 +22,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from collections.abc import Callable
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -1082,6 +1083,19 @@ def _unclaim_issue(repo: str, issue_number: int) -> None:
     _gh(args, repo=repo, check=False)
 
 
+def _delete_remote_branch(repo: str, branch: str) -> None:
+    """Delete a remote branch ref via the GitHub API.
+
+    Args:
+        repo:   Repository in ``owner/repo`` format.
+        branch: Branch name to delete (e.g. ``42-fix-auth``).
+    """
+    _gh(
+        ["api", f"repos/{repo}/git/refs/heads/{branch}", "--method", "DELETE"],
+        check=False,
+    )
+
+
 def _list_triage_issues(repo: str) -> list[dict[str, Any]]:
     """Return all open issues labelled ``triage``.
 
@@ -1595,6 +1609,190 @@ def _dispatch_research_agent(
     return issue, branch_name, worktree_path, result
 
 
+def _run_persistent_pool(
+    *,
+    pool_size: int,
+    gov: UsageGovernor,
+    repo: str,
+    repo_root: str,
+    config: Config,
+    checkpoint: Checkpoint,
+    stage: str,
+    fill_fn: Callable[[dict], None],
+    on_success: Callable[[dict, str, str], None],
+    when_empty_fn: Callable[[], bool],
+    on_release: Callable[..., None] | None = None,
+    stall_reason: str = "dep-blocked deadlock",
+) -> None:
+    """Persistent pool loop shared by research-worker and impl-worker.
+
+    Maintains a live pool of concurrent agents.  When a future completes,
+    ``fill_fn`` is called immediately to refill the pool.  Exits when
+    ``when_empty_fn`` returns ``True`` (no more work) or a deadlock stall
+    is detected.
+
+    Args:
+        pool_size:     Maximum concurrent agents.
+        gov:           UsageGovernor for dispatch gating.
+        repo:          ``owner/repo`` string.
+        repo_root:     Absolute path to the local repo clone used for worktrees.
+        config:        Validated Config instance.
+        checkpoint:    Active Checkpoint instance.
+        stage:         Log stage label (``"research"``, ``"impl"``).
+        fill_fn:       ``fill_fn(active) -> None`` — submits new futures into
+                       ``active`` until the pool is full or no candidates remain.
+                       ``active`` maps ``Future`` → ``(issue, branch, worktree, *extras)``.
+        on_success:    ``on_success(issue, branch, worktree_path) -> None`` — called
+                       on a clean result.  Responsible for PR monitoring, triage, and
+                       worktree cleanup.
+        when_empty_fn: ``() -> bool`` — called when the pool drains.  Side-effects
+                       the completion gate / pipeline filing.  Returns ``True`` to
+                       exit the loop, ``False`` to stall-wait.
+        on_release:    Optional ``on_release(slot) -> None`` — called immediately
+                       after ``active.pop(future)`` (before result inspection), e.g.
+                       to release a module lock.
+        stall_reason:  Human-readable reason logged on deadlock escalation.
+    """
+    checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
+    retry_counts: dict[int, int] = {}
+    stall_count: int = 0
+    active: dict = {}
+
+    fill_fn(active)
+
+    while True:
+        if not active:
+            if when_empty_fn():
+                break
+            stall_count += 1
+            if stall_count >= STALL_MAX_ITERATIONS:
+                logger.log_conductor_event(
+                    run_id=checkpoint.run_id,
+                    phase="stall",
+                    event_type="human_escalate",
+                    payload={
+                        "reason": stall_reason,
+                        "stall_iterations": stall_count,
+                    },
+                    log_dir=config.log_dir.expanduser(),
+                )
+                break
+            time.sleep(BACKOFF_SLEEP_SECONDS)
+            fill_fn(active)
+            continue
+
+        stall_count = 0
+
+        done, _ = concurrent.futures.wait(
+            list(active.keys()), return_when=concurrent.futures.FIRST_COMPLETED
+        )
+        for future in done:
+            slot = active.pop(future)
+            _issue, _branch, _worktree_path = slot[0], slot[1], slot[2]
+            issue_number = _issue["number"]
+
+            if on_release is not None:
+                on_release(slot)
+
+            try:
+                _, _, _, result = future.result()
+            except Exception as exc:
+                logger.log_conductor_event(
+                    run_id=checkpoint.run_id,
+                    phase="dispatch",
+                    event_type="agent_exception",
+                    payload={"issue_number": issue_number, "error": str(exc)},
+                    log_dir=config.log_dir.expanduser(),
+                )
+                gov.record_completion(1)
+                _unclaim_issue(repo=repo, issue_number=issue_number)
+                _remove_worktree(_worktree_path, repo_root)
+                continue
+
+            gov.record_completion(1)
+            gov.record_result(result)
+            session.save(checkpoint, checkpoint_path)
+
+            logger.log_cost(
+                result.raw_result_event or {},
+                logger.LogContext(
+                    session_id=str(uuid.uuid4()),
+                    run_id=checkpoint.run_id,
+                    repo=repo,
+                    stage=stage,
+                    issue_number=issue_number,
+                ),
+                log_dir=config.log_dir.expanduser(),
+                model=config.model,
+                auth_mode=_auth_mode(config),
+            )
+
+            logger.log_conductor_event(
+                run_id=checkpoint.run_id,
+                phase="dispatch",
+                event_type="agent_completed",
+                payload={
+                    "issue_number": issue_number,
+                    "subtype": result.subtype,
+                    "is_error": result.is_error,
+                    "error_code": result.error_code,
+                },
+                log_dir=config.log_dir.expanduser(),
+            )
+
+            if result.error_code in ("rate_limit", "extra_usage_exhausted") or (
+                result.subtype == "error_max_budget_usd"
+            ):
+                _unclaim_issue(repo=repo, issue_number=issue_number)
+                _delete_remote_branch(repo, _branch)
+                attempt = retry_counts.get(issue_number, 0)
+                gov.record_429(attempt)
+                retry_counts[issue_number] = attempt + 1
+                logger.log_conductor_event(
+                    run_id=checkpoint.run_id,
+                    phase="backoff",
+                    event_type="backoff_enter",
+                    payload={
+                        "issue_number": issue_number,
+                        "reason": result.error_code or result.subtype,
+                        "attempt": attempt,
+                    },
+                    log_dir=config.log_dir.expanduser(),
+                )
+                session.save(checkpoint, checkpoint_path)
+                _remove_worktree(_worktree_path, repo_root)
+                continue
+
+            if result.is_error:
+                current_retries = retry_counts.get(issue_number, 0) + 1
+                retry_counts[issue_number] = current_retries
+                _unclaim_issue(repo=repo, issue_number=issue_number)
+                _delete_remote_branch(repo, _branch)
+                if current_retries >= MAX_RETRIES:
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="dispatch",
+                        event_type="human_escalate",
+                        payload={
+                            "issue_number": issue_number,
+                            "reason": result.subtype or "unknown_error",
+                            "error_code": result.error_code,
+                            "retry_count": current_retries,
+                            "action_required": "manual investigation",
+                        },
+                        log_dir=config.log_dir.expanduser(),
+                    )
+                _remove_worktree(_worktree_path, repo_root)
+                session.save(checkpoint, checkpoint_path)
+                continue
+
+            # Success — delegate PR monitoring, triage, and worktree cleanup to on_success
+            on_success(_issue, _branch, _worktree_path)
+            session.save(checkpoint, checkpoint_path)
+
+        fill_fn(active)
+
+
 def _run_research_worker(
     repo: str,
     milestone: str,
@@ -1623,8 +1821,6 @@ def _run_research_worker(
     """
     gov = UsageGovernor(config, checkpoint)
     checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
-    retry_counts: dict[int, int] = {}
-    stall_count: int = 0
     repo_root, _clone_dir = _ensure_worktree_repo(repo)
 
     # Pre-check: the milestone must exist before we can do anything useful.
@@ -1696,10 +1892,8 @@ def _run_research_worker(
         return
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=pool_size) as executor:
-        active: dict = {}  # future -> (issue, branch_name, worktree_path)
 
-        def _fill_research_pool() -> None:
-            """Re-fetch open issues and submit new agents until pool is full."""
+        def _fill(active: dict) -> None:
             open_issues = _list_open_research_issues(repo, milestone)
             if not open_issues:
                 return
@@ -1712,7 +1906,7 @@ def _run_research_worker(
                 dry_run=False,
             )
             if not blocking:
-                return  # completion gate will fire in the main loop
+                return
             active_issue_numbers = {info[0]["number"] for info in active.values()}
             open_issue_numbers = {i.get("number", 0) for i in open_issues}
             unblocked = _filter_unblocked(blocking, open_issue_numbers)
@@ -1765,206 +1959,81 @@ def _run_research_worker(
                 active[future] = (issue, branch_name, worktree_path)
                 active_issue_numbers.add(issue_number)
 
-        _fill_research_pool()
-
-        while True:
-            if not active:
-                open_issues = _list_open_research_issues(repo, milestone)
-                if not open_issues:
-                    _run_completion_gate(
-                        repo=repo,
-                        milestone=milestone,
-                        open_issues=[],
-                        config=config,
-                        checkpoint=checkpoint,
-                        dry_run=dry_run,
-                    )
-                    break
-                blocking, non_blocking = _classify_blocking_issues(
-                    open_issues=open_issues,
+        def _on_success(issue: dict, branch: str, worktree_path: str) -> None:
+            issue_number = issue["number"]
+            found = _find_pr_for_issue(repo, issue_number)
+            if found is not None:
+                pr_number, pr_branch = found
+                _monitor_pr(
+                    pr_number=pr_number,
+                    branch=pr_branch,
                     repo=repo,
-                    milestone=milestone,
                     config=config,
                     checkpoint=checkpoint,
-                    dry_run=dry_run,
+                    issue_number=issue_number,
                 )
-                if not blocking:
-                    _run_completion_gate(
-                        repo=repo,
-                        milestone=milestone,
-                        open_issues=non_blocking,
-                        config=config,
-                        checkpoint=checkpoint,
-                        dry_run=dry_run,
-                    )
-                    break
-
-                # Pool empty but blocking issues exist — stall
-                stall_count += 1
-                if stall_count >= STALL_MAX_ITERATIONS:
-                    logger.log_conductor_event(
-                        run_id=checkpoint.run_id,
-                        phase="dispatch",
-                        event_type="human_escalate",
-                        payload={
-                            "reason": "deadlock_detected",
-                            "stall_iterations": stall_count,
-                            "stall_duration_seconds": stall_count * BACKOFF_SLEEP_SECONDS,
-                            "action_required": (
-                                "All blocking research issues are dependency-blocked "
-                                "and no agents are running. Manual intervention required "
-                                "to resolve the dependency cycle or close/skip issues."
-                            ),
-                        },
-                        log_dir=config.log_dir.expanduser(),
-                    )
-                    break
-                time.sleep(BACKOFF_SLEEP_SECONDS)
-                _fill_research_pool()
-                continue
-
-            stall_count = 0
-
-            # ------------------------------------------------------------------
-            # Wait for the first agent to complete
-            # ------------------------------------------------------------------
-            done, _ = concurrent.futures.wait(
-                list(active.keys()), return_when=concurrent.futures.FIRST_COMPLETED
+            else:
+                click.echo(
+                    f"[research-worker] Warning: no open PR found for issue #{issue_number}",
+                    err=True,
+                )
+            _apply_triage_rubric(
+                repo=repo,
+                milestone=milestone,
+                config=config,
+                checkpoint=checkpoint,
             )
-            for future in done:
-                _issue, _branch, _worktree_path = active.pop(future)
-                issue_number = _issue["number"]
+            _remove_worktree(worktree_path, repo_root)
 
-                try:
-                    _, _, _, result = future.result()
-                except Exception as exc:
-                    logger.log_conductor_event(
-                        run_id=checkpoint.run_id,
-                        phase="dispatch",
-                        event_type="agent_exception",
-                        payload={
-                            "issue_number": issue_number,
-                            "error": str(exc),
-                        },
-                        log_dir=config.log_dir.expanduser(),
-                    )
-                    gov.record_completion(1)
-                    _unclaim_issue(repo=repo, issue_number=issue_number)
-                    _remove_worktree(_worktree_path, repo_root)
-                    continue
-
-                gov.record_completion(1)
-                gov.record_result(result)
-                session.save(checkpoint, checkpoint_path)
-
-                logger.log_cost(
-                    result.raw_result_event or {},
-                    logger.LogContext(
-                        session_id=str(uuid.uuid4()),
-                        run_id=checkpoint.run_id,
-                        repo=repo,
-                        stage="research",
-                        issue_number=issue_number,
-                    ),
-                    log_dir=config.log_dir.expanduser(),
-                    model=config.model,
-                    auth_mode=_auth_mode(config),
+        def _when_empty() -> bool:
+            open_issues = _list_open_research_issues(repo, milestone)
+            if not open_issues:
+                _run_completion_gate(
+                    repo=repo,
+                    milestone=milestone,
+                    open_issues=[],
+                    config=config,
+                    checkpoint=checkpoint,
+                    dry_run=False,
                 )
-
-                logger.log_conductor_event(
-                    run_id=checkpoint.run_id,
-                    phase="dispatch",
-                    event_type="agent_completed",
-                    payload={
-                        "issue_number": issue_number,
-                        "subtype": result.subtype,
-                        "is_error": result.is_error,
-                        "error_code": result.error_code,
-                    },
-                    log_dir=config.log_dir.expanduser(),
+                return True
+            blocking, non_blocking = _classify_blocking_issues(
+                open_issues=open_issues,
+                repo=repo,
+                milestone=milestone,
+                config=config,
+                checkpoint=checkpoint,
+                dry_run=False,
+            )
+            if not blocking:
+                _run_completion_gate(
+                    repo=repo,
+                    milestone=milestone,
+                    open_issues=non_blocking,
+                    config=config,
+                    checkpoint=checkpoint,
+                    dry_run=False,
                 )
+                return True
+            return False
 
-                if not result.is_error:
-                    # Success: find the PR the agent created, then monitor and merge it.
-                    found = _find_pr_for_issue(repo, issue_number)
-                    if found is not None:
-                        pr_number, pr_branch = found
-                        _monitor_pr(
-                            pr_number=pr_number,
-                            branch=pr_branch,
-                            repo=repo,
-                            config=config,
-                            checkpoint=checkpoint,
-                            issue_number=issue_number,
-                        )
-                    else:
-                        click.echo(
-                            f"[research-worker] Warning: no open PR found for "
-                            f"issue #{issue_number}",
-                            err=True,
-                        )
-                    # Apply triage rubric to any follow-up issues filed by the agent
-                    _apply_triage_rubric(
-                        repo=repo,
-                        milestone=milestone,
-                        config=config,
-                        checkpoint=checkpoint,
-                    )
-
-                elif result.error_code in ("rate_limit", "extra_usage_exhausted") or (
-                    result.subtype == "error_max_budget_usd"
-                ):
-                    # Rate-limited or budget exhausted: unclaim and back off.
-                    _unclaim_issue(repo=repo, issue_number=issue_number)
-                    _gh(
-                        ["api", f"repos/{repo}/git/refs/heads/{_branch}", "--method", "DELETE"],
-                        check=False,
-                    )
-                    attempt = retry_counts.get(issue_number, 0)
-                    gov.record_429(attempt)
-                    retry_counts[issue_number] = attempt + 1
-                    logger.log_conductor_event(
-                        run_id=checkpoint.run_id,
-                        phase="backoff",
-                        event_type="backoff_enter",
-                        payload={
-                            "issue_number": issue_number,
-                            "reason": result.error_code or result.subtype,
-                            "attempt": attempt,
-                        },
-                        log_dir=config.log_dir.expanduser(),
-                    )
-                    session.save(checkpoint, checkpoint_path)
-
-                elif result.is_error:
-                    # Other error: increment retry count, unclaim for retry.
-                    current_retries = retry_counts.get(issue_number, 0) + 1
-                    retry_counts[issue_number] = current_retries
-                    _unclaim_issue(repo=repo, issue_number=issue_number)
-                    _gh(
-                        ["api", f"repos/{repo}/git/refs/heads/{_branch}", "--method", "DELETE"],
-                        check=False,
-                    )
-                    if current_retries >= MAX_RETRIES:
-                        logger.log_conductor_event(
-                            run_id=checkpoint.run_id,
-                            phase="dispatch",
-                            event_type="human_escalate",
-                            payload={
-                                "issue_number": issue_number,
-                                "reason": result.subtype or "unknown_error",
-                                "error_code": result.error_code,
-                                "retry_count": current_retries,
-                                "action_required": "manual investigation",
-                            },
-                            log_dir=config.log_dir.expanduser(),
-                        )
-                    # Issue returns to open state for retry in a future iteration
-
-                _remove_worktree(_worktree_path, repo_root)
-                session.save(checkpoint, checkpoint_path)
-
-            _fill_research_pool()
+        _run_persistent_pool(
+            pool_size=pool_size,
+            gov=gov,
+            repo=repo,
+            repo_root=repo_root,
+            config=config,
+            checkpoint=checkpoint,
+            stage="research",
+            fill_fn=_fill,
+            on_success=_on_success,
+            when_empty_fn=_when_empty,
+            stall_reason=(
+                "All blocking research issues are dependency-blocked and no agents are "
+                "running. Manual intervention required to resolve the dependency cycle "
+                "or close/skip issues."
+            ),
+        )
 
     if _clone_dir:
         shutil.rmtree(_clone_dir, ignore_errors=True)
@@ -3117,7 +3186,6 @@ def _run_impl_worker(
     """
     gov = UsageGovernor(config, checkpoint)
     checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
-    retry_counts: dict[int, int] = {}
     active_modules: set[str] = set()  # module isolation tracker
     repo_root, _clone_dir = _ensure_worktree_repo(repo)
     default_branch = _get_default_branch_for_repo(repo) if not dry_run else config.default_branch
@@ -3134,8 +3202,7 @@ def _run_impl_worker(
             if found is not None:
                 pr_number, stale_branch = found
                 click.echo(
-                    f"[impl-worker] Resuming: monitoring PR #{pr_number}"
-                    f" for issue #{stale_number}",
+                    f"[impl-worker] Resuming: monitoring PR #{pr_number} for issue #{stale_number}",
                     err=True,
                 )
                 _monitor_pr(
@@ -3178,11 +3245,8 @@ def _run_impl_worker(
         return
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=pool_size) as executor:
-        active: dict = {}  # future -> (issue, branch, worktree_path, module)
-        stall_counter: int = 0
 
-        def _fill_impl_pool() -> None:
-            """Re-fetch open issues and submit new agents until pool is full."""
+        def _fill(active: dict) -> None:
             open_issues = _list_open_impl_issues(repo, milestone)
             active_issue_numbers = {info[0]["number"] for info in active.values()}
             open_issue_numbers = {i.get("number", 0) for i in open_issues}
@@ -3244,241 +3308,118 @@ def _run_impl_worker(
                 active[future] = (issue, branch, worktree_path, mod)
                 active_issue_numbers.add(issue_number)
 
-        _fill_impl_pool()
-
-        while True:
-            if not active:
-                open_issues = _list_open_impl_issues(repo, milestone)
-                if not open_issues:
-                    # No open issues remain — file pipeline issue and stop
-                    next_version = _find_next_version(milestone)
-                    _gh(
-                        [
-                            "issue",
-                            "create",
-                            "--title",
-                            f"Run plan-milestones for {next_version}",
-                            "--label",
-                            "pipeline",
-                            "--body",
-                            (
-                                f"Pipeline stage transition: impl-worker has completed "
-                                f"all implementation issues for {milestone}. "
-                                f"Time to plan the next version."
-                            ),
-                        ],
-                        repo=repo,
-                        check=False,
-                    )
-                    logger.log_conductor_event(
-                        run_id=checkpoint.run_id,
-                        phase="complete",
-                        event_type="stage_complete",
-                        payload={
-                            "milestone": milestone,
-                            "next_pipeline_issue": f"Run plan-milestones for {next_version}",
-                        },
-                        log_dir=config.log_dir.expanduser(),
-                    )
-                    session.save(checkpoint, checkpoint_path)
-                    click.echo(
-                        f"Implementation milestone '{milestone}' complete. "
-                        f"Filed 'Run plan-milestones for {next_version}' pipeline issue."
-                    )
-                    break
-
-                # Pool empty but open issues exist — all dep-blocked or no capacity
-                stall_counter += 1
-                if stall_counter >= STALL_MAX_ITERATIONS:
-                    logger.log_conductor_event(
-                        run_id=checkpoint.run_id,
-                        phase="stall",
-                        event_type="human_escalate",
-                        payload={
-                            "reason": "dep-blocked deadlock or all modules busy",
-                            "open_issues": [i["number"] for i in open_issues],
-                        },
-                        log_dir=config.log_dir.expanduser(),
-                    )
-                    break
-                time.sleep(BACKOFF_SLEEP_SECONDS)
-                _fill_impl_pool()
-                continue
-
-            stall_counter = 0
-
-            # ------------------------------------------------------------------
-            # Wait for the first agent to complete
-            # ------------------------------------------------------------------
-            done, _ = concurrent.futures.wait(
-                list(active.keys()), return_when=concurrent.futures.FIRST_COMPLETED
-            )
-            for future in done:
-                _issue, _branch, _worktree_path, _module = active.pop(future)
-                issue_number = _issue["number"]
-
-                try:
-                    _, _, _, result = future.result()
-                except Exception as exc:
-                    # Unexpected exception from dispatcher
-                    logger.log_conductor_event(
-                        run_id=checkpoint.run_id,
-                        phase="dispatch",
-                        event_type="agent_exception",
-                        payload={
-                            "issue_number": issue_number,
-                            "error": str(exc),
-                        },
-                        log_dir=config.log_dir.expanduser(),
-                    )
-                    gov.record_completion(1)
-                    active_modules.discard(_module)
-                    _unclaim_issue(repo=repo, issue_number=issue_number)
-                    _remove_worktree(_worktree_path, repo_root)
-                    continue
-
-                gov.record_completion(1)
-                gov.record_result(result)
-                active_modules.discard(_module)
-
-                logger.log_cost(
-                    result.raw_result_event or {},
-                    logger.LogContext(
-                        session_id=str(uuid.uuid4()),
-                        run_id=checkpoint.run_id,
-                        repo=repo,
-                        stage="impl",
-                        issue_number=issue_number,
-                    ),
-                    log_dir=config.log_dir.expanduser(),
-                    model=config.model,
-                    auth_mode=_auth_mode(config),
-                )
-
+        def _on_success(issue: dict, branch: str, worktree_path: str) -> None:
+            issue_number = issue["number"]
+            pr_number = _find_pr_for_branch(repo, branch)
+            if pr_number is None:
                 logger.log_conductor_event(
                     run_id=checkpoint.run_id,
                     phase="dispatch",
-                    event_type="agent_completed",
+                    event_type="human_escalate",
                     payload={
                         "issue_number": issue_number,
-                        "subtype": result.subtype,
-                        "is_error": result.is_error,
-                        "error_code": result.error_code,
-                        "branch": _branch,
+                        "reason": "agent completed but no PR found",
+                        "branch": branch,
                     },
                     log_dir=config.log_dir.expanduser(),
                 )
-                session.save(checkpoint, checkpoint_path)
-
-                # Rate-limited -> unclaim and back off
-                if result.error_code in ("rate_limit", "extra_usage_exhausted") or (
-                    result.subtype == "error_max_budget_usd"
-                ):
-                    _unclaim_issue(repo=repo, issue_number=issue_number)
-                    _remove_worktree(_worktree_path, repo_root)
-                    attempt = retry_counts.get(issue_number, 0)
-                    gov.record_429(attempt)
-                    retry_counts[issue_number] = attempt + 1
-                    logger.log_conductor_event(
-                        run_id=checkpoint.run_id,
-                        phase="backoff",
-                        event_type="backoff_enter",
-                        payload={
-                            "issue_number": issue_number,
-                            "reason": result.error_code or result.subtype,
-                            "attempt": attempt,
-                        },
-                        log_dir=config.log_dir.expanduser(),
-                    )
-                    session.save(checkpoint, checkpoint_path)
-                    continue
-
-                # Other agent error -> retry or escalate
-                if result.is_error:
-                    current_retries = retry_counts.get(issue_number, 0) + 1
-                    retry_counts[issue_number] = current_retries
-                    _unclaim_issue(repo=repo, issue_number=issue_number)
-                    _remove_worktree(_worktree_path, repo_root)
-                    if current_retries >= MAX_RETRIES:
-                        logger.log_conductor_event(
-                            run_id=checkpoint.run_id,
-                            phase="dispatch",
-                            event_type="human_escalate",
-                            payload={
-                                "issue_number": issue_number,
-                                "reason": result.subtype or "unknown_error",
-                                "error_code": result.error_code,
-                                "retry_count": current_retries,
-                                "action_required": "manual investigation",
-                            },
-                            log_dir=config.log_dir.expanduser(),
-                        )
-                    continue
-
-                # Success path: find the PR created by the agent
-                pr_number = _find_pr_for_branch(repo, _branch)
-                if pr_number is None:
-                    # Agent succeeded but created no PR — escalate
-                    logger.log_conductor_event(
-                        run_id=checkpoint.run_id,
-                        phase="dispatch",
-                        event_type="human_escalate",
-                        payload={
-                            "issue_number": issue_number,
-                            "reason": "agent completed but no PR found",
-                            "branch": _branch,
-                        },
-                        log_dir=config.log_dir.expanduser(),
-                    )
-                    _unclaim_issue(repo=repo, issue_number=issue_number)
-                    _remove_worktree(_worktree_path, repo_root)
-                    continue
-
-                # Record the open PR
-                checkpoint.open_prs[_branch] = pr_number
-                session.save(checkpoint, checkpoint_path)
-
+                _unclaim_issue(repo=repo, issue_number=issue_number)
+                _remove_worktree(worktree_path, repo_root)
+                return
+            checkpoint.open_prs[branch] = pr_number
+            session.save(checkpoint, checkpoint_path)
+            logger.log_conductor_event(
+                run_id=checkpoint.run_id,
+                phase="dispatch",
+                event_type="pr_created",
+                payload={
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "branch": branch,
+                },
+                log_dir=config.log_dir.expanduser(),
+            )
+            merged = _monitor_pr(
+                pr_number=pr_number,
+                branch=branch,
+                repo=repo,
+                config=config,
+                checkpoint=checkpoint,
+                worktree_path=worktree_path,
+                issue_number=issue_number,
+            )
+            if merged:
+                _remove_worktree(worktree_path, repo_root)
+            else:
                 logger.log_conductor_event(
                     run_id=checkpoint.run_id,
-                    phase="dispatch",
-                    event_type="pr_created",
+                    phase="merge",
+                    event_type="human_escalate",
                     payload={
                         "issue_number": issue_number,
                         "pr_number": pr_number,
-                        "branch": _branch,
+                        "reason": "CI monitoring did not result in merge",
                     },
                     log_dir=config.log_dir.expanduser(),
                 )
 
-                # Monitor CI and merge
-                merged = _monitor_pr(
-                    pr_number=pr_number,
-                    branch=_branch,
+        def _on_release(slot: tuple) -> None:
+            active_modules.discard(slot[3])
+
+        def _when_empty() -> bool:
+            open_issues = _list_open_impl_issues(repo, milestone)
+            if not open_issues:
+                next_version = _find_next_version(milestone)
+                _gh(
+                    [
+                        "issue",
+                        "create",
+                        "--title",
+                        f"Run plan-milestones for {next_version}",
+                        "--label",
+                        "pipeline",
+                        "--body",
+                        (
+                            f"Pipeline stage transition: impl-worker has completed "
+                            f"all implementation issues for {milestone}. "
+                            f"Time to plan the next version."
+                        ),
+                    ],
                     repo=repo,
-                    config=config,
-                    checkpoint=checkpoint,
-                    worktree_path=_worktree_path,
-                    issue_number=issue_number,
+                    check=False,
                 )
-
-                if merged:
-                    _remove_worktree(_worktree_path, repo_root)
-                else:
-                    logger.log_conductor_event(
-                        run_id=checkpoint.run_id,
-                        phase="merge",
-                        event_type="human_escalate",
-                        payload={
-                            "issue_number": issue_number,
-                            "pr_number": pr_number,
-                            "reason": "CI monitoring did not result in merge",
-                        },
-                        log_dir=config.log_dir.expanduser(),
-                    )
-
+                logger.log_conductor_event(
+                    run_id=checkpoint.run_id,
+                    phase="complete",
+                    event_type="stage_complete",
+                    payload={
+                        "milestone": milestone,
+                        "next_pipeline_issue": f"Run plan-milestones for {next_version}",
+                    },
+                    log_dir=config.log_dir.expanduser(),
+                )
                 session.save(checkpoint, checkpoint_path)
+                click.echo(
+                    f"Implementation milestone '{milestone}' complete. "
+                    f"Filed 'Run plan-milestones for {next_version}' pipeline issue."
+                )
+                return True
+            return False
 
-            _fill_impl_pool()
+        _run_persistent_pool(
+            pool_size=pool_size,
+            gov=gov,
+            repo=repo,
+            repo_root=repo_root,
+            config=config,
+            checkpoint=checkpoint,
+            stage="impl",
+            fill_fn=_fill,
+            on_success=_on_success,
+            when_empty_fn=_when_empty,
+            on_release=_on_release,
+            stall_reason="dep-blocked deadlock or all modules busy",
+        )
 
     if _clone_dir:
         shutil.rmtree(_clone_dir, ignore_errors=True)
