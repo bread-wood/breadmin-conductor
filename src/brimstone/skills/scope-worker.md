@@ -161,18 +161,18 @@ If any issue has a dependency on an issue number that was not filed in this sess
 impl milestone. If it is closed or missing, remove the dependency and note the correction.
 
 **Wire up GitHub dependency links for every dependency relationship.**
-For each issue N that depends on issue M, update issue N's body to include the canonical
-`Depends on: #M` text in the Dependencies section, then confirm with:
+For each issue N that depends on issue M, append `Depends on: #M` to issue N's body:
 ```bash
-gh issue edit <N> --body "$(cat <<'EOF'
-<full updated body with correct Depends on: #M line>
-EOF
-)" --repo <owner>/<repo>
+gh issue edit <N> --repo <owner>/<repo> \
+  --body "$(gh issue view <N> --repo <owner>/<repo> --json body --jq .body)
+
+Depends on: #<M>"
 ```
 
-Do this for every dependency edge in the DAG. brimstone's `_filter_unblocked` reads
-`Depends on: #N` from issue bodies to enforce execution order — if these lines are absent
-or contain wrong numbers, all issues will be dispatched in parallel regardless of order.
+Do this for **every dependency edge** in the DAG — one `gh issue edit` call per blocked issue.
+brimstone's `_filter_unblocked` reads `Depends on: #N` from issue bodies to enforce execution
+order — if these lines are absent or contain wrong numbers, all issues will be dispatched in
+parallel regardless of order.
 
 ### Step 5 — Print Summary
 
