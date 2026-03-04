@@ -4702,9 +4702,10 @@ def _run_plan_issues(
 def _validate_spec_path(spec: str) -> Path:
     """Resolve and validate the ``--spec`` argument.
 
-    Accepts a relative path (resolved from cwd) or an absolute path.  Fails
-    with a :exc:`click.ClickException` if the path does not exist or does not
-    end in ``.md``.
+    Accepts:
+    - A local path (relative or absolute)
+    - A GitHub path in ``owner/repo/path/to/spec.md`` format — fetched via
+      ``gh api`` and written to a temp file that is cleaned up at exit.
 
     Args:
         spec: Raw value of the ``--spec`` CLI option.
@@ -4715,12 +4716,51 @@ def _validate_spec_path(spec: str) -> Path:
     Raises:
         click.ClickException: If the path does not exist or is not a ``.md`` file.
     """
-    resolved = Path(spec).expanduser().resolve()
-    if not resolved.exists():
-        raise click.ClickException(f"Spec file not found: {resolved}")
-    if resolved.suffix.lower() != ".md":
-        raise click.ClickException(f"Spec file must be a .md file, got: {resolved.name!r}")
-    return resolved
+    # Detect GitHub path: owner/repo/path — at least 3 slash-separated parts,
+    # does not start with / or ~, and the local path does not exist.
+    parts = spec.split("/")
+    local = Path(spec).expanduser().resolve()
+    is_github_path = (
+        len(parts) >= 3
+        and not spec.startswith("/")
+        and not spec.startswith("~")
+        and not local.exists()
+    )
+    if is_github_path:
+        owner_repo = f"{parts[0]}/{parts[1]}"
+        file_path = "/".join(parts[2:])
+        if not file_path.lower().endswith(".md"):
+            raise click.ClickException(f"Spec file must be a .md file, got: {file_path!r}")
+        result = subprocess.run(
+            ["gh", "api", f"repos/{owner_repo}/contents/{file_path}", "--jq", ".content"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise click.ClickException(
+                f"Could not fetch spec from GitHub ({owner_repo}/{file_path}): "
+                f"{result.stderr.strip()}"
+            )
+        import base64
+        import tempfile
+
+        content = base64.b64decode(result.stdout.strip()).decode()
+        suffix = Path(file_path).suffix
+        stem = Path(file_path).stem
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=suffix, prefix=f"{stem}-", delete=False)
+        tmp.write(content)
+        tmp.close()
+        tmp_path = Path(tmp.name)
+        import atexit
+
+        atexit.register(lambda p=tmp_path: p.unlink(missing_ok=True))
+        return tmp_path
+
+    if not local.exists():
+        raise click.ClickException(f"Spec file not found: {local}")
+    if local.suffix.lower() != ".md":
+        raise click.ClickException(f"Spec file must be a .md file, got: {local.name!r}")
+    return local
 
 
 _BRIMSTONE_BOT = "yeast-bot"
@@ -5143,6 +5183,7 @@ def _run_plan(
     dry_run: bool = False,
     spec_stem: str | None = None,
     spec_local_path: str | None = None,
+    store: BeadStore | None = None,
 ) -> None:
     """Dispatch a single plan agent to create a milestone pair and seed issues.
 
@@ -5160,11 +5201,23 @@ def _run_plan(
                          When None, falls back to ``version``.
         spec_local_path: Absolute path to the original spec file on disk. When provided,
                          the agent reads it directly; otherwise reads via GitHub API.
+        store:           Active BeadStore. When provided, used as source of truth to
+                         detect whether research beads already exist for this milestone.
     """
     if spec_stem is None:
         spec_stem = version
     checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
     today = date.today().isoformat()
+
+    # Skip plan if research beads already exist — BeadStore is source of truth.
+    if not dry_run and store is not None:
+        existing_beads = store.list_work_beads(milestone=version, stage="research")
+        if existing_beads:
+            click.echo(
+                f"[plan] {len(existing_beads)} research bead(s) already exist for {version!r}"
+                " — plan stage skipped (already seeded)."
+            )
+            return
 
     # Skip plan if design is already underway (HLD merged → research issues
     # seeded in a prior run; re-filing them would block design with new research).
@@ -5908,7 +5961,13 @@ def run(
                 f"--milestone is required for: {', '.join(f'--{s}' for s in non_plan_stages)}"
             )
     else:
-        effective_milestones = milestone  # may be empty; only plan stage runs
+        # Plan-only run: infer milestone from spec stems if no explicit --milestone
+        if milestone:
+            effective_milestones = milestone
+        elif resolved_specs:
+            effective_milestones = tuple(_infer_milestone_from_spec(p) for p in resolved_specs)
+        else:
+            effective_milestones = milestone  # empty; will be caught downstream
 
     # -----------------------------------------------------------------------
     # Resolve repo and build base config
@@ -6027,6 +6086,7 @@ def run(
                     dry_run=False,
                     spec_stem=stem,
                     spec_local_path=str(resolved_spec),
+                    store=_store,
                 )
             else:
                 # Completion check — skip if stage is already done
