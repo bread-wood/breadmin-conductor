@@ -3208,14 +3208,26 @@ def _process_merge_queue(
                 )
                 break
 
-        # Squash-merge
-        merge_result = _gh(
-            ["pr", "merge", str(pr_number), "--squash", "--delete-branch"],
-            repo=repo,
-            check=False,
-        )
+        # Squash-merge — retry a few times to handle GitHub's eventual-consistency
+        # window: after a rebase force-push (or after sibling PRs merged first),
+        # the GraphQL mergeability can briefly return "not mergeable" even when
+        # gh pr view shows mergeStateStatus=CLEAN.
+        _merge_delays = [3, 8, 15]
+        merge_result = None
+        for _delay in [0] + _merge_delays:
+            if _delay:
+                time.sleep(_delay)
+            merge_result = _gh(
+                ["pr", "merge", str(pr_number), "--squash", "--delete-branch"],
+                repo=repo,
+                check=False,
+            )
+            if merge_result.returncode == 0:
+                break
+            if "not mergeable" not in (merge_result.stderr or "").lower():
+                break  # non-retriable error
 
-        if merge_result.returncode == 0:
+        if merge_result is not None and merge_result.returncode == 0:
             now_str = datetime.now(UTC).isoformat()
             pr_bead = store.read_pr_bead(pr_number)
             if pr_bead is not None:
@@ -3249,7 +3261,7 @@ def _process_merge_queue(
                     "pr_number": pr_number,
                     "issue_number": issue_number,
                     "reason": "squash merge failed",
-                    "stderr": merge_result.stderr[:500] if merge_result.stderr else "",
+                    "stderr": (merge_result.stderr or "")[:500] if merge_result is not None else "",
                 },
                 log_dir=config.log_dir.expanduser(),
             )
