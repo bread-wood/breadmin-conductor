@@ -4855,28 +4855,31 @@ def _run_design_worker(
         click.echo(f"[dry-run] Would dispatch LLD agents in parallel for milestone {milestone!r}")
         return
 
-    # LLD issues were filed by the HLD agent; pick up all open ones.
-    # Self-heal: compare open issues against modules declared in the HLD and
-    # create any that are missing — handles both the "none filed" case and the
-    # "some but not all filed" partial case.
-    all_design_issues = _list_open_issues_by_label(repo, milestone, DESIGN_LABEL)
-    lld_issues = [i for i in all_design_issues if i["title"] != hld_issue_title]
-
+    # LLD beads are the source of truth for what has been dispatched.
+    # Self-heal: compare existing design beads against modules declared in the
+    # HLD and create a GitHub issue + bead for any that are missing — handles
+    # both "none filed" and "some but not all filed" partial states.
     modules_from_hld = _parse_modules_from_hld(repo, hld_doc_path, default_branch)
-    if modules_from_hld:
-        filed_titles = {i["title"] for i in lld_issues}
-        missing = [m for m in modules_from_hld if f"Design: LLD for {m}" not in filed_titles]
+    if modules_from_hld and store is not None:
+        existing_beads = store.list_work_beads(milestone=milestone, stage="design")
+        beaded_modules = {
+            _extract_module_from_design_issue({"title": b.title})
+            for b in existing_beads
+            if b.title != hld_issue_title
+        }
+        missing = [m for m in modules_from_hld if m not in beaded_modules]
         if missing:
             click.echo(
-                f"[design-worker] Self-healing: filing {len(missing)} missing LLD issue(s): "
+                f"[design-worker] Self-healing: filing {len(missing)} missing LLD bead(s): "
                 + ", ".join(missing),
                 err=True,
             )
             for module in missing:
+                title = f"Design: LLD for {module}"
                 _file_design_issue_if_missing(
                     repo,
                     milestone,
-                    f"Design: LLD for {module}",
+                    title,
                     (
                         f"## Deliverable\n"
                         f"`docs/design/{milestone}/lld/{module}.md`\n\n"
@@ -4889,11 +4892,11 @@ def _run_design_worker(
                         f"for this module."
                     ),
                 )
-            # Re-seed beads and re-fetch to include newly created issues
-            if store is not None:
-                _seed_work_beads(repo, milestone, DESIGN_LABEL, "design", store)
-            all_design_issues = _list_open_issues_by_label(repo, milestone, DESIGN_LABEL)
-            lld_issues = [i for i in all_design_issues if i["title"] != hld_issue_title]
+            # Seed beads from GitHub so newly created issues get beads
+            _seed_work_beads(repo, milestone, DESIGN_LABEL, "design", store)
+
+    all_design_issues = _list_open_issues_by_label(repo, milestone, DESIGN_LABEL)
+    lld_issues = [i for i in all_design_issues if i["title"] != hld_issue_title]
 
     if not lld_issues:
         click.echo(
