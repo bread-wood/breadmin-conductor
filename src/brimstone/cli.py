@@ -6806,6 +6806,13 @@ def _check_gate_before_stage(
     default=False,
     help="Run the bead/repo health monitor as a background thread alongside the pipeline.",
 )
+@click.option(
+    "--bugs-repo",
+    "bugs_repo",
+    default=None,
+    help="Repository where monitor anomaly issues are filed (should be the brimstone repo). "
+    "Only used when --monitor is set. Defaults to --repo when omitted.",
+)
 def run(
     specs: tuple[str, ...],
     repo: str | None,
@@ -6822,6 +6829,7 @@ def run(
     max_budget: float | None,
     dry_run: bool,
     monitor_enabled: bool,
+    bugs_repo: str | None,
 ) -> None:
     """Run one or more pipeline stages for a milestone.
 
@@ -6996,6 +7004,7 @@ def run(
             monitor.run_monitor(
                 _monitor_store,
                 repo_ref,
+                bugs_repo=bugs_repo,
                 once=False,
                 interval=monitor.MONITOR_INTERVAL_SECONDS,
                 dry_run=False,
@@ -7452,7 +7461,15 @@ def status_cmd(repo: str | None) -> None:
 @click.option(
     "--repo",
     default=None,
-    help="Repository in owner/repo format. Inferred from git remote if omitted.",
+    help="Repository being orchestrated (watched for label/bead drift). "
+    "Inferred from git remote if omitted.",
+)
+@click.option(
+    "--bugs-repo",
+    "bugs_repo",
+    default=None,
+    help="Repository where anomaly bug issues are filed. Defaults to --repo when omitted, "
+    "but should normally be the brimstone repo itself.",
 )
 @click.option(
     "--once",
@@ -7472,8 +7489,10 @@ def status_cmd(repo: str | None) -> None:
     default=False,
     help="Print anomalies to stdout without filing GitHub issues.",
 )
-def monitor_cmd(repo: str | None, once: bool, interval: int, dry_run: bool) -> None:
-    """Watch bead and repo state for aberrations and file bug issues."""
+def monitor_cmd(
+    repo: str | None, bugs_repo: str | None, once: bool, interval: int, dry_run: bool
+) -> None:
+    """Watch bead and repo state for aberrations and file bug issues against bugs-repo."""
     repo_ref = _resolve_repo(repo)
     if not repo_ref:
         raise click.UsageError(
@@ -7483,4 +7502,6 @@ def monitor_cmd(repo: str | None, once: bool, interval: int, dry_run: bool) -> N
     config = load_config(github_repo=repo_ref, target_repo=repo_ref)
     store = make_bead_store(config, repo_ref)
 
-    monitor.run_monitor(store, repo_ref, once=once, interval=interval, dry_run=dry_run)
+    monitor.run_monitor(
+        store, repo_ref, bugs_repo=bugs_repo, once=once, interval=interval, dry_run=dry_run
+    )

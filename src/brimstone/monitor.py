@@ -358,7 +358,7 @@ def _build_issue_body(anomaly: Anomaly) -> str:
     )
 
 
-def file_anomaly_issue(anomaly: Anomaly, repo: str) -> str | None:
+def file_anomaly_issue(anomaly: Anomaly, bugs_repo: str) -> str | None:
     """File a GitHub issue for the anomaly. Returns the issue URL or None on failure."""
     label = "bug,P1" if anomaly.severity == "critical" else "bug,P2"
     title = f"[monitor] {anomaly.kind}: {anomaly.description[:80]}"
@@ -366,7 +366,7 @@ def file_anomaly_issue(anomaly: Anomaly, repo: str) -> str | None:
 
     result = _gh(
         ["issue", "create", "--title", title, "--label", label, "--body", body],
-        repo=repo,
+        repo=bugs_repo,
         check=False,
     )
     if result.returncode != 0:
@@ -379,10 +379,17 @@ def file_anomaly_issue(anomaly: Anomaly, repo: str) -> str | None:
 def process_anomalies(
     anomalies: list[Anomaly],
     store: BeadStore,
-    repo: str,
+    bugs_repo: str,
     dry_run: bool = False,
 ) -> list[str]:
     """Dedup and file GitHub issues for each new anomaly.
+
+    Args:
+        anomalies: Detected anomalies from this scan pass.
+        store:     BeadStore for the watched repo (used for dedup file path).
+        bugs_repo: Repository where bug issues are filed (the brimstone repo,
+                   not the target repo being orchestrated).
+        dry_run:   Print anomalies without filing GitHub issues.
 
     Returns a list of URLs for issues filed this run.
     """
@@ -401,7 +408,7 @@ def process_anomalies(
             filed[fp] = "dry-run"
             continue
 
-        url = file_anomaly_issue(anomaly, repo)
+        url = file_anomaly_issue(anomaly, bugs_repo)
         if url:
             filed[fp] = url
             new_urls.append(url)
@@ -423,6 +430,7 @@ def run_monitor(
     store: BeadStore,
     repo: str,
     *,
+    bugs_repo: str | None = None,
     once: bool = False,
     interval: int = MONITOR_INTERVAL_SECONDS,
     dry_run: bool = False,
@@ -430,13 +438,19 @@ def run_monitor(
     """Run the monitoring loop.
 
     Args:
-        store:    BeadStore for the target repo.
-        repo:     ``owner/repo`` string (for GitHub API calls).
-        once:     If True, run one pass and return instead of looping.
-        interval: Seconds between detection passes.
-        dry_run:  If True, print anomalies but do not file GitHub issues.
+        store:     BeadStore for the target repo being orchestrated.
+        repo:      ``owner/repo`` of the target repo (used for label checks).
+        bugs_repo: ``owner/repo`` where anomaly issues are filed.  Defaults to
+                   ``repo`` when not set, but should normally be the brimstone
+                   repo itself since anomalies represent brimstone bugs.
+        once:      If True, run one pass and return instead of looping.
+        interval:  Seconds between detection passes.
+        dry_run:   If True, print anomalies but do not file GitHub issues.
     """
-    print(f"[monitor] starting for {repo} (interval={interval}s, once={once})")
+    _bugs_repo = bugs_repo or repo
+    print(
+        f"[monitor] watching {repo}, filing bugs → {_bugs_repo} (interval={interval}s, once={once})"
+    )
 
     while True:
         ts = datetime.now(UTC).isoformat()
@@ -445,7 +459,7 @@ def run_monitor(
         anomalies = run_all_detectors(store, repo)
 
         if anomalies:
-            new_urls = process_anomalies(anomalies, store, repo, dry_run=dry_run)
+            new_urls = process_anomalies(anomalies, store, _bugs_repo, dry_run=dry_run)
             total = len(anomalies)
             new = len(new_urls)
             print(f"[monitor] {total} anomaly/ies found, {new} new issue(s) filed")
