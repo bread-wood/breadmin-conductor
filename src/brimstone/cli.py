@@ -658,7 +658,7 @@ def _resume_open_prs(
     except json.JSONDecodeError:
         return
 
-    # Fetch all impl issues for the milestone (open + closed) to build a number set
+    # Fetch all impl issues for the milestone (open + closed) to build lookup maps
     issues_result = _gh(
         [
             "issue",
@@ -670,7 +670,7 @@ def _resume_open_prs(
             "--milestone",
             milestone,
             "--json",
-            "number",
+            "number,state",
             "--limit",
             "200",
         ],
@@ -678,11 +678,12 @@ def _resume_open_prs(
         check=False,
     )
     try:
-        milestone_issue_numbers: set[int] = {
-            i["number"] for i in json.loads(issues_result.stdout or "[]")
-        }
+        _issues = json.loads(issues_result.stdout or "[]")
+        milestone_issue_numbers: set[int] = {i["number"] for i in _issues}
+        open_issue_numbers: set[int] = {i["number"] for i in _issues if i["state"] == "OPEN"}
     except (json.JSONDecodeError, KeyError):
         milestone_issue_numbers = set()
+        open_issue_numbers = set()
 
     for pr in open_prs:
         branch: str = pr.get("headRefName") or ""
@@ -698,6 +699,24 @@ def _resume_open_prs(
         if issue_number not in milestone_issue_numbers:
             continue
         if issue_number in already_handled:
+            continue
+        # If the issue was closed (abandoned/manually closed), close the PR too
+        if issue_number not in open_issue_numbers:
+            click.echo(
+                f"{log_prefix} Closing PR #{pr_number}: issue #{issue_number} was closed",
+                err=True,
+            )
+            _gh(
+                [
+                    "pr",
+                    "close",
+                    str(pr_number),
+                    "--comment",
+                    f"Closing: issue #{issue_number} was closed before this PR merged.",
+                ],
+                repo=repo,
+                check=False,
+            )
             continue
         click.echo(
             f"{log_prefix} Resuming untracked open PR #{pr_number} for issue #{issue_number}",
@@ -1049,11 +1068,26 @@ def _file_design_issue_if_missing(
 ) -> None:
     """Create a ``stage/design`` issue with *title* in *repo* if it doesn't already exist.
 
-    Fetches all open+closed issues and checks for an exact title match before
-    creating, making this call idempotent on re-run.
+    Fetches all open+closed issues scoped to *milestone* and checks for an exact
+    title match before creating, making this call idempotent on re-run.
+
+    Scoping to the milestone prevents false-positive dedup matches against
+    identically-titled issues from prior milestones (e.g. "Design: LLD for lexer"
+    from v0.1.0 should not block filing the same title for v0.2.0).
     """
     result = _gh(
-        ["issue", "list", "--state", "all", "--limit", "500", "--json", "title"],
+        [
+            "issue",
+            "list",
+            "--state",
+            "all",
+            "--milestone",
+            milestone,
+            "--limit",
+            "500",
+            "--json",
+            "title",
+        ],
         repo=repo,
         check=False,
     )
