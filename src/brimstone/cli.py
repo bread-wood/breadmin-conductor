@@ -6444,8 +6444,9 @@ def run(
                             if _skip_store
                             else []
                         )
+                        # merge_ready = PR exists but hasn't merged yet — not done
                         _r_done = _r_beads and not any(
-                            b.state in ("open", "claimed") for b in _r_beads
+                            b.state in ("open", "claimed", "merge_ready") for b in _r_beads
                         )
                         if _r_done:
                             click.echo(
@@ -6460,7 +6461,9 @@ def run(
                         )
                         _d_done = (
                             _d_beads
-                            and not any(b.state in ("open", "claimed") for b in _d_beads)
+                            and not any(
+                                b.state in ("open", "claimed", "merge_ready") for b in _d_beads
+                            )
                             and _doc_exists_on_default_branch(
                                 repo_ref, f"docs/design/{ms}/HLD.md", default_branch
                             )
