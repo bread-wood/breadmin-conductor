@@ -6481,6 +6481,14 @@ def run(
                         _r_done = _r_beads and not any(
                             b.state in ("open", "claimed", "merge_ready") for b in _r_beads
                         )
+                        # Guard: plan can file new research issues that have no beads yet.
+                        # If beads look complete, confirm no open GitHub issues exist.
+                        if _r_done and repo_ref:
+                            _gh_open = _list_all_open_issues_by_label(
+                                repo_ref, ms, RESEARCH_LABEL
+                            )
+                            if _gh_open:
+                                _r_done = False
                         if _r_done:
                             click.echo(
                                 f"[run] {stage} ({ms}): already complete, skipping", err=True
