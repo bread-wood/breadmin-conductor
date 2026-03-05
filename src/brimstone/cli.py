@@ -1821,7 +1821,7 @@ def _prune_stale_dependencies(
             logger.log_conductor_event(
                 run_id=checkpoint.run_id,
                 phase="stall",
-                event_type="human_escalate",
+                event_type="dependency_pruned",
                 payload={
                     "issue_number": issue_number,
                     "pruned_dep": ref,
@@ -3189,6 +3189,14 @@ def _monitor_pr(
     if store is not None:
         store.write_pr_bead(pr_bead)
 
+    # Track any temp worktree created by the D1 conflict fallback so it is
+    # cleaned up on every exit path (return True, return False, or timeout).
+    _d1_tmp_wt: str = ""
+
+    def _cleanup_d1() -> None:
+        if _d1_tmp_wt and repo_root:
+            _remove_worktree(_d1_tmp_wt, repo_root)
+
     timeout_count = 0
     while True:
         for poll_idx in range(max_polls):
@@ -3204,6 +3212,7 @@ def _monitor_pr(
                     )
                     if _tmp_wt:
                         worktree_path = _tmp_wt
+                        _d1_tmp_wt = _tmp_wt  # mark for cleanup on all exit paths
                     else:
                         logger.log_conductor_event(
                             run_id=checkpoint.run_id,
@@ -3236,6 +3245,7 @@ def _monitor_pr(
                     pr_bead.state = "conflict"
                     if store is not None:
                         store.write_pr_bead(pr_bead)
+                    _cleanup_d1()
                     return False
 
                 rebase_ok = _rebase_branch(
@@ -3257,6 +3267,7 @@ def _monitor_pr(
                     pr_bead.state = "conflict"
                     if store is not None:
                         store.write_pr_bead(pr_bead)
+                    _cleanup_d1()
                     return False
                 # Rebase succeeded — continue polling so CI can re-run
                 continue
@@ -3362,6 +3373,10 @@ def _monitor_pr(
                     if _work_bead is not None:
                         _work_bead.state = "merge_ready"
                         store.write_work_bead(_work_bead)
+                        # Strip in-progress label now that the issue is queued for merge.
+                        # _unclaim_issue's merge_ready guard ensures only the label is
+                        # removed — the bead state is not reset to open.
+                        _unclaim_issue(repo=repo, issue_number=issue_number, store=store)
                 logger.log_conductor_event(
                     run_id=checkpoint.run_id,
                     phase="merge",
@@ -3374,6 +3389,7 @@ def _monitor_pr(
                     },
                     log_dir=config.log_dir.expanduser(),
                 )
+                _cleanup_d1()
                 return True
 
             elif ci_status == "fail":
@@ -3401,6 +3417,7 @@ def _monitor_pr(
                         },
                         log_dir=config.log_dir.expanduser(),
                     )
+                    _cleanup_d1()
                     return False
 
             # ci_status == "pending": continue polling
@@ -3426,6 +3443,11 @@ def _monitor_pr(
                 capture_output=True,
                 text=True,
             )
+            # Reset per-CI-run counters so the new run starts clean
+            rebase_attempts = 0
+            ci_fail_count = 0
+            consecutive_no_checks = 0
+            last_head_sha = ""
             continue  # restart poll loop with fresh CI run
         break  # second timeout or no worktree → fall through
 
@@ -3444,6 +3466,7 @@ def _monitor_pr(
         },
         log_dir=config.log_dir.expanduser(),
     )
+    _cleanup_d1()
     return False
 
 
