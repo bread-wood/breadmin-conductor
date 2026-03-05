@@ -3523,6 +3523,14 @@ def _checkout_existing_branch_worktree(branch: str, repo_root: str) -> str | Non
         capture_output=True,
         text=True,
     )
+    if result.returncode != 0 and "already exists" in result.stderr:
+        # Local branch exists from a previous session — check it out directly.
+        result = subprocess.run(
+            ["git", "worktree", "add", worktree_dir, branch],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
     return worktree_dir if result.returncode == 0 else None
 
 
