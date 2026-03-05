@@ -200,7 +200,7 @@ class AnomalyBead:
     auto_repair_attempts: int = 0
     gh_issue_number: int | None = None
     gh_issue_url: str | None = None
-    repair_branch: str | None = None    # branch created for the bug-tier repair agent
+    repair_branch: str | None = None  # branch created for the bug-tier repair agent
     repair_pr_number: int | None = None  # PR opened by the repair agent
     detected_at: str = ""
     resolved_at: str | None = None
@@ -847,6 +847,8 @@ def _load_anomaly_bead(path: Path) -> AnomalyBead:
         auto_repair_attempts=data.get("auto_repair_attempts", 0),
         gh_issue_number=data.get("gh_issue_number"),
         gh_issue_url=data.get("gh_issue_url"),
+        repair_branch=data.get("repair_branch"),
+        repair_pr_number=data.get("repair_pr_number"),
         detected_at=data.get("detected_at", ""),
         resolved_at=data.get("resolved_at"),
     )

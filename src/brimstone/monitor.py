@@ -959,27 +959,37 @@ def _create_repair_worktree(branch: str, repo_root: str, default_branch: str) ->
     # Clean up any stale state
     subprocess.run(
         ["git", "worktree", "remove", "--force", worktree_dir],
-        cwd=repo_root, capture_output=True, text=True,
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
     )
     subprocess.run(
         ["git", "branch", "-D", branch],
-        cwd=repo_root, capture_output=True, text=True,
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
     )
     # Fetch so origin/<default_branch> is current
     subprocess.run(
         ["git", "fetch", "origin"],
-        cwd=repo_root, capture_output=True, text=True,
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
     )
     result = subprocess.run(
         ["git", "worktree", "add", worktree_dir, "-b", branch, f"origin/{default_branch}"],
-        cwd=repo_root, capture_output=True, text=True,
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
     )
     if result.returncode != 0:
         print(f"[monitor] worktree add failed: {result.stderr.strip()}")
         return None
     subprocess.run(
         ["git", "push", "-u", "origin", branch],
-        cwd=worktree_dir, capture_output=True, text=True,
+        cwd=worktree_dir,
+        capture_output=True,
+        text=True,
     )
     return worktree_dir
 
@@ -987,7 +997,9 @@ def _create_repair_worktree(branch: str, repo_root: str, default_branch: str) ->
 def _remove_repair_worktree(worktree_path: str, repo_root: str) -> None:
     subprocess.run(
         ["git", "worktree", "remove", "--force", worktree_path],
-        cwd=repo_root, capture_output=True, text=True,
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
     )
 
 
@@ -1192,7 +1204,7 @@ def _run_repair_impl(
         env=env,
         max_turns=100,
         timeout_seconds=getattr(config, "agent_timeout_minutes", 60) * 60,
-        model=getattr(config, "model", None),
+        model=getattr(config, "monitor_model", None) or getattr(config, "model", None),
         fallback_model=getattr(config, "fallback_model", None),
     )
 
@@ -1237,10 +1249,7 @@ def _run_repair_impl(
     _remove_repair_worktree(worktree_path, repo_root)
 
     if not merged:
-        print(
-            f"[monitor] repair PR #{pr_number} not merged — "
-            "next scan will resume merge polling"
-        )
+        print(f"[monitor] repair PR #{pr_number} not merged — next scan will resume merge polling")
 
 
 # ---------------------------------------------------------------------------

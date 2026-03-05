@@ -144,7 +144,7 @@ class TestMonitorPrToMergeQueueDrain:
             patch("brimstone.cli._is_conflict_failure", return_value=False),
             patch("brimstone.cli._get_pr_checks_status", return_value="pass"),
             patch("brimstone.cli._get_review_status", return_value="approved"),
-            patch("brimstone.cli._gh"),
+            patch("brimstone.cli._gh", side_effect=_gh_side_effect),
             patch("brimstone.cli.time.sleep"),
             patch("brimstone.cli.session.save"),
             patch("brimstone.cli.logger.log_conductor_event"),
@@ -174,13 +174,9 @@ class TestMonitorPrToMergeQueueDrain:
         assert entry.issue_number == 7
 
         # --- Phase 2: _process_merge_queue ---
-        merge_result = MagicMock()
-        merge_result.returncode = 0
-        merge_result.stderr = None
-
         with (
             patch("brimstone.cli._checkout_existing_branch_worktree", return_value=None),
-            patch("brimstone.cli._gh", return_value=merge_result),
+            patch("brimstone.cli._gh", side_effect=_gh_side_effect),
             patch("brimstone.cli.session.save"),
             patch("brimstone.cli.logger.log_conductor_event"),
         ):

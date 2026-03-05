@@ -116,22 +116,58 @@ class Config(BaseSettings):
         description="Directory for session checkpoints",
     )
 
-    # --- Model ---
+    # --- Model allocation ---
+    # Tiered routing strategy: cheap models for grunt work, expensive for judgment.
+    #
+    # March 2026 pricing (per 1M tokens, input / output):
+    #   claude-opus-4-6          $5.00 / $25.00   frontier  — synthesis, deep design
+    #   claude-sonnet-4-6        $3.00 / $15.00   mid       — impl, design, triage
+    #   claude-haiku-4-5         $1.00 / $5.00    budget    — research, scope, monitor
+    #
+    # Typical pipeline cost breakdown per run:
+    #   research  (haiku)  × N issues  ≈ $0.01–0.05 each   → bulk of issue count
+    #   scope     (haiku)  × 1         ≈ $0.02–0.10
+    #   impl      (sonnet) × N issues  ≈ $0.10–0.50 each   → cost driver
+    #   design    (sonnet) × M modules ≈ $0.05–0.20 each
+    #   monitor   (haiku)  × ticks     ≈ $0.001–0.01 each  → negligible
+    #
+    # Escalation path: impl agents that hit max_retries can be manually re-run
+    # against opus via BRIMSTONE_MODEL override for the specific issue.
+
     model: str = Field(
         default="claude-sonnet-4-6",
-        description="Claude model ID for impl agents (default: claude-sonnet-4-6)",
+        description=(
+            "Claude model for impl agents. Mid-tier workhorse — balances capability "
+            "with cost for code generation and PR feedback triage."
+        ),
     )
     research_model: str = Field(
         default="claude-haiku-4-5-20251001",
-        description="Claude model ID for research agents (default: claude-haiku-4-5-20251001)",
+        description=(
+            "Claude model for research agents. Budget tier — research is high-volume "
+            "triage work; Haiku handles it well at ~10× lower cost than Sonnet."
+        ),
     )
     design_model: str = Field(
         default="claude-sonnet-4-6",
-        description="Claude model ID for design agents (default: claude-sonnet-4-6)",
+        description=(
+            "Claude model for design agents (HLD/LLD). Mid-tier — design requires "
+            "judgment and cross-module reasoning; Sonnet is the right floor here."
+        ),
     )
     scope_model: str = Field(
         default="claude-haiku-4-5-20251001",
-        description="Claude model ID for scope/plan-issues agents (default: haiku)",
+        description=(
+            "Claude model for scope/plan-issues agents. Budget tier — issue filing "
+            "and milestone planning are structured tasks Haiku handles cleanly."
+        ),
+    )
+    monitor_model: str = Field(
+        default="claude-haiku-4-5-20251001",
+        description=(
+            "Claude model for monitor/anomaly repair agents. Budget tier — health "
+            "checks and inline repairs are diagnostic, not creative; Haiku suffices."
+        ),
     )
 
     # --- Git / GitHub ---
@@ -182,6 +218,16 @@ class Config(BaseSettings):
     state_repo_dir: Path = Field(
         default=Path("~/.brimstone/state-repos"),
         description="Clone directory for state repos",
+    )
+
+    # --- Jobman integration ---
+    jobman_url: str | None = Field(
+        default=None,
+        description="Base URL for the jobman server (e.g. http://localhost:9500)",
+    )
+    jobman_api_key: str | None = Field(
+        default=None,
+        description="API key for authenticating with jobman",
     )
 
     # --- Health checks ---
