@@ -147,6 +147,12 @@ class CampaignBead:
     # Example: {"v0.2.1-multi-model": ["bread-wood/brimstone:v0.2.0-hardened-core"]}
     # Example: {"v0.1.0-knowledge-wire": ["bread-wood/moot:v0.4.0-council-spine"]}
     milestone_blocked_by: dict[str, list[str]] = field(default_factory=dict)
+    # Same-repo design stage gates.
+    # Maps milestone name → list of milestone names (same repo) whose design stage
+    # must be complete (status ∈ {"scoping", "implementing", "shipped"}) before this
+    # milestone's design stage can begin.
+    # Example: {"v0.5.0": ["v0.4.0"]}
+    design_blocked_by: dict[str, list[str]] = field(default_factory=dict)
     updated_at: str = ""
 
 
@@ -194,6 +200,8 @@ class AnomalyBead:
     auto_repair_attempts: int = 0
     gh_issue_number: int | None = None
     gh_issue_url: str | None = None
+    repair_branch: str | None = None  # branch created for the bug-tier repair agent
+    repair_pr_number: int | None = None  # PR opened by the repair agent
     detected_at: str = ""
     resolved_at: str | None = None
 
@@ -796,6 +804,7 @@ def _load_campaign_bead(path: Path) -> CampaignBead:
         current_index=data.get("current_index", 0),
         statuses=data.get("statuses", {}),
         milestone_blocked_by=data.get("milestone_blocked_by", {}),
+        design_blocked_by=data.get("design_blocked_by", {}),
         updated_at=data.get("updated_at", ""),
     )
 
@@ -838,6 +847,8 @@ def _load_anomaly_bead(path: Path) -> AnomalyBead:
         auto_repair_attempts=data.get("auto_repair_attempts", 0),
         gh_issue_number=data.get("gh_issue_number"),
         gh_issue_url=data.get("gh_issue_url"),
+        repair_branch=data.get("repair_branch"),
+        repair_pr_number=data.get("repair_pr_number"),
         detected_at=data.get("detected_at", ""),
         resolved_at=data.get("resolved_at"),
     )

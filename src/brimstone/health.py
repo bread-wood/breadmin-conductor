@@ -499,9 +499,7 @@ def _check_orphaned_issues(config: Config) -> CheckResult:
         )
 
     issues_with_pr_bead: set[int] = {
-        pb.issue_number
-        for pb in store.list_pr_beads()
-        if pb.state not in ("merged", "abandoned")
+        pb.issue_number for pb in store.list_pr_beads() if pb.state not in ("merged", "abandoned")
     }
 
     orphaned = [b for b in claimed_beads if b.issue_number not in issues_with_pr_bead]

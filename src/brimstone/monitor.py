@@ -13,10 +13,10 @@ every anomaly in the source repo's bead store, and responds in one of three tier
   probe   — the cause is unclear; a ``stage/research`` issue is filed in ``repairs``
              so an agent can investigate before a fix is attempted.
 
-AnomalyBeads live in the source repo's bead store (``anomalies/<id>.json``).
-When brimstone watches multiple repos (``--watch``), each repo's anomaly beads stay
-in that repo's bead store and repair issues are filed in that repo's ``repairs``
-milestone — never cross-contaminated.
+AnomalyBeads live in the watched repo's bead store (``anomalies/<id>.json``).
+Repair issues (bug/probe tiers) are filed in *bugs_repo* (normally the brimstone
+repo itself — anomalies are brimstone bugs, not target-repo bugs). Inline fixes
+apply to the watched repo directly (e.g. correcting a GitHub label).
 
 Detector inventory
 ------------------
@@ -41,12 +41,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
+from brimstone import runner as _runner
 from brimstone.beads import (
     BEAD_SCHEMA_VERSION,
     AnomalyBead,
@@ -692,23 +696,33 @@ def process_anomalies(
     store: BeadStore,
     repo: str,
     dry_run: bool = False,
-    # bugs_repo kept for backward compat but ignored — issues go to repo's repairs milestone
-    bugs_repo: str | None = None,  # noqa: ARG001
+    bugs_repo: str | None = None,
+    config: Any = None,
+    repo_root: str = "",
 ) -> list[str]:
     """Classify, bead-ify, and respond to each detected anomaly.
 
     For each anomaly:
     - Sets ``is_blocking`` and ``repair_tier`` on the Anomaly object.
     - Creates an AnomalyBead in the source repo's bead store (dedup by anomaly_id).
-    - ``inline``: applies the fix directly, no issue filed.
-    - ``bug``: files a ``stage/impl`` issue in repo's ``repairs`` milestone.
-    - ``probe``: files a ``stage/research`` issue in repo's ``repairs`` milestone.
+    - ``inline``: applies the fix to the watched repo directly, no issue filed.
+    - ``bug``: files a ``stage/impl`` issue in *bugs_repo*'s ``repairs`` milestone
+      and dispatches an impl agent to fix the brimstone source.
+    - ``probe``: files a ``stage/research`` issue in *bugs_repo*'s ``repairs`` milestone.
+
+    *bugs_repo* is the repo where anomaly issues are filed (normally the brimstone repo
+    itself — anomalies are brimstone bugs, not target-repo bugs). Defaults to *repo*
+    when omitted.
 
     Also runs a cleanup sweep: AnomalyBeads in ``open`` state whose anomaly no
     longer appears are transitioned to ``repaired``.
 
     Returns a list of URLs for repair issues filed this run.
     """
+    # Repair issues (bug + probe tiers) go to bugs_repo (the brimstone repo), not
+    # the target repo being watched. Inline fixes still apply to the watched repo.
+    _bugs_repo = bugs_repo or repo
+
     active_milestone = _get_active_milestone(store)
 
     for anomaly in anomalies:
@@ -790,7 +804,7 @@ def process_anomalies(
                     )
                     anomaly.repair_tier = "bug"
                     existing.repair_tier = "bug"
-                    url = _file_repair_issue(anomaly, repo)
+                    url = _file_repair_issue(anomaly, _bugs_repo)
                     if url:
                         existing.gh_issue_url = url
                         try:
@@ -804,7 +818,7 @@ def process_anomalies(
         # --- Bug / Probe tiers ---
         else:
             if existing.gh_issue_number is None:
-                url = _file_repair_issue(anomaly, repo)
+                url = _file_repair_issue(anomaly, _bugs_repo)
                 if url:
                     existing.gh_issue_url = url
                     try:
@@ -823,6 +837,31 @@ def process_anomalies(
                         f"issue for {anomaly.kind!r}"
                     )
 
+            # Bug tier: dispatch impl agent to fix the issue, monitor PR, and merge.
+            # Probe tier: leave the research issue for a human/agent to investigate separately.
+            if (
+                anomaly.repair_tier == "bug"
+                and config is not None
+                and existing.gh_issue_number is not None
+                and existing.state == "open"
+            ):
+                if existing.repair_pr_number is not None:
+                    # Agent already ran and created a PR — resume merge polling.
+                    _poll_and_merge_repair_pr(
+                        existing.repair_pr_number,
+                        existing.repair_branch or "",
+                        _bugs_repo,
+                        store,
+                        existing,
+                    )
+                elif existing.repair_branch is None:
+                    # No dispatch yet — run the full impl workflow.
+                    _run_repair_impl(
+                        existing, existing.gh_issue_number, _bugs_repo, store, config, repo_root
+                    )
+                # else: repair_branch set but no PR yet — agent may still be running
+                # (shouldn't happen since _run_repair_impl is blocking, but safe to skip)
+
     return new_urls
 
 
@@ -835,21 +874,27 @@ def run_monitor(
     store: BeadStore,
     repo: str,
     *,
-    bugs_repo: str | None = None,  # kept for backward compat; ignored
+    bugs_repo: str | None = None,
     once: bool = False,
     interval: int = MONITOR_INTERVAL_SECONDS,
     dry_run: bool = False,
+    config: Any = None,
+    repo_root: str = "",
 ) -> None:
     """Run the monitoring loop.
 
     Args:
         store:     BeadStore for the target repo.
         repo:      ``owner/repo`` string (for GitHub API calls).
-        bugs_repo: Deprecated; ignored. Repair issues are now filed in each
-                   repo's own ``repairs`` milestone, not a central bugs repo.
+        bugs_repo: Repo where anomaly issues are filed — normally the brimstone
+                   repo itself (anomalies are brimstone bugs). Defaults to *repo*.
         once:      If True, run one pass and return instead of looping.
         interval:  Seconds between detection passes.
         dry_run:   If True, print anomalies but do not write beads or file issues.
+        config:    Config instance. When provided, bug-tier anomalies are fixed by
+                   dispatching an impl agent (same workflow as the main impl pipeline).
+        repo_root: Absolute path to the local repo checkout. Used for worktree creation
+                   when dispatching repair agents. Defaults to cwd when omitted.
     """
     print(f"[monitor] starting for {repo} (interval={interval}s, once={once})")
 
@@ -860,7 +905,15 @@ def run_monitor(
         anomalies = run_all_detectors(store, repo)
 
         if anomalies:
-            new_urls = process_anomalies(anomalies, store, repo, dry_run=dry_run)
+            new_urls = process_anomalies(
+                anomalies,
+                store,
+                repo,
+                dry_run=dry_run,
+                bugs_repo=bugs_repo,
+                config=config,
+                repo_root=repo_root,
+            )
             total = len(anomalies)
             new = len(new_urls)
             blocking = sum(1 for a in anomalies if a.is_blocking)
@@ -875,6 +928,328 @@ def run_monitor(
             break
 
         time.sleep(interval)
+
+
+# ---------------------------------------------------------------------------
+# Repair impl workflow
+# ---------------------------------------------------------------------------
+
+_REPAIR_CI_MAX_POLLS: int = 60
+_REPAIR_CI_POLL_INTERVAL: int = 30  # seconds
+
+
+def _get_default_branch(repo: str) -> str:
+    """Return the default branch name for *repo* (falls back to ``"mainline"`` then ``"main"``)."""
+    result = _gh(
+        ["repo", "view", repo, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"],
+        repo=None,
+        check=False,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip()
+    return "mainline"
+
+
+def _create_repair_worktree(branch: str, repo_root: str, default_branch: str) -> str | None:
+    """Create a git worktree for *branch* under ``.claude/worktrees/``.
+
+    Mirrors the logic in cli._create_worktree.
+    """
+    worktree_dir = os.path.join(repo_root, ".claude", "worktrees", branch)
+    # Clean up any stale state
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", worktree_dir],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "branch", "-D", branch],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    # Fetch so origin/<default_branch> is current
+    subprocess.run(
+        ["git", "fetch", "origin"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    result = subprocess.run(
+        ["git", "worktree", "add", worktree_dir, "-b", branch, f"origin/{default_branch}"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"[monitor] worktree add failed: {result.stderr.strip()}")
+        return None
+    subprocess.run(
+        ["git", "push", "-u", "origin", branch],
+        cwd=worktree_dir,
+        capture_output=True,
+        text=True,
+    )
+    return worktree_dir
+
+
+def _remove_repair_worktree(worktree_path: str, repo_root: str) -> None:
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", worktree_path],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _build_repair_impl_prompt(
+    issue_number: int,
+    issue_title: str,
+    issue_body: str,
+    branch: str,
+    worktree_path: str,
+    repo: str,
+) -> str:
+    return (
+        "## Headless Autonomous Mode\n"
+        "You are running in a fully automated headless pipeline. No human is present.\n"
+        "- Use tools directly and silently. Do NOT produce conversational text"
+        " between tool calls.\n\n"
+        f"## Working directory\n"
+        f"Your isolated worktree is already checked out at:\n"
+        f"  {worktree_path}\n\n"
+        f"Your FIRST action must be:\n"
+        f"  cd {worktree_path}\n\n"
+        f"ALL file writes and git operations must happen inside that directory.\n"
+        f"Do NOT write to /tmp, ~/, or the main repo checkout.\n\n"
+        f"## Task\n"
+        f"You are implementing repair issue #{issue_number} on branch `{branch}`.\n"
+        f"Repository: {repo}\n"
+        f"Task: {issue_title}\n\n"
+        f"## Steps\n"
+        f"1. cd {worktree_path}   (branch `{branch}` is already checked out)\n"
+        f"2. Read the issue: gh issue view {issue_number} --repo {repo}\n"
+        f"3. Implement the fix within the scope listed in the issue body\n"
+        f"4. Run tests — all tests must pass\n"
+        f"5. Run lint — must be clean\n"
+        f"6. Commit with message referencing the issue\n"
+        f"7. git push -u origin {branch}\n"
+        f'8. Create PR: gh pr create --repo {repo} --title "{issue_title}" '
+        f'--label "bug,stage/impl" '
+        f'--body "Closes #{issue_number}\\n\\n## Summary\\n<what was fixed>'
+        f'\\n\\n## Test plan\\n<what was tested>"\n'
+        f"9. After gh pr create, poll CI (max 60 attempts × 30s = 30 min):\n"
+        f"   Loop: gh pr checks <PR-number> --json name,bucket --jq '[.[] | {{name,bucket}}]'\n"
+        f"   Wait 30s: sleep 30\n"
+        f"   If any check has bucket='fail': read logs, fix, push. Max 3 fix attempts.\n"
+        f"   If still failing after 3 attempts: leave a PR comment explaining, then STOP.\n"
+        f"     gh pr comment <PR-number> --repo {repo} --body "
+        f'"brimstone: CI still failing after 3 fix attempts. Manual investigation needed."\n'
+        f"10. Once CI is clean, check reviews:\n"
+        f"    gh pr view <PR-number> --repo {repo} --json reviews,comments\n"
+        f"    gh api repos/{repo}/pulls/<PR-number>/comments\n"
+        f"    If CHANGES_REQUESTED: fix ALL feedback in ONE commit. Max 2 review fix attempts.\n"
+        f"11. When CI passes + no CHANGES_REQUESTED outstanding:\n"
+        f"    Output exactly one line: Done.\n"
+        f"    Do NOT merge. The orchestrator handles merging.\n\n"
+        f"## Issue body\n{issue_body}"
+    )
+
+
+def _poll_and_merge_repair_pr(
+    pr_number: int,
+    branch: str,
+    repo: str,
+    store: BeadStore,
+    abead: AnomalyBead,
+) -> bool:
+    """Poll CI for a repair PR and squash-merge when ready. Returns True if merged."""
+    print(f"[monitor] polling CI for repair PR #{pr_number} (branch={branch!r})")
+    for _ in range(_REPAIR_CI_MAX_POLLS):
+        time.sleep(_REPAIR_CI_POLL_INTERVAL)
+
+        ci_result = _gh(
+            ["pr", "checks", str(pr_number), "--json", "name,state,bucket"],
+            repo=repo,
+            check=False,
+        )
+        if ci_result.returncode != 0:
+            continue
+        try:
+            checks = json.loads(ci_result.stdout)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+        if not checks:
+            continue  # CI not started yet
+
+        ci_status = "pass"
+        for c in checks:
+            bucket = (c.get("bucket") or "").lower()
+            state = (c.get("state") or "").lower()
+            if bucket in ("fail", "cancel"):
+                ci_status = "fail"
+                break
+            elif bucket not in ("pass", "skipping") and state != "completed":
+                ci_status = "pending"
+
+        if ci_status == "pending":
+            continue
+        if ci_status == "fail":
+            print(f"[monitor] repair PR #{pr_number} CI still failing — leaving for next scan")
+            return False
+
+        # CI passed — check reviews
+        pr_view = _gh(
+            ["pr", "view", str(pr_number), "--json", "reviewDecision"],
+            repo=repo,
+            check=False,
+        )
+        review_decision = ""
+        if pr_view.returncode == 0:
+            try:
+                review_decision = json.loads(pr_view.stdout).get("reviewDecision", "") or ""
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        if review_decision == "CHANGES_REQUESTED":
+            print(f"[monitor] repair PR #{pr_number} has CHANGES_REQUESTED — leaving for next scan")
+            return False
+
+        # Squash merge
+        merge_result = _gh(
+            ["pr", "merge", str(pr_number), "--squash", "--delete-branch"],
+            repo=repo,
+            check=False,
+        )
+        if merge_result.returncode == 0:
+            print(f"[monitor] repair PR #{pr_number} merged successfully")
+            abead.repair_pr_number = pr_number
+            abead.state = "repaired"
+            abead.resolved_at = datetime.now(UTC).isoformat()
+            store.write_anomaly_bead(abead)
+            return True
+        else:
+            print(f"[monitor] repair PR #{pr_number} merge failed: {merge_result.stderr.strip()}")
+            return False
+
+    print(f"[monitor] repair PR #{pr_number} CI poll timed out")
+    return False
+
+
+def _run_repair_impl(
+    abead: AnomalyBead,
+    issue_number: int,
+    repo: str,
+    store: BeadStore,
+    config: Any,
+    repo_root: str = "",
+) -> None:
+    """Dispatch an impl agent to fix *issue_number*, then monitor and squash-merge the PR.
+
+    Blocking — runs the agent synchronously and polls CI until merge or timeout.
+    Only called for ``bug``-tier anomalies when *config* is available.
+    """
+    from brimstone.config import build_subprocess_env  # safe: config doesn't import monitor
+
+    if not repo_root:
+        repo_root = str(Path.cwd())
+
+    default_branch = _get_default_branch(repo)
+    branch = f"repair-{abead.anomaly_id[:8]}-{issue_number}"
+
+    print(f"[monitor] creating repair worktree: branch={branch!r}")
+    worktree_path = _create_repair_worktree(branch, repo_root, default_branch)
+    if worktree_path is None:
+        print(f"[monitor] WARN: failed to create repair worktree for branch {branch!r}")
+        return
+
+    abead.repair_branch = branch
+    store.write_anomaly_bead(abead)
+
+    # Fetch issue title + body
+    issue_result = _gh(
+        ["issue", "view", str(issue_number), "--json", "title,body"],
+        repo=repo,
+        check=False,
+    )
+    issue_title = f"[monitor/repair] #{issue_number}"
+    issue_body = ""
+    if issue_result.returncode == 0:
+        try:
+            data = json.loads(issue_result.stdout)
+            issue_title = data.get("title", issue_title)
+            issue_body = data.get("body", "") or ""
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    prompt = _build_repair_impl_prompt(
+        issue_number, issue_title, issue_body, branch, worktree_path, repo
+    )
+    silent_header = (
+        "SILENT MODE: You are running in a fully automated headless pipeline. "
+        "Minimize text output. Use tools directly. "
+        "Do NOT narrate, explain, summarize, or produce any text between tool calls "
+        "unless the task explicitly requires written output.\n\n"
+    )
+
+    config_dir = f"/tmp/brimstone-repair-{abead.anomaly_id[:8]}-{uuid.uuid4().hex}"
+    env = build_subprocess_env(config, extra={"CLAUDE_CONFIG_DIR": config_dir})
+
+    print(f"[monitor] dispatching repair agent for issue #{issue_number}")
+    result = _runner.run(
+        prompt=silent_header + prompt,
+        allowed_tools=_runner.TOOLS_IMPL_AGENT,
+        env=env,
+        max_turns=100,
+        timeout_seconds=getattr(config, "agent_timeout_minutes", 60) * 60,
+        model=getattr(config, "monitor_model", None) or getattr(config, "model", None),
+        fallback_model=getattr(config, "fallback_model", None),
+    )
+
+    if result.is_error:
+        print(f"[monitor] repair agent for #{issue_number} failed ({result.subtype})")
+        _remove_repair_worktree(worktree_path, repo_root)
+        # Clear so next scan can re-dispatch
+        abead.repair_branch = None
+        store.write_anomaly_bead(abead)
+        return
+
+    print(f"[monitor] repair agent for #{issue_number} finished — finding PR")
+
+    # Find the PR the agent created
+    pr_result = _gh(
+        ["pr", "list", "--head", branch, "--json", "number", "--limit", "1"],
+        repo=repo,
+        check=False,
+    )
+    pr_number: int | None = None
+    if pr_result.returncode == 0:
+        try:
+            prs = json.loads(pr_result.stdout)
+            if prs:
+                pr_number = prs[0]["number"]
+        except (json.JSONDecodeError, ValueError, KeyError):
+            pass
+
+    if pr_number is None:
+        print(f"[monitor] WARN: no PR found for repair branch {branch!r}")
+        _remove_repair_worktree(worktree_path, repo_root)
+        # Clear so next scan can re-dispatch
+        abead.repair_branch = None
+        store.write_anomaly_bead(abead)
+        return
+
+    print(f"[monitor] found repair PR #{pr_number} — monitoring CI")
+    abead.repair_pr_number = pr_number
+    store.write_anomaly_bead(abead)
+
+    merged = _poll_and_merge_repair_pr(pr_number, branch, repo, store, abead)
+    _remove_repair_worktree(worktree_path, repo_root)
+
+    if not merged:
+        print(f"[monitor] repair PR #{pr_number} not merged — next scan will resume merge polling")
 
 
 # ---------------------------------------------------------------------------
