@@ -5081,19 +5081,20 @@ def _run_design_worker(
         # with open PRs that haven't merged yet) are included in the blocking check.
         # _list_open_issues_by_label filters them out, making the gate a no-op when
         # all research is claimed but nothing has merged yet.
-        open_research_issues = _list_all_open_issues_by_label(repo, milestone, RESEARCH_LABEL)
-        blocking, _ = _classify_blocking_issues(
-            open_research_issues, repo, milestone, config, checkpoint, store=store
-        )
-        if blocking:
+        while True:
+            open_research_issues = _list_all_open_issues_by_label(repo, milestone, RESEARCH_LABEL)
+            blocking, _ = _classify_blocking_issues(
+                open_research_issues, repo, milestone, config, checkpoint, store=store
+            )
+            if not blocking:
+                break
             nums = ", ".join(f"#{i['number']}" for i in blocking)
             click.echo(
-                f"Error: {len(blocking)} blocking research issue(s) still open for milestone "
-                f"'{milestone}' ({nums}). All blocking research must complete before design "
-                f"can begin.",
+                f"[design] {len(blocking)} blocking research issue(s) still open for milestone "
+                f"'{milestone}' ({nums}). Waiting {BACKOFF_SLEEP_SECONDS}s…",
                 err=True,
             )
-            raise SystemExit(1)
+            time.sleep(BACKOFF_SLEEP_SECONDS)
 
         default_branch = _get_default_branch_for_repo(repo)
         repo_root, _clone_dir = _ensure_worktree_repo(repo)
