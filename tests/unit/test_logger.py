@@ -323,8 +323,8 @@ def test_estimate_cost_usd_sonnet_positive() -> None:
     assert result > 0
 
 
-def test_estimate_cost_usd_opus_is_5x_sonnet() -> None:
-    """Opus cost is approximately 5x the Sonnet cost for the same usage."""
+def test_estimate_cost_usd_opus_is_5_3rds_sonnet() -> None:
+    """Opus 4.6 cost is approximately 5/3x the Sonnet cost for the same usage ($5/$25 vs $3/$15)."""
     usage = {
         "input_tokens": 100_000,
         "output_tokens": 10_000,
@@ -335,7 +335,7 @@ def test_estimate_cost_usd_opus_is_5x_sonnet() -> None:
     opus = _estimate_cost_usd(usage, "claude-opus-4-6")
     assert sonnet is not None
     assert opus is not None
-    assert opus == pytest.approx(sonnet * 5.0, rel=1e-5)
+    assert opus == pytest.approx(sonnet * (5.0 / 3.0), rel=1e-5)
 
 
 def test_estimate_cost_usd_unknown_model_returns_none() -> None:
