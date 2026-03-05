@@ -381,9 +381,9 @@ class TestGetPrChecksStatus:
     def test_returns_pending_on_gh_failure(self) -> None:
         assert self._call("", returncode=1) == "pending"
 
-    def test_returns_pass_on_empty_checks(self) -> None:
-        # No CI configured → treat as green so PRs aren't stuck
-        assert self._call("[]") == "pass"
+    def test_returns_no_checks_on_empty_list(self) -> None:
+        # Empty list = checks not yet triggered or no CI; caller uses grace counter
+        assert self._call("[]") == "no_checks"
 
     def test_returns_pass_when_all_succeed(self) -> None:
         checks = [

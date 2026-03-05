@@ -257,21 +257,31 @@ class TestPipelineAllStages:
         )
 
     def test_research_skipped_when_already_complete(self, git_repo: Path, tmp_path: Path) -> None:
-        """Research stage is skipped when 0 open research issues."""
+        """Research stage is skipped when all research beads are closed."""
         cli_runner = CliRunner()
         called: list[str] = []
+        mock_store = MagicMock()
+
+        def _beads_for_stage(**kw: object) -> list:
+            stage = kw.get("stage", "")
+            if stage == "research":
+                return [MagicMock(state="closed"), MagicMock(state="closed")]
+            if stage == "impl":
+                return [MagicMock(state="open")]  # so scope is skipped
+            return []
+
+        mock_store.list_work_beads.side_effect = _beads_for_stage
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
                 patch(_COMMON_PATCHES["resolve_repo"], return_value=_REPO),
                 patch(_COMMON_PATCHES["milestone_exists"], return_value=True),
-                # Research done
-                patch(_COMMON_PATCHES["open_research"], return_value=0),
                 patch(_COMMON_PATCHES["doc_exists"], return_value=False),
                 patch(_COMMON_PATCHES["open_impl"], return_value=[{"number": 1}]),
                 patch(_COMMON_PATCHES["plan_issues"]),
                 patch(_COMMON_PATCHES["default_branch"], return_value="mainline"),
                 patch(_COMMON_PATCHES["startup"], side_effect=_fake_startup),
+                patch("brimstone.cli.make_bead_store", return_value=mock_store),
                 patch(
                     _COMMON_PATCHES["research_worker"],
                     side_effect=lambda **kw: called.append("research"),
@@ -295,21 +305,30 @@ class TestPipelineAllStages:
         assert "design" in called
 
     def test_design_skipped_when_hld_already_merged(self, git_repo: Path, tmp_path: Path) -> None:
-        """Design stage is skipped when HLD.md already exists on the default branch."""
+        """Design stage is skipped when all design beads are closed and HLD exists."""
         cli_runner = CliRunner()
         called: list[str] = []
+        mock_store = MagicMock()
+
+        def _beads_for_stage(**kw: object) -> list:
+            stage = kw.get("stage", "")
+            if stage in ("research", "design"):
+                return [MagicMock(state="closed"), MagicMock(state="closed")]
+            return []
+
+        mock_store.list_work_beads.side_effect = _beads_for_stage
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
                 patch(_COMMON_PATCHES["resolve_repo"], return_value=_REPO),
                 patch(_COMMON_PATCHES["milestone_exists"], return_value=True),
-                patch(_COMMON_PATCHES["open_research"], return_value=0),
                 # HLD already merged
                 patch(_COMMON_PATCHES["doc_exists"], return_value=True),
                 patch(_COMMON_PATCHES["open_impl"], return_value=[{"number": 1}]),
                 patch(_COMMON_PATCHES["plan_issues"]),
                 patch(_COMMON_PATCHES["default_branch"], return_value="mainline"),
                 patch(_COMMON_PATCHES["startup"], side_effect=_fake_startup),
+                patch("brimstone.cli.make_bead_store", return_value=mock_store),
                 patch(
                     _COMMON_PATCHES["research_worker"],
                     side_effect=lambda **kw: called.append("research"),

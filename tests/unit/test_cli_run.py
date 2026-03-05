@@ -168,15 +168,20 @@ class TestRunMilestoneCheck:
 
 class TestRunCompletionSkip:
     def test_research_skipped_when_no_open_issues(self, tmp_path: Path) -> None:
-        """Research stage is skipped if there are no open research issues."""
+        """Research stage is skipped if all research beads are closed."""
         research_called: list[bool] = []
+        mock_store = MagicMock()
+        mock_store.list_work_beads.return_value = [
+            MagicMock(state="closed"),
+            MagicMock(state="closed"),
+        ]
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
                 patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", return_value=True),
-                patch("brimstone.cli._count_open_issues_by_label", return_value=0),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
+                patch("brimstone.cli.make_bead_store", return_value=mock_store),
                 patch(
                     "brimstone.cli._run_research_worker",
                     side_effect=lambda **kw: research_called.append(True),
@@ -193,15 +198,20 @@ class TestRunCompletionSkip:
         assert "already complete" in result.output
 
     def test_design_skipped_when_hld_exists(self, tmp_path: Path) -> None:
-        """Design stage is skipped if HLD.md already exists on the default branch."""
+        """Design stage is skipped if all design beads are closed and HLD exists."""
         design_called: list[bool] = []
+        mock_store = MagicMock()
+        mock_store.list_work_beads.return_value = [
+            MagicMock(state="closed"),
+            MagicMock(state="closed"),
+        ]
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
                 patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
-                patch("brimstone.cli._count_open_issues_by_label", return_value=0),
+                patch("brimstone.cli.make_bead_store", return_value=mock_store),
                 patch("brimstone.cli._doc_exists_on_default_branch", return_value=True),
                 patch(
                     "brimstone.cli._run_design_worker",
@@ -266,14 +276,20 @@ class TestRunGates:
     def test_all_skips_design_gate(self, tmp_path: Path) -> None:
         """--all does not check the design gate (research is also being run)."""
         calls: list[str] = []
+        mock_store = MagicMock()
+
+        def _beads(**kw: object) -> list:
+            # Return impl beads so scope is skipped; no beads for other stages so they run.
+            return [MagicMock(state="open")] if kw.get("stage") == "impl" else []
+
+        mock_store.list_work_beads.side_effect = _beads
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
                 patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
-                patch("brimstone.cli._count_open_issues_by_label", return_value=2),
-                patch("brimstone.cli._count_all_issues_by_label", return_value=1),
+                patch("brimstone.cli.make_bead_store", return_value=mock_store),
                 patch("brimstone.cli._doc_exists_on_default_branch", return_value=False),
                 patch("brimstone.cli._list_open_issues_by_label", return_value=[{"number": 1}]),
                 patch(
