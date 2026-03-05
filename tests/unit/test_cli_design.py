@@ -150,8 +150,8 @@ _DESIGN_PATCHES = {
 
 
 class TestDesignWorkerGate1:
-    def test_aborts_when_blocking_research_open(self, tmp_path: Path, capsys) -> None:
-        """Gate fires when there are open research issues without [DEFERRED] tag."""
+    def test_waits_when_blocking_research_open(self, tmp_path: Path, capsys) -> None:
+        """Gate waits when blocking research issues remain, then proceeds when clear."""
         config = make_config(tmp_path)
         checkpoint = make_checkpoint()
 
@@ -170,12 +170,28 @@ class TestDesignWorkerGate1:
             _issue(12, "also no tag"),
         ]
 
+        # First classify call returns 3 blocking; second returns empty (cleared).
+        classify_calls = {"n": 0}
+
+        def _classify_side_effect(issues, *args, **kwargs):
+            classify_calls["n"] += 1
+            if classify_calls["n"] == 1:
+                return (blocking_issues, [])
+            return ([], [])
+
         with (
             patch(_DESIGN_PATCHES["list_research"], return_value=blocking_issues),
+            patch(_DESIGN_PATCHES["classify_blocking"], side_effect=_classify_side_effect),
+            patch("brimstone.cli.time.sleep"),
+            patch(_DESIGN_PATCHES["default_branch"], return_value="main"),
+            patch(_DESIGN_PATCHES["repo_root"], return_value="/repo"),
+            patch(_DESIGN_PATCHES["doc_exists"], return_value=True),
+            patch(_DESIGN_PATCHES["file_design"]),
+            patch(_DESIGN_PATCHES["list_design"], return_value=[]),
             patch(_DESIGN_PATCHES["log_event"]),
             patch(_DESIGN_PATCHES["save_session"]),
         ):
-            with pytest.raises(SystemExit) as exc_info:
+            with pytest.raises(SystemExit):
                 _run_design_worker(
                     repo="owner/repo",
                     milestone="v1",
@@ -183,10 +199,11 @@ class TestDesignWorkerGate1:
                     checkpoint=checkpoint,
                     dry_run=False,
                 )
-        assert exc_info.value.code == 1
+
         captured = capsys.readouterr()
-        assert "research" in captured.err.lower()
-        assert "3" in captured.err
+        # Gate waited for blocking research, then proceeded past Gate 1
+        assert "waiting" in captured.err.lower()
+        assert "3" in captured.err  # "3 blocking" in wait message
 
     def test_proceeds_when_only_deferred_research_remain(self, tmp_path: Path) -> None:
         """Gate passes when only [DEFERRED] issues remain open."""
