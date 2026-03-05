@@ -27,9 +27,22 @@ Tests live in `tests/`. Default branch: `mainline`.
 
 ### When to create beads
 
-- **Research/impl issues**: seeded in bulk by `_seed_work_beads` at stage startup.
-- **Design LLD issues**: created by `_run_design_worker` Phase 2 self-heal — parse `### Module:` headings from the merged HLD, call `_file_design_issue_if_missing` for each missing module, then `_seed_work_beads` to create the bead. Always check existing beads first, not GitHub issues.
-- **Never** create a bead for an issue that has `state="closed"` or `state="abandoned"` — those are terminal.
+Every tracked work item — research, design, and impl issues, plus milestones and campaigns — has a corresponding bead. GitHub issues/PRs are inputs and outputs; beads are the ledger.
+
+**WorkBeads** (one per issue, all stages):
+
+- **Research issues**: seeded in bulk by `_seed_work_beads(stage="research")` at research-worker startup. `_seed_work_beads` is the single GitHub → bead sync point; all subsequent dispatch reads from beads only.
+- **Design HLD issue**: filed by `_file_design_issue_if_missing` at research completion gate; the bead is created when `_seed_work_beads(stage="design")` runs at design-worker startup. Dedup check must use `store.list_work_beads(stage="design")` — not `gh issue list`.
+- **Design LLD issues**: filed by `_run_design_worker` Phase 2 self-heal — parse `### Module:` headings from the merged HLD, call `_file_design_issue_if_missing` for each missing module, then `_seed_work_beads(stage="design")` to create beads. Always check existing beads first, not GitHub issues.
+- **Impl issues**: seeded in bulk by `_seed_work_beads(stage="impl")` at impl-worker startup (after scope agent has filed the issues on GitHub).
+- **Never** create a bead for an issue that has `state="closed"` or `state="abandoned"` — those are terminal. `_seed_work_beads` skips existing beads; it never overwrites.
+
+**CampaignBead** (one per repo, at `campaign.json`; cross-repo aware):
+
+- Created when `brimstone run` is invoked with multiple milestones (a campaign). Tracks the ordered milestone list, per-milestone status (`pending → planning → researching → designing → scoping → implementing → shipped`), and cross-repo milestone blockers.
+- **Pinned to one repo**, but can declare cross-repo dependencies: `milestone_blocked_by` maps a milestone name → list of `"owner/repo:milestone"` strings that must be `"shipped"` before that milestone can begin. The bead tracks only this repo's milestones; the foreign-repo entries are dependency pointers, not owned state.
+- Milestone progress is read from `store.read_campaign_bead()`. The `status` command uses the campaign bead as primary source; GitHub milestone queries are a fallback when no campaign bead exists.
+- Update the campaign bead via `store.write_campaign_bead()` whenever milestone status changes (e.g. after impl completes for a milestone). Do not use GitHub issue counts as the gate for advancing campaign status — use bead states.
 
 ## Module Isolation
 

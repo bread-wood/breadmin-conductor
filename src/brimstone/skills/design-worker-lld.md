@@ -64,6 +64,29 @@ ls docs/design/ && cat docs/design/*/lld/<module>.md 2>/dev/null || true
 
 Create `docs/design/<milestone>/lld/<module>.md` in your working directory.
 
+**The LLD is a delta document, never a full system description.**
+
+Before writing, determine your change scope by comparing the current requirements
+against the previous-milestone LLD you read in Step 2:
+
+- **No code changes in this module:** Write a minimal doc. State that the module is
+  unchanged, explain in one paragraph why the existing code already handles this
+  version's new requirements (e.g. "the `except CalcError` handler catches all new
+  subclasses by inheritance"), and list only the new test cases added. Omit all
+  sections about data structures, algorithms, and interfaces — refer the reader to
+  the previous LLD for those. This is the correct, complete LLD for a no-change module.
+- **Partial changes:** Write only the sections that changed. For sections that are
+  identical to the prior version (e.g. TokenType variants that didn't change), omit
+  them or write "Unchanged from v0.X.0 — see `docs/design/v0.X.0/lld/<module>.md`."
+  Lead each changed section with what is new or different.
+- **Significant rewrite or new module:** Write all sections as normal, but explicitly
+  call out which parts are new vs. inherited from prior milestones.
+
+**Common mistakes to avoid:**
+- Do NOT copy-paste the full prior LLD and add a few lines at the bottom.
+- Do NOT repeat unchanged interfaces, data structures, or algorithms.
+- Do NOT write the LLD as if the prior version didn't exist.
+
 The LLD must cover:
 
 **Overview**

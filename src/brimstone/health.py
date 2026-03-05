@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
+from brimstone.beads import BeadStore, make_bead_store
 from brimstone.config import Config
 from brimstone.session import Checkpoint, is_backing_off
 
@@ -466,10 +467,76 @@ def _check_worktrees() -> CheckResult:
 
 
 def _check_orphaned_issues(config: Config) -> CheckResult:
-    """Check 6: No stale in-progress issues."""
-    max_orphaned: int = getattr(config, "max_orphaned_issues", 5)
+    """Check 6: No stale in-progress issues (claimed beads with no open PR bead).
 
-    # Get in-progress issues
+    Uses the bead store when available (bead-first: ``state=claimed`` + no PR bead).
+    Falls back to GitHub ``in-progress`` label cross-referenced with open PRs when
+    no bead store is configured.
+    """
+    max_orphaned: int = getattr(config, "max_orphaned_issues", 5)
+    github_repo: str | None = getattr(config, "github_repo", None)
+
+    # ------------------------------------------------------------------
+    # Bead-based check (preferred)
+    # ------------------------------------------------------------------
+    if github_repo:
+        try:
+            store: BeadStore = make_bead_store(config, github_repo)
+            claimed_beads = store.list_work_beads(state="claimed")
+            if not claimed_beads:
+                return CheckResult(
+                    name="No stale in-progress issues",
+                    status="pass",
+                    message="No claimed beads found.",
+                )
+            # Issues with a PR bead in a non-terminal state have active PRs
+            issues_with_open_prs: set[int] = {
+                pb.issue_number
+                for pb in store.list_pr_beads()
+                if pb.state not in ("merged", "abandoned")
+            }
+            orphaned_beads = [
+                b for b in claimed_beads if b.issue_number not in issues_with_open_prs
+            ]
+            count = len(orphaned_beads)
+            total_claimed = len(claimed_beads)
+
+            if count == 0:
+                return CheckResult(
+                    name="No stale in-progress issues",
+                    status="pass",
+                    message=f"{total_claimed} claimed bead(s) all have open PR beads.",
+                )
+
+            issue_list = ", ".join(f"#{b.issue_number} '{b.title}'" for b in orphaned_beads)
+            if count > max_orphaned:
+                return CheckResult(
+                    name="No stale in-progress issues",
+                    status="fail",
+                    message=(
+                        f"Too many orphaned claimed beads: {count} with no open PR bead "
+                        f"(threshold: {max_orphaned})."
+                    ),
+                    remediation=(
+                        f"Too many orphaned claimed beads ({count} > {max_orphaned}). "
+                        "Clear stale beads before starting a new run."
+                    ),
+                )
+            return CheckResult(
+                name="No stale in-progress issues",
+                status="warn",
+                message=f"{count} claimed bead(s) with no open PR bead: {issue_list}.",
+                remediation=(
+                    f"Claimed beads with no open PR bead: {issue_list}. "
+                    "Inspect and unclaim or re-dispatch these issues."
+                ),
+            )
+        except Exception:
+            pass  # fall through to GitHub-based check
+
+    # ------------------------------------------------------------------
+    # GitHub fallback (no bead store)
+    # ------------------------------------------------------------------
     issues_result = subprocess.run(
         [
             "gh",
@@ -512,7 +579,6 @@ def _check_orphaned_issues(config: Config) -> CheckResult:
             message="No in-progress issues found.",
         )
 
-    # Get open PRs to cross-reference by branch naming convention
     pr_result = subprocess.run(
         [
             "gh",
@@ -535,7 +601,6 @@ def _check_orphaned_issues(config: Config) -> CheckResult:
         except json.JSONDecodeError:
             pass
 
-    # Build set of issue numbers that have a corresponding open PR
     issues_with_prs: set[int] = set()
     for pr in open_prs:
         head_ref: str = pr.get("headRefName", "")
@@ -543,7 +608,6 @@ def _check_orphaned_issues(config: Config) -> CheckResult:
         if parts[0].isdigit():
             issues_with_prs.add(int(parts[0]))
 
-    # Orphaned = in-progress label, no open PR
     orphaned = [issue for issue in issues if issue["number"] not in issues_with_prs]
     count = len(orphaned)
 

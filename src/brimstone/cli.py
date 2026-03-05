@@ -9,6 +9,7 @@ Subcommands:
   brimstone adopt   — adopt an existing repo (stub)
   brimstone health  — preflight health checks
   brimstone cost    — cost ledger summary
+  brimstone monitor — watch bead/repo state for aberrations and file bugs
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from typing import Any
 
 import click
 
-from brimstone import health, logger, runner, session
+from brimstone import health, logger, monitor, runner, session
 from brimstone.beads import (
     BEAD_SCHEMA_VERSION,
     BeadStore,
@@ -37,6 +38,7 @@ from brimstone.beads import (
     MergeQueueEntry,
     PRBead,
     WorkBead,
+    detect_dep_cycles,
     make_bead_store,
 )
 from brimstone.config import (
@@ -717,6 +719,11 @@ def _resume_open_prs(
                 repo=repo,
                 check=False,
             )
+            if store is not None:
+                _closed_bead = store.read_work_bead(issue_number)
+                if _closed_bead is not None and _closed_bead.state not in ("closed", "abandoned"):
+                    _closed_bead.state = "abandoned"
+                    store.write_work_bead(_closed_bead)
             continue
         click.echo(
             f"{log_prefix} Resuming untracked open PR #{pr_number} for issue #{issue_number}",
@@ -823,6 +830,12 @@ def _resume_stale_issues(
             handled.add(stale_number)
         elif _pr_merged_for_issue(repo, stale_number):
             _gh(["issue", "close", str(stale_number)], repo=repo, check=False)
+            if store is not None:
+                _stale_bead = store.read_work_bead(stale_number)
+                if _stale_bead is not None and _stale_bead.state not in ("closed", "abandoned"):
+                    _stale_bead.state = "closed"
+                    _stale_bead.closed_at = datetime.now(UTC).isoformat()
+                    store.write_work_bead(_stale_bead)
             click.echo(
                 f"{log_prefix} Closed #{stale_number} — merged PR found, issue was not auto-closed",
                 err=True,
@@ -1065,39 +1078,44 @@ def _file_design_issue_if_missing(
     milestone: str,
     title: str,
     body: str,
+    store: BeadStore | None = None,
 ) -> None:
     """Create a ``stage/design`` issue with *title* in *repo* if it doesn't already exist.
 
-    Fetches all open+closed issues scoped to *milestone* and checks for an exact
-    title match before creating, making this call idempotent on re-run.
-
-    Scoping to the milestone prevents false-positive dedup matches against
-    identically-titled issues from prior milestones (e.g. "Design: LLD for lexer"
-    from v0.1.0 should not block filing the same title for v0.2.0).
+    When *store* is provided, checks existing design beads first (invariant 3:
+    dedup against beads, not GitHub issues). Falls back to a GitHub issue-list
+    query only when no store is available.
     """
-    result = _gh(
-        [
-            "issue",
-            "list",
-            "--state",
-            "all",
-            "--milestone",
-            milestone,
-            "--limit",
-            "500",
-            "--json",
-            "title",
-        ],
-        repo=repo,
-        check=False,
-    )
-    if result.returncode == 0:
-        try:
-            existing = {i["title"] for i in json.loads(result.stdout)}
-            if title in existing:
-                return
-        except (json.JSONDecodeError, KeyError):
-            pass
+    if store is not None:
+        existing_titles = {
+            b.title for b in store.list_work_beads(milestone=milestone, stage="design")
+        }
+        if title in existing_titles:
+            return
+    else:
+        result = _gh(
+            [
+                "issue",
+                "list",
+                "--state",
+                "all",
+                "--milestone",
+                milestone,
+                "--limit",
+                "500",
+                "--json",
+                "title",
+            ],
+            repo=repo,
+            check=False,
+        )
+        if result.returncode == 0:
+            try:
+                existing = {i["title"] for i in json.loads(result.stdout)}
+                if title in existing:
+                    return
+            except (json.JSONDecodeError, KeyError):
+                pass
 
     _gh(
         [
@@ -1217,7 +1235,8 @@ def _filter_unblocked(
             bead = store.read_work_bead(issue_number)
             if bead is not None:
                 blocked = any(
-                    (dep_bead := store.read_work_bead(dep)) is None or dep_bead.state != "closed"
+                    (dep_bead := store.read_work_bead(dep)) is None
+                    or dep_bead.state not in ("closed", "abandoned")
                     for dep in bead.blocked_by
                 )
                 if not blocked:
@@ -1360,6 +1379,39 @@ def _startup_dep_checks(open_issues: list[dict[str, Any]], repo: str) -> None:
         raise SystemExit(1)
 
 
+def _startup_dep_checks_from_beads(beads: list[WorkBead], repo: str) -> None:
+    """Bead-native dependency validation and cycle detection at worker startup.
+
+    Unknown deps (referenced in blocked_by but without a bead or GitHub issue)
+    emit a warning and are treated as unblocked.  Cycles abort with exit code 1.
+    Cycle detection is delegated to :func:`beads.detect_dep_cycles`.
+    """
+    active_numbers = {b.issue_number for b in beads if b.state not in ("closed", "abandoned")}
+    all_referenced: set[int] = set()
+    for bead in beads:
+        if bead.state not in ("closed", "abandoned"):
+            all_referenced.update(bead.blocked_by)
+    for dep in sorted(all_referenced - active_numbers):
+        result = _gh(["issue", "view", str(dep), "--json", "number"], repo=repo, check=False)
+        if result.returncode != 0:
+            click.echo(
+                f"[dep-check] Warning: issue #{dep} referenced as a dependency does not "
+                f"exist on GitHub. The depending issue will be treated as unblocked.",
+                err=True,
+            )
+    cycles = detect_dep_cycles(beads)
+    if cycles:
+        for cycle in cycles:
+            nums = " → ".join(f"#{n}" for n in cycle)
+            click.echo(f"[dep-check] Error: dependency cycle detected: {nums}", err=True)
+        click.echo(
+            "[dep-check] Resolve the cycle(s) above before dispatching. "
+            "Break a cycle by adding [DEFERRED] to one issue's body or closing it.",
+            err=True,
+        )
+        raise SystemExit(1)
+
+
 def _claim_issue(
     repo: str,
     issue_number: int,
@@ -1434,7 +1486,7 @@ def _unclaim_issue(repo: str, issue_number: int, store: BeadStore | None = None)
     """
     if store is not None:
         bead = store.read_work_bead(issue_number)
-        if bead is not None and bead.state not in ("abandoned", "closed"):
+        if bead is not None and bead.state not in ("abandoned", "closed", "merge_ready"):
             bead.state = "open"
             store.write_work_bead(bead)
     info = _gh(
@@ -1712,6 +1764,75 @@ def _dispatch_research_agent(
     return issue, branch_name, worktree_path, result
 
 
+def _prune_stale_dependencies(
+    repo: str,
+    milestone: str,
+    store: BeadStore,
+    config: Config,
+    checkpoint: Checkpoint,
+) -> bool:
+    """Remove 'Depends on: #N' refs that point to closed issues.
+
+    Scans open issues in the milestone for dependency references.  For each
+    reference pointing to a closed issue, removes the text from the issue body
+    and removes the dependency from the corresponding WorkBead.
+
+    Returns:
+        True if at least one stale dependency was pruned; False otherwise.
+    """
+    issues_result = _gh(
+        ["issue", "list", "--milestone", milestone, "--state", "open", "--json", "number,body"],
+        repo=repo,
+        check=False,
+    )
+    try:
+        issues = json.loads(issues_result.stdout or "[]")
+    except (json.JSONDecodeError, AttributeError):
+        return False
+
+    pruned = False
+    for issue in issues:
+        body = issue.get("body") or ""
+        issue_number = issue["number"]
+        refs = re.findall(r"Depends on: #(\d+)", body)
+        for ref_str in refs:
+            ref = int(ref_str)
+            state_result = _gh(
+                ["issue", "view", str(ref), "--json", "state", "--jq", ".state"],
+                repo=repo,
+                check=False,
+            )
+            state = (state_result.stdout or "").strip().upper()
+            if state != "CLOSED":
+                continue
+            # Remove the stale dependency from the issue body
+            new_body = re.sub(rf"\nDepends on: #{ref}", "", body)
+            _gh(
+                ["issue", "edit", str(issue_number), "--body", new_body],
+                repo=repo,
+                check=False,
+            )
+            body = new_body  # update for subsequent iterations
+            # Remove from WorkBead
+            _dep_bead = store.read_work_bead(issue_number)
+            if _dep_bead is not None and ref in _dep_bead.blocked_by:
+                _dep_bead.blocked_by.remove(ref)
+                store.write_work_bead(_dep_bead)
+            logger.log_conductor_event(
+                run_id=checkpoint.run_id,
+                phase="stall",
+                event_type="human_escalate",
+                payload={
+                    "issue_number": issue_number,
+                    "pruned_dep": ref,
+                    "reason": f"stale dependency #{ref} closed; removed from issue #{issue_number}",
+                },
+                log_dir=config.log_dir.expanduser(),
+            )
+            pruned = True
+    return pruned
+
+
 def _run_persistent_pool(
     *,
     pool_size: int,
@@ -1761,8 +1882,9 @@ def _run_persistent_pool(
         stall_reason:  Human-readable reason logged on deadlock escalation.
     """
     checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
-    # In-memory fallback retry tracker used when store is None.
+    # In-memory fallback retry/restart trackers used when store is None.
     _retry_counts: dict[int, int] = {}
+    _restart_counts: dict[int, int] = {}
     stall_count: int = 0
     _watchdog_tick: int = 0
     active: dict = {}
@@ -1775,6 +1897,20 @@ def _run_persistent_pool(
                 break
             stall_count += 1
             if stall_count >= STALL_MAX_ITERATIONS:
+                # Before escalating, try pruning stale Depends-on references
+                if store is not None and milestone:
+                    _pruned = _prune_stale_dependencies(
+                        repo=repo,
+                        milestone=milestone,
+                        store=store,
+                        config=config,
+                        checkpoint=checkpoint,
+                    )
+                    if _pruned:
+                        stall_count = 0
+                        fill_fn(active)
+                        if active:
+                            continue  # work unblocked — restart pool loop
                 logger.log_conductor_event(
                     run_id=checkpoint.run_id,
                     phase="stall",
@@ -1894,26 +2030,59 @@ def _run_persistent_pool(
                 _delete_remote_branch(repo, _branch)
                 if current_retries >= MAX_RETRIES:
                     reason = result.subtype or "unknown_error"
-                    _exhaust_issue(repo, issue_number, reason, store)
-                    click.echo(
-                        f"[{stage}] #{issue_number} exhausted {MAX_RETRIES} retries "
-                        f"({reason}) — closed with 'bug' label. Reopen to retry.",
-                        err=True,
+                    _restart_count = (
+                        _bead.restart_count
+                        if _bead is not None
+                        else _restart_counts.get(issue_number, 0)
                     )
-                    logger.log_conductor_event(
-                        run_id=checkpoint.run_id,
-                        phase="dispatch",
-                        event_type="human_escalate",
-                        payload={
-                            "issue_number": issue_number,
-                            "reason": reason,
-                            "error_code": result.error_code,
-                            "retry_count": current_retries,
-                            "stderr": result.stderr[:500] if result.stderr else "",
-                            "action_required": "manual investigation",
-                        },
-                        log_dir=config.log_dir.expanduser(),
-                    )
+                    if _restart_count < 2:
+                        # Nuclear restart: reset retry state and re-queue the issue
+                        if _bead is not None:
+                            _bead.restart_count = _restart_count + 1
+                            _bead.retry_count = 0
+                            _bead.state = "open"
+                            store.write_work_bead(_bead)  # type: ignore[union-attr]
+                        else:
+                            _restart_counts[issue_number] = _restart_count + 1
+                            _retry_counts[issue_number] = 0
+                        _unclaim_issue(repo=repo, issue_number=issue_number, store=store)
+                        logger.log_conductor_event(
+                            run_id=checkpoint.run_id,
+                            phase="dispatch",
+                            event_type="agent_nuclear_restart",
+                            payload={
+                                "issue_number": issue_number,
+                                "reason": reason,
+                                "error_code": result.error_code,
+                                "retry_count": current_retries,
+                                "restart_count": _restart_count + 1,
+                                "stderr": result.stderr[:500] if result.stderr else "",
+                            },
+                            log_dir=config.log_dir.expanduser(),
+                        )
+                    else:
+                        # Exhausted restart budget — close with bug label
+                        _exhaust_issue(repo, issue_number, reason, store)
+                        click.echo(
+                            f"[{stage}] #{issue_number} exhausted {MAX_RETRIES} retries "
+                            f"({reason}) — closed with 'bug' label. Reopen to retry.",
+                            err=True,
+                        )
+                        logger.log_conductor_event(
+                            run_id=checkpoint.run_id,
+                            phase="dispatch",
+                            event_type="human_escalate",
+                            payload={
+                                "issue_number": issue_number,
+                                "reason": reason,
+                                "error_code": result.error_code,
+                                "retry_count": current_retries,
+                                "restart_count": _restart_count,
+                                "stderr": result.stderr[:500] if result.stderr else "",
+                                "action_required": "manual investigation",
+                            },
+                            log_dir=config.log_dir.expanduser(),
+                        )
                 else:
                     _unclaim_issue(repo=repo, issue_number=issue_number, store=store)
                 _remove_worktree(_worktree_path, repo_root)
@@ -1996,7 +2165,13 @@ def _run_research_worker(
             repo_root=repo_root,
             store=store,
         )
-        _startup_dep_checks(_list_open_issues_by_label(repo, milestone, RESEARCH_LABEL), repo)
+        if store is not None:
+            _seed_work_beads(repo, milestone, RESEARCH_LABEL, "research", store)
+            _startup_dep_checks_from_beads(
+                store.list_work_beads(milestone=milestone, stage="research"), repo
+            )
+        else:
+            _startup_dep_checks(_list_open_issues_by_label(repo, milestone, RESEARCH_LABEL), repo)
 
     research_limits: dict[str, int] = {"pro": 2, "max": 3, "max20x": 5}
     pool_size = config.max_concurrency or research_limits.get(config.subscription_tier, 3)
@@ -2046,7 +2221,7 @@ def _run_research_worker(
                     and not b.deferred
                     and all(
                         (dep_bead := store.read_work_bead(dep)) is not None
-                        and dep_bead.state == "closed"
+                        and dep_bead.state in ("closed", "abandoned")
                         for dep in b.blocked_by
                     )
                 ]
@@ -2208,6 +2383,7 @@ def _run_research_worker(
                     store=store,
                     worktree_path=worktree_path,
                     default_branch=default_branch,
+                    repo_root=repo_root,
                 )
             else:
                 click.echo(
@@ -2239,6 +2415,7 @@ def _run_research_worker(
                         config=config,
                         checkpoint=checkpoint,
                         dry_run=False,
+                        store=store,
                     )
                     return True
                 blocking = [b for b in open_beads if not b.deferred]
@@ -2253,6 +2430,7 @@ def _run_research_worker(
                         config=config,
                         checkpoint=checkpoint,
                         dry_run=False,
+                        store=store,
                     )
                     return True
                 # All blocking beads are in merge_ready state — their PRs are
@@ -2278,6 +2456,7 @@ def _run_research_worker(
                             config=config,
                             checkpoint=checkpoint,
                             dry_run=False,
+                            store=store,
                         )
                         return True
                     blocking = [b for b in open_beads if not b.deferred]
@@ -2292,6 +2471,7 @@ def _run_research_worker(
                             config=config,
                             checkpoint=checkpoint,
                             dry_run=False,
+                            store=store,
                         )
                         return True
                 return False
@@ -2394,6 +2574,7 @@ def _run_completion_gate(
     config: Config,
     checkpoint: Checkpoint,
     dry_run: bool = False,
+    store: BeadStore | None = None,
 ) -> None:
     """Declare research milestone complete, migrate non-blocking issues, file the HLD issue.
 
@@ -2407,6 +2588,7 @@ def _run_completion_gate(
         config:      Current Config instance.
         checkpoint:  Current Checkpoint instance.
         dry_run:     If True, print actions without modifying GitHub.
+        store:       BeadStore for bead-first dedup when filing HLD issue.
     """
     checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
 
@@ -2451,6 +2633,7 @@ def _run_completion_gate(
             repo=repo,
             milestone=milestone,
             title=hld_title,
+            store=store,
             body=(
                 "## Deliverable\n"
                 f"`docs/design/{milestone}/HLD.md`\n\n"
@@ -2958,6 +3141,7 @@ def _monitor_pr(
     default_branch: str = "main",
     max_polls: int = _CI_MAX_POLLS,
     poll_interval: int = _CI_POLL_INTERVAL,
+    repo_root: str = "",
 ) -> bool:
     """Monitor a PR's CI status and squash-merge it when CI passes.
 
@@ -2991,6 +3175,7 @@ def _monitor_pr(
     rebase_attempts = 0
     ci_fail_count = 0
     consecutive_no_checks = 0  # grace counter: empty CI after force-push vs no CI configured
+    last_head_sha: str = ""  # track HEAD to reset ci_fail_count when agent pushes a fix
 
     # Write initial PRBead
     pr_bead = PRBead(
@@ -3004,169 +3189,245 @@ def _monitor_pr(
     if store is not None:
         store.write_pr_bead(pr_bead)
 
-    for poll_idx in range(max_polls):
-        time.sleep(poll_interval)
+    timeout_count = 0
+    while True:
+        for poll_idx in range(max_polls):
+            time.sleep(poll_interval)
 
-        # Detect merge conflicts at the start of every poll — this fires even
-        # while CI is still pending so we don't wait 30 min before rebasing.
-        if _is_conflict_failure(repo, pr_number):
-            if not worktree_path:
-                # No worktree available (e.g. research PRs) — can't rebase
-                logger.log_conductor_event(
-                    run_id=checkpoint.run_id,
-                    phase="ci_check",
-                    event_type="human_escalate",
-                    payload={
-                        "pr_number": pr_number,
-                        "issue_number": issue_number,
-                        "reason": "conflict detected but no worktree for rebase",
-                    },
-                    log_dir=config.log_dir.expanduser(),
+            # Detect merge conflicts at the start of every poll — this fires even
+            # while CI is still pending so we don't wait 30 min before rebasing.
+            if _is_conflict_failure(repo, pr_number):
+                if not worktree_path:
+                    # No worktree available — try to create a temp one if repo_root provided
+                    _tmp_wt = (
+                        _checkout_existing_branch_worktree(branch, repo_root) if repo_root else None
+                    )
+                    if _tmp_wt:
+                        worktree_path = _tmp_wt
+                    else:
+                        logger.log_conductor_event(
+                            run_id=checkpoint.run_id,
+                            phase="ci_check",
+                            event_type="human_escalate",
+                            payload={
+                                "pr_number": pr_number,
+                                "issue_number": issue_number,
+                                "reason": "conflict detected but no worktree for rebase",
+                            },
+                            log_dir=config.log_dir.expanduser(),
+                        )
+                        pr_bead.state = "conflict"
+                        if store is not None:
+                            store.write_pr_bead(pr_bead)
+                        return False
+
+                if rebase_attempts >= _REBASE_RETRY_LIMIT:
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="ci_check",
+                        event_type="human_escalate",
+                        payload={
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            "reason": "rebase limit exceeded",
+                        },
+                        log_dir=config.log_dir.expanduser(),
+                    )
+                    pr_bead.state = "conflict"
+                    if store is not None:
+                        store.write_pr_bead(pr_bead)
+                    return False
+
+                rebase_ok = _rebase_branch(
+                    branch, repo, worktree_path, default_branch, config=config
                 )
-                pr_bead.state = "conflict"
-                if store is not None:
-                    store.write_pr_bead(pr_bead)
-                return False
-
-            if rebase_attempts >= _REBASE_RETRY_LIMIT:
-                logger.log_conductor_event(
-                    run_id=checkpoint.run_id,
-                    phase="ci_check",
-                    event_type="human_escalate",
-                    payload={
-                        "pr_number": pr_number,
-                        "issue_number": issue_number,
-                        "reason": "rebase limit exceeded",
-                    },
-                    log_dir=config.log_dir.expanduser(),
-                )
-                pr_bead.state = "conflict"
-                if store is not None:
-                    store.write_pr_bead(pr_bead)
-                return False
-
-            rebase_ok = _rebase_branch(branch, repo, worktree_path, default_branch, config=config)
-            rebase_attempts += 1
-            if not rebase_ok:
-                logger.log_conductor_event(
-                    run_id=checkpoint.run_id,
-                    phase="ci_check",
-                    event_type="human_escalate",
-                    payload={
-                        "pr_number": pr_number,
-                        "issue_number": issue_number,
-                        "reason": "rebase failed — conflicts outside agent scope",
-                    },
-                    log_dir=config.log_dir.expanduser(),
-                )
-                pr_bead.state = "conflict"
-                if store is not None:
-                    store.write_pr_bead(pr_bead)
-                return False
-            # Rebase succeeded — continue polling so CI can re-run
-            continue
-
-        ci_status = _get_pr_checks_status(repo, pr_number)
-
-        # Handle the "no checks yet" case: distinguish a brief post-push race
-        # (CI not triggered yet) from "repo has no CI configured".
-        # After _CI_NO_CHECKS_GRACE consecutive no_checks polls, treat as pass.
-        if ci_status == "no_checks":
-            consecutive_no_checks += 1
-            if consecutive_no_checks < _CI_NO_CHECKS_GRACE:
-                continue  # wait for CI to appear
-            ci_status = "pass"  # grace exhausted — no CI configured
-        else:
-            consecutive_no_checks = 0  # reset when real checks appear
-
-        logger.log_conductor_event(
-            run_id=checkpoint.run_id,
-            phase="ci_check",
-            event_type="ci_checked",
-            payload={
-                "pr_number": pr_number,
-                "issue_number": issue_number,
-                "status": ci_status,
-                "poll_index": poll_idx,
-            },
-            log_dir=config.log_dir.expanduser(),
-        )
-
-        if ci_status == "pass":
-            # Check reviews
-            review_status = _get_review_status(repo, pr_number)
-
-            if review_status == "changes_requested":
-                # Record that review feedback is pending — do NOT dispatch a fix agent.
-                # Agents handle their own review feedback via updated skill files (PR 5).
-                pr_bead.state = "reviewing"
-                if store is not None:
-                    store.write_pr_bead(pr_bead)
-                # Continue polling — agent may push a fix commit
+                rebase_attempts += 1
+                if not rebase_ok:
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="ci_check",
+                        event_type="human_escalate",
+                        payload={
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            "reason": "rebase failed — conflicts outside agent scope",
+                        },
+                        log_dir=config.log_dir.expanduser(),
+                    )
+                    pr_bead.state = "conflict"
+                    if store is not None:
+                        store.write_pr_bead(pr_bead)
+                    return False
+                # Rebase succeeded — continue polling so CI can re-run
                 continue
 
-            # Enqueue to MergeQueue — _process_merge_queue() does the actual merge
-            _now_str = datetime.now(UTC).isoformat()
-            if store is not None:
-                _queue = store.read_merge_queue()
-                _queue.queue.append(
-                    MergeQueueEntry(
-                        pr_number=pr_number,
-                        issue_number=issue_number,
-                        branch=branch,
-                        enqueued_at=_now_str,
-                    )
-                )
-                _queue.updated_at = _now_str
-                store.write_merge_queue(_queue)
-                pr_bead.state = "merge_ready"
-                store.write_pr_bead(pr_bead)
-                _work_bead = store.read_work_bead(issue_number)
-                if _work_bead is not None:
-                    _work_bead.state = "merge_ready"
-                    store.write_work_bead(_work_bead)
+            # Track HEAD SHA — if agent pushes a fix commit, reset ci_fail_count so
+            # a fresh CI run isn't counted as a continuation of the previous failure.
+            _sha_result = _gh(
+                ["pr", "view", str(pr_number), "--json", "headRefOid", "--jq", ".headRefOid"],
+                repo=repo,
+                check=False,
+            )
+            _current_sha = (_sha_result.stdout or "").strip()
+            if _current_sha and _current_sha != last_head_sha:
+                if last_head_sha:  # not first poll — new commit landed
+                    ci_fail_count = 0
+                last_head_sha = _current_sha
+
+            ci_status = _get_pr_checks_status(repo, pr_number)
+
+            # Handle the "no checks yet" case: distinguish a brief post-push race
+            # (CI not triggered yet) from "repo has no CI configured".
+            # After _CI_NO_CHECKS_GRACE consecutive no_checks polls, treat as pass.
+            if ci_status == "no_checks":
+                consecutive_no_checks += 1
+                if consecutive_no_checks < _CI_NO_CHECKS_GRACE:
+                    continue  # wait for CI to appear
+                ci_status = "pass"  # grace exhausted — no CI configured
+            else:
+                consecutive_no_checks = 0  # reset when real checks appear
+
             logger.log_conductor_event(
                 run_id=checkpoint.run_id,
-                phase="merge",
-                event_type="pr_merged",
+                phase="ci_check",
+                event_type="ci_checked",
                 payload={
                     "pr_number": pr_number,
                     "issue_number": issue_number,
-                    "branch": branch,
-                    "queued": True,
+                    "status": ci_status,
+                    "poll_index": poll_idx,
                 },
                 log_dir=config.log_dir.expanduser(),
             )
-            return True
 
-        elif ci_status == "fail":
-            ci_fail_count += 1
-            if ci_fail_count <= 1:
-                # First failure: may be transient — poll once more
-                pr_bead.ci_state = "failing"
+            if ci_status == "pass":
+                # Check reviews
+                review_status = _get_review_status(repo, pr_number)
+
+                if review_status == "changes_requested":
+                    # Record that review feedback is pending — do NOT dispatch a fix agent.
+                    # Agents handle their own review feedback via updated skill files (PR 5).
+                    pr_bead.state = "reviewing"
+                    if store is not None:
+                        store.write_pr_bead(pr_bead)
+                    # Continue polling — agent may push a fix commit
+                    continue
+
+                # Log inline comment presence for observability before enqueue
+                _inline_result = _gh(
+                    ["api", f"repos/{repo}/pulls/{pr_number}/comments", "--jq", "length"],
+                    repo=repo,
+                    check=False,
+                )
+                try:
+                    _inline_count = int((_inline_result.stdout or "0").strip())
+                except ValueError:
+                    _inline_count = 0
+                if _inline_count > 0:
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="ci_check",
+                        event_type="inline_comments_present",
+                        payload={
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            "count": _inline_count,
+                        },
+                        log_dir=config.log_dir.expanduser(),
+                    )
+
+                # Enqueue to MergeQueue — _process_merge_queue() does the actual merge
+                _now_str = datetime.now(UTC).isoformat()
                 if store is not None:
+                    _queue = store.read_merge_queue()
+                    _work_bead = store.read_work_bead(issue_number)
+                    _priority = 0
+                    if _work_bead is not None:
+                        _p = _work_bead.priority or ""
+                        _priority = {"P0": 40, "P1": 30, "P2": 20, "P3": 10, "P4": 5}.get(_p, 0)
+                    _queue.queue.append(
+                        MergeQueueEntry(
+                            pr_number=pr_number,
+                            issue_number=issue_number,
+                            branch=branch,
+                            enqueued_at=_now_str,
+                            priority=_priority,
+                        )
+                    )
+                    _queue.queue.sort(key=lambda e: e.priority, reverse=True)
+                    _queue.updated_at = _now_str
+                    store.write_merge_queue(_queue)
+                    pr_bead.state = "merge_ready"
                     store.write_pr_bead(pr_bead)
-            else:
-                # Persistent failure — escalate; agents should fix CI via updated skills (PR 5)
-                pr_bead.state = "ci_failing"
-                pr_bead.ci_state = "failing"
-                if store is not None:
-                    store.write_pr_bead(pr_bead)
+                    if _work_bead is not None:
+                        _work_bead.state = "merge_ready"
+                        store.write_work_bead(_work_bead)
                 logger.log_conductor_event(
                     run_id=checkpoint.run_id,
-                    phase="ci_check",
-                    event_type="human_escalate",
+                    phase="merge",
+                    event_type="pr_merged",
                     payload={
                         "pr_number": pr_number,
                         "issue_number": issue_number,
-                        "reason": "ci failed (persistent); agent should fix via skill",
-                        "ci_fail_count": ci_fail_count,
+                        "branch": branch,
+                        "queued": True,
                     },
                     log_dir=config.log_dir.expanduser(),
                 )
-                return False
+                return True
 
-        # ci_status == "pending": continue polling
+            elif ci_status == "fail":
+                ci_fail_count += 1
+                if ci_fail_count < 3:
+                    # Transient failure or agent still fixing — poll again
+                    pr_bead.ci_state = "failing"
+                    if store is not None:
+                        store.write_pr_bead(pr_bead)
+                else:
+                    # Persistent failure — escalate; agents should fix CI via updated skills (PR 5)
+                    pr_bead.state = "ci_failing"
+                    pr_bead.ci_state = "failing"
+                    if store is not None:
+                        store.write_pr_bead(pr_bead)
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="ci_check",
+                        event_type="human_escalate",
+                        payload={
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            "reason": "ci failed (persistent); agent should fix via skill",
+                            "ci_fail_count": ci_fail_count,
+                        },
+                        log_dir=config.log_dir.expanduser(),
+                    )
+                    return False
+
+            # ci_status == "pending": continue polling
+
+        # Inner poll loop timed out — try one empty-commit re-trigger if worktree available
+        if worktree_path and os.path.isdir(worktree_path) and timeout_count < 1:
+            timeout_count += 1
+            subprocess.run(
+                [
+                    "git",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "ci: re-trigger [skip-duplicate-detection]",
+                ],
+                cwd=worktree_path,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "push"],
+                cwd=worktree_path,
+                capture_output=True,
+                text=True,
+            )
+            continue  # restart poll loop with fresh CI run
+        break  # second timeout or no worktree → fall through
 
     # Timeout
     pr_bead.state = "abandoned"
@@ -3223,14 +3484,19 @@ def _process_merge_queue(
     if orphaned:
         now_str = datetime.now(UTC).isoformat()
         for pr_bead in orphaned:
+            _wb = store.read_work_bead(pr_bead.issue_number)
+            _p = (_wb.priority or "") if _wb else ""
+            _priority = {"P0": 40, "P1": 30, "P2": 20, "P3": 10, "P4": 5}.get(_p, 0)
             queue.queue.append(
                 MergeQueueEntry(
                     pr_number=pr_bead.pr_number,
                     issue_number=pr_bead.issue_number,
                     branch=pr_bead.branch,
                     enqueued_at=now_str,
+                    priority=_priority,
                 )
             )
+        queue.queue.sort(key=lambda e: e.priority, reverse=True)
         store.write_merge_queue(queue)
 
     if not queue.queue:
@@ -3252,7 +3518,27 @@ def _process_merge_queue(
             finally:
                 _remove_worktree(wt_path, repo_root)
             if not rebase_ok:
-                # Rebase failed — push to tail, stop processing
+                entry.attempts += 1
+                if entry.attempts >= _REBASE_RETRY_LIMIT:
+                    # Cap exceeded — write conflict state and discard entry
+                    _pr_bead_rb = store.read_pr_bead(pr_number)
+                    if _pr_bead_rb is not None:
+                        _pr_bead_rb.state = "conflict"
+                        store.write_pr_bead(_pr_bead_rb)
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="merge",
+                        event_type="human_escalate",
+                        payload={
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            "reason": "merge queue rebase limit exceeded",
+                            "attempts": entry.attempts,
+                        },
+                        log_dir=config.log_dir.expanduser(),
+                    )
+                    continue  # discard entry, process rest of queue
+                # Push to tail, stop processing current pass
                 remaining.append(entry)
                 logger.log_conductor_event(
                     run_id=checkpoint.run_id,
@@ -3262,6 +3548,7 @@ def _process_merge_queue(
                         "pr_number": pr_number,
                         "issue_number": issue_number,
                         "reason": "rebase failed in merge queue; pushed to tail",
+                        "attempts": entry.attempts,
                     },
                     log_dir=config.log_dir.expanduser(),
                 )
@@ -3312,20 +3599,80 @@ def _process_merge_queue(
                 log_dir=config.log_dir.expanduser(),
             )
         else:
-            logger.log_conductor_event(
-                run_id=checkpoint.run_id,
-                phase="merge",
-                event_type="human_escalate",
-                payload={
-                    "pr_number": pr_number,
-                    "issue_number": issue_number,
-                    "reason": "squash merge failed",
-                    "stderr": (merge_result.stderr or "")[:500] if merge_result is not None else "",
-                },
-                log_dir=config.log_dir.expanduser(),
-            )
-            # Remove from queue — won't be retried automatically
-            # (Watchdog or human intervention needed)
+            _merge_stderr = (merge_result.stderr or "").lower() if merge_result is not None else ""
+            _governance_keywords = ("required status check", "review required", "protected branch")
+            if any(kw in _merge_stderr for kw in _governance_keywords):
+                # Governance block — write conflict state, discard entry
+                _pr_bead_gv = store.read_pr_bead(pr_number)
+                if _pr_bead_gv is not None:
+                    _pr_bead_gv.state = "conflict"
+                    store.write_pr_bead(_pr_bead_gv)
+                logger.log_conductor_event(
+                    run_id=checkpoint.run_id,
+                    phase="merge",
+                    event_type="human_escalate",
+                    payload={
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "reason": "squash merge failed: governance block",
+                        "stderr": _merge_stderr[:500],
+                    },
+                    log_dir=config.log_dir.expanduser(),
+                )
+                # Entry discarded — fall through to next iteration
+            elif _is_conflict_failure(repo, pr_number):
+                # Re-conflict race after rebase — retry up to merge_attempts cap
+                entry.merge_attempts += 1
+                if entry.merge_attempts < _REBASE_RETRY_LIMIT:
+                    remaining.insert(0, entry)  # retry at head of queue
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="merge",
+                        event_type="human_escalate",
+                        payload={
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            "reason": "squash merge conflict race; re-queued at head",
+                            "merge_attempts": entry.merge_attempts,
+                        },
+                        log_dir=config.log_dir.expanduser(),
+                    )
+                    break  # restart drain from top
+                else:
+                    _pr_bead_cr = store.read_pr_bead(pr_number)
+                    if _pr_bead_cr is not None:
+                        _pr_bead_cr.state = "conflict"
+                        store.write_pr_bead(_pr_bead_cr)
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="merge",
+                        event_type="human_escalate",
+                        payload={
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            "reason": "squash merge conflict race limit exceeded",
+                            "merge_attempts": entry.merge_attempts,
+                        },
+                        log_dir=config.log_dir.expanduser(),
+                    )
+            else:
+                # Transient failure — write conflict state, discard entry
+                _pr_bead_tr = store.read_pr_bead(pr_number)
+                if _pr_bead_tr is not None:
+                    _pr_bead_tr.state = "conflict"
+                    store.write_pr_bead(_pr_bead_tr)
+                logger.log_conductor_event(
+                    run_id=checkpoint.run_id,
+                    phase="merge",
+                    event_type="human_escalate",
+                    payload={
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "reason": "squash merge failed: transient error",
+                        "stderr": _merge_stderr[:500],
+                    },
+                    log_dir=config.log_dir.expanduser(),
+                )
 
     # Write updated queue (with processed entries removed, remaining intact)
     queue.queue = remaining
@@ -3435,7 +3782,7 @@ def _dispatch_recovery_agent(
     env = build_subprocess_env(config)
     runner.run(
         prompt=prompt,
-        allowed_tools=["Bash"],
+        allowed_tools=runner.TOOLS_IMPL_AGENT,
         env=env,
         max_turns=60,
         timeout_seconds=config.agent_timeout_minutes * 60,
@@ -4225,7 +4572,13 @@ def _run_impl_worker(
             already_handled=handled,
             store=store,
         )
-        _startup_dep_checks(_list_open_issues_by_label(repo, milestone, IMPL_LABEL), repo)
+        if store is not None:
+            _seed_work_beads(repo, milestone, IMPL_LABEL, "impl", store)
+            _startup_dep_checks_from_beads(
+                store.list_work_beads(milestone=milestone, stage="impl"), repo
+            )
+        else:
+            _startup_dep_checks(_list_open_issues_by_label(repo, milestone, IMPL_LABEL), repo)
         if store is not None:
             _ensure_impl_scaffold(
                 repo=repo, milestone=milestone, store=store, default_branch=default_branch
@@ -4242,7 +4595,7 @@ def _run_impl_worker(
                 and not b.deferred
                 and all(
                     (dep_bead := store.read_work_bead(dep)) is not None
-                    and dep_bead.state == "closed"
+                    and dep_bead.state in ("closed", "abandoned")
                     for dep in b.blocked_by
                 )
             ]
@@ -4296,7 +4649,7 @@ def _run_impl_worker(
                     and not b.deferred
                     and all(
                         (dep_bead := store.read_work_bead(dep)) is not None
-                        and dep_bead.state == "closed"
+                        and dep_bead.state in ("closed", "abandoned")
                         for dep in b.blocked_by
                     )
                 ]
@@ -4448,20 +4801,63 @@ def _run_impl_worker(
             issue_number = issue["number"]
             pr_number = _find_pr_for_branch(repo, branch)
             if pr_number is None:
-                logger.log_conductor_event(
-                    run_id=checkpoint.run_id,
-                    phase="dispatch",
-                    event_type="human_escalate",
-                    payload={
-                        "issue_number": issue_number,
-                        "reason": "agent completed but no PR found",
-                        "branch": branch,
-                    },
-                    log_dir=config.log_dir.expanduser(),
+                # Branch was pushed but PR not created — check if there are commits ahead
+                # and try a minimal recovery agent to create the PR automatically.
+                _compare = _gh(
+                    [
+                        "api",
+                        f"repos/{repo}/compare/{default_branch}...{branch}",
+                        "--jq",
+                        ".ahead_by",
+                    ],
+                    repo=repo,
+                    check=False,
                 )
-                _unclaim_issue(repo=repo, issue_number=issue_number, store=store)
-                _remove_worktree(worktree_path, repo_root)
-                return
+                _ahead_by = 0
+                try:
+                    _ahead_by = int((_compare.stdout or "0").strip())
+                except ValueError:
+                    pass
+                if _ahead_by > 0:
+                    # Branch has commits — dispatch a recovery agent to create the PR
+                    _issue_title = issue.get("title", f"Issue #{issue_number}")
+                    _recovery_prompt = (
+                        f"The agent for issue #{issue_number} completed but did not create a PR. "
+                        f"The branch `{branch}` has {_ahead_by} commit(s) ahead of "
+                        f"`{default_branch}`. Your only task: create the PR.\n\n"
+                        f"Run: gh pr create --repo {repo} --head {branch} "
+                        f'--title "{_issue_title}" '
+                        f'--body "Closes #{issue_number}" --base {default_branch}\n\n'
+                        f"Then STOP."
+                    )
+                    _env = build_subprocess_env(config)
+                    runner.run(
+                        prompt=_recovery_prompt,
+                        allowed_tools=["Bash"],
+                        env=_env,
+                        max_turns=10,
+                        timeout_seconds=120,
+                        model=config.model,
+                        prefix=f"[pr-recovery #{issue_number}] ",
+                    )
+                    # Retry PR lookup after recovery agent
+                    pr_number = _find_pr_for_branch(repo, branch)
+                if pr_number is None:
+                    logger.log_conductor_event(
+                        run_id=checkpoint.run_id,
+                        phase="dispatch",
+                        event_type="human_escalate",
+                        payload={
+                            "issue_number": issue_number,
+                            "reason": "agent completed but no PR found",
+                            "branch": branch,
+                            "ahead_by": _ahead_by,
+                        },
+                        log_dir=config.log_dir.expanduser(),
+                    )
+                    _unclaim_issue(repo=repo, issue_number=issue_number, store=store)
+                    _remove_worktree(worktree_path, repo_root)
+                    return
             session.save(checkpoint, checkpoint_path)
             logger.log_conductor_event(
                 run_id=checkpoint.run_id,
@@ -4513,11 +4909,11 @@ def _run_impl_worker(
                 logger.log_conductor_event(
                     run_id=checkpoint.run_id,
                     phase="merge",
-                    event_type="human_escalate",
+                    event_type="ci_monitoring_complete_no_merge",
                     payload={
                         "issue_number": issue_number,
                         "pr_number": pr_number,
-                        "reason": "CI monitoring did not result in merge",
+                        "reason": "CI monitoring did not result in merge; watchdog will handle",
                     },
                     log_dir=config.log_dir.expanduser(),
                 )
@@ -4716,11 +5112,22 @@ def _run_design_worker(
     elif _doc_exists_on_default_branch(repo, hld_doc_path, default_branch):
         click.echo("HLD already merged — skipping Phase 1")
     else:
-        # Find the HLD issue (may have been filed by completion gate or on a previous run)
-        design_issues = _list_open_issues_by_label(repo, milestone, DESIGN_LABEL)
-        hld_issue = next((i for i in design_issues if i["title"] == hld_issue_title), None)
-        if hld_issue is None:
-            # Missing — create it (idempotent) and re-fetch
+        # Seed design beads first, then find HLD via beads (source of truth)
+        if store is not None:
+            _seed_work_beads(repo, milestone, DESIGN_LABEL, "design", store)
+
+        hld_bead = None
+        hld_issue: dict[str, Any] | None = None
+        if store is not None:
+            hld_bead = next(
+                (
+                    b
+                    for b in store.list_work_beads(milestone=milestone, stage="design")
+                    if b.title == hld_issue_title and b.state not in ("closed", "abandoned")
+                ),
+                None,
+            )
+        if hld_bead is None:
             _file_design_issue_if_missing(
                 repo,
                 milestone,
@@ -4735,9 +5142,36 @@ def _run_design_worker(
                     "issue with label `stage/design` and this milestone. "
                     "Check for duplicates before filing."
                 ),
+                store=store,
             )
-            design_issues = _list_open_issues_by_label(repo, milestone, DESIGN_LABEL)
-            hld_issue = next((i for i in design_issues if i["title"] == hld_issue_title), None)
+            if store is not None:
+                _seed_work_beads(repo, milestone, DESIGN_LABEL, "design", store)
+                hld_bead = next(
+                    (
+                        b
+                        for b in store.list_work_beads(milestone=milestone, stage="design")
+                        if b.title == hld_issue_title and b.state not in ("closed", "abandoned")
+                    ),
+                    None,
+                )
+            if hld_bead is None:
+                design_issues = _list_open_issues_by_label(repo, milestone, DESIGN_LABEL)
+                hld_issue = next((i for i in design_issues if i["title"] == hld_issue_title), None)
+
+        if hld_bead is not None:
+            _view = _gh(
+                ["issue", "view", str(hld_bead.issue_number), "--json", "number,title,body"],
+                repo=repo,
+                check=False,
+            )
+            try:
+                hld_issue = json.loads(_view.stdout)
+            except (json.JSONDecodeError, AttributeError):
+                hld_issue = {
+                    "number": hld_bead.issue_number,
+                    "title": hld_bead.title,
+                    "body": "",
+                }
 
         if hld_issue is None:
             click.echo("Error: Could not find or create HLD design issue.", err=True)
@@ -4891,12 +5325,39 @@ def _run_design_worker(
                         f"public API/interfaces, error handling, and test strategy "
                         f"for this module."
                     ),
+                    store=store,
                 )
             # Seed beads from GitHub so newly created issues get beads
             _seed_work_beads(repo, milestone, DESIGN_LABEL, "design", store)
 
-    all_design_issues = _list_open_issues_by_label(repo, milestone, DESIGN_LABEL)
-    lld_issues = [i for i in all_design_issues if i["title"] != hld_issue_title]
+    # Build LLD issue list — beads are source of truth when store is available.
+    # Fetch full issue bodies at dispatch time so agents have design instructions.
+    if store is not None:
+        _lld_beads = [
+            b
+            for b in store.list_work_beads(state="open", milestone=milestone, stage="design")
+            if b.title != hld_issue_title
+        ]
+        lld_issues: list[dict[str, Any]] = []
+        for _b in _lld_beads:
+            _bview = _gh(
+                [
+                    "issue",
+                    "view",
+                    str(_b.issue_number),
+                    "--json",
+                    "number,title,body,labels,assignees,milestone",
+                ],
+                repo=repo,
+                check=False,
+            )
+            try:
+                lld_issues.append(json.loads(_bview.stdout))
+            except (json.JSONDecodeError, AttributeError):
+                lld_issues.append({"number": _b.issue_number, "title": _b.title, "body": ""})
+    else:
+        all_design_issues = _list_open_issues_by_label(repo, milestone, DESIGN_LABEL)
+        lld_issues = [i for i in all_design_issues if i["title"] != hld_issue_title]
 
     if not lld_issues:
         click.echo(
@@ -5691,10 +6152,10 @@ def _run_plan(
     if not dry_run:
         try:
             if _milestone_exists(repo, version):
-                existing = _count_open_issues_by_label(repo, version, RESEARCH_LABEL)
+                existing = _count_all_issues_by_label(repo, version, RESEARCH_LABEL)
                 if existing > 0:
                     click.echo(
-                        f"[plan] milestone {version!r} exists with {existing} open research"
+                        f"[plan] milestone {version!r} exists with {existing} research"
                         " issue(s) — plan stage skipped (already seeded)."
                     )
                     return
@@ -6192,8 +6653,12 @@ def _check_gate_before_stage(
     repo: str,
     milestone: str,
     default_branch: str,
+    store: BeadStore | None = None,
 ) -> None:
     """Abort with a clear error if a prerequisite stage has not been completed.
+
+    Bead-first: when *store* is provided, gates check bead state directly.
+    Falls back to GitHub issue counts when no store is available.
 
     Gates are only applied when the prerequisite stage is NOT also being run in
     the same invocation (e.g. ``--all`` skips both gates because research and
@@ -6205,17 +6670,32 @@ def _check_gate_before_stage(
         repo:              GitHub repository in ``owner/repo`` format.
         milestone:         Active milestone name.
         default_branch:    Default branch of the remote repo.
+        store:             BeadStore for bead-first checks, or None.
 
     Raises:
         click.ClickException: If the prerequisite is not satisfied.
     """
     if stage == "design" and "research" not in stages_being_run:
-        open_count = _count_open_issues_by_label(repo, milestone, RESEARCH_LABEL)
-        if open_count > 0:
-            raise click.ClickException(
-                f"{open_count} open research issue(s) remain for milestone '{milestone}'. "
-                "Run `brimstone run --research` first, or use `--all` to run all stages."
-            )
+        if store is not None:
+            research_beads = store.list_work_beads(milestone=milestone, stage="research")
+            blocking = [
+                b
+                for b in research_beads
+                if b.state not in ("closed", "abandoned") and not b.deferred
+            ]
+            if blocking:
+                raise click.ClickException(
+                    f"{len(blocking)} open research bead(s) remain for"
+                    f" milestone '{milestone}'. "
+                    "Run `brimstone run --research` first, or use `--all`."
+                )
+        else:
+            open_count = _count_open_issues_by_label(repo, milestone, RESEARCH_LABEL)
+            if open_count > 0:
+                raise click.ClickException(
+                    f"{open_count} open research issue(s) remain for milestone '{milestone}'. "
+                    "Run `brimstone run --research` first, or use `--all` to run all stages."
+                )
 
     if stage == "scope" and "design" not in stages_being_run:
         hld_path = f"docs/design/{milestone}/HLD.md"
@@ -6226,11 +6706,19 @@ def _check_gate_before_stage(
             )
 
     if stage == "impl" and "scope" not in stages_being_run:
-        if _count_open_issues_by_label(repo, milestone, IMPL_LABEL) == 0:
-            raise click.ClickException(
-                f"No open impl issues found for milestone '{milestone}'. "
-                "Run `brimstone run --scope` first to generate them from the design docs."
-            )
+        if store is not None:
+            impl_beads = store.list_work_beads(milestone=milestone, stage="impl")
+            if not impl_beads:
+                raise click.ClickException(
+                    f"No impl beads found for milestone '{milestone}'. "
+                    "Run `brimstone run --scope` first to generate them from the design docs."
+                )
+        else:
+            if _count_open_issues_by_label(repo, milestone, IMPL_LABEL) == 0:
+                raise click.ClickException(
+                    f"No open impl issues found for milestone '{milestone}'. "
+                    "Run `brimstone run --scope` first to generate them from the design docs."
+                )
 
 
 @brimstone.command("run")
@@ -6311,6 +6799,13 @@ def _check_gate_before_stage(
 @click.option("--model", default=None, help="Override Claude model")
 @click.option("--max-budget", type=float, default=None, help="USD budget cap")
 @click.option("--dry-run", is_flag=True, help="Print what each stage would do without executing")
+@click.option(
+    "--monitor",
+    "monitor_enabled",
+    is_flag=True,
+    default=False,
+    help="Run the bead/repo health monitor as a background thread alongside the pipeline.",
+)
 def run(
     specs: tuple[str, ...],
     repo: str | None,
@@ -6326,6 +6821,7 @@ def run(
     model: str | None,
     max_budget: float | None,
     dry_run: bool,
+    monitor_enabled: bool,
 ) -> None:
     """Run one or more pipeline stages for a milestone.
 
@@ -6489,6 +6985,27 @@ def run(
         _ensure_labels(repo_ref)
 
     # -----------------------------------------------------------------------
+    # Monitor thread — start before the pipeline loop when --monitor is set
+    # -----------------------------------------------------------------------
+    if monitor_enabled and not dry_run and repo_ref:
+        import threading
+
+        _monitor_store = make_bead_store(config, repo_ref)
+
+        def _monitor_thread() -> None:
+            monitor.run_monitor(
+                _monitor_store,
+                repo_ref,
+                once=False,
+                interval=monitor.MONITOR_INTERVAL_SECONDS,
+                dry_run=False,
+            )
+
+        _mt = threading.Thread(target=_monitor_thread, daemon=True, name="brimstone-monitor")
+        _mt.start()
+        click.echo("[monitor] background health monitor started", err=True)
+
+    # -----------------------------------------------------------------------
     # Campaign bead — track multi-milestone progress
     # -----------------------------------------------------------------------
     is_campaign = len(effective_milestones) > 1
@@ -6530,6 +7047,15 @@ def run(
     }
 
     for i, ms in enumerate(effective_milestones):
+        # Fast-path: skip milestones that were already fully shipped in a prior session.
+        if (
+            is_campaign
+            and campaign_store is not None
+            and campaign_bead.statuses.get(ms) == "shipped"
+        ):
+            click.echo(f"[campaign] {ms} already shipped — skipping.", err=True)
+            continue
+
         for stage in stages:
             click.echo(f"\n── Stage: {stage} ({ms}) ──", err=True)
 
@@ -6587,11 +7113,13 @@ def run(
                             b.state in ("open", "claimed", "merge_ready") for b in _r_beads
                         )
                         # Guard: plan can file new research issues that have no beads yet.
-                        # If beads look complete, confirm no open GitHub issues exist.
-                        if _r_done and repo_ref:
-                            _gh_open = _list_all_open_issues_by_label(repo_ref, ms, RESEARCH_LABEL)
-                            if _gh_open:
-                                _r_done = False
+                        # Re-seed to pick up plan-filed issues, then re-check beads.
+                        if _r_done and repo_ref and _skip_store:
+                            _seed_work_beads(repo_ref, ms, RESEARCH_LABEL, "research", _skip_store)
+                            _r_beads = _skip_store.list_work_beads(milestone=ms, stage="research")
+                            _r_done = bool(_r_beads) and not any(
+                                b.state in ("open", "claimed", "merge_ready") for b in _r_beads
+                            )
                         if _r_done:
                             click.echo(
                                 f"[run] {stage} ({ms}): already complete, skipping", err=True
@@ -6623,7 +7151,7 @@ def run(
                             if _skip_store
                             else []
                         )
-                        if _i_beads:
+                        if _i_beads and not (_skip_store and _skip_store.scope_needs_rerun(ms)):
                             click.echo(
                                 f"[run] {stage} ({ms}): impl issues already exist, skipping",
                                 err=True,
@@ -6632,7 +7160,9 @@ def run(
 
                 # Gate check — only when prerequisite is not also in this run
                 if not dry_run:
-                    _check_gate_before_stage(stage, stages, repo_ref, ms, default_branch)
+                    _check_gate_before_stage(
+                        stage, stages, repo_ref, ms, default_branch, store=_skip_store
+                    )
 
                 if dry_run:
                     click.echo(f"[dry-run] would run {stage} for milestone={ms!r}", err=True)
@@ -6688,7 +7218,13 @@ def run(
                             err=True,
                         )
                         while True:
-                            open_count = _count_open_issues_by_label(repo_ref, ms, IMPL_LABEL)
+                            if _store is not None:
+                                _impl_beads = _store.list_work_beads(milestone=ms, stage="impl")
+                                open_count = sum(
+                                    1 for b in _impl_beads if b.state not in ("closed", "abandoned")
+                                )
+                            else:
+                                open_count = _count_open_issues_by_label(repo_ref, ms, IMPL_LABEL)
                             if open_count == 0:
                                 break
                             click.echo(
@@ -6898,10 +7434,53 @@ def status_cmd(repo: str | None) -> None:
         if raw_status == "shipped":
             click.echo(f"{connector} {ms}  [{status_upper}]")
         elif raw_status == "implementing":
-            open_count = _count_open_issues_by_label(repo_ref, ms, IMPL_LABEL)
-            total_count = _count_all_issues_by_label(repo_ref, ms, IMPL_LABEL)
+            _all_impl = store.list_work_beads(milestone=ms, stage="impl") if store else []
+            if _all_impl:
+                open_count = sum(1 for b in _all_impl if b.state not in ("closed", "abandoned"))
+                total_count = len(_all_impl)
+            else:
+                open_count = _count_open_issues_by_label(repo_ref, ms, IMPL_LABEL)
+                total_count = _count_all_issues_by_label(repo_ref, ms, IMPL_LABEL)
             click.echo(
                 f"{connector} {ms}  [{status_upper}  {open_count}/{total_count} issues open]"
             )
         else:
             click.echo(f"{connector} {ms}  [{status_upper}]")
+
+
+@brimstone.command("monitor")
+@click.option(
+    "--repo",
+    default=None,
+    help="Repository in owner/repo format. Inferred from git remote if omitted.",
+)
+@click.option(
+    "--once",
+    is_flag=True,
+    default=False,
+    help="Run one detection pass and exit instead of looping.",
+)
+@click.option(
+    "--interval",
+    default=monitor.MONITOR_INTERVAL_SECONDS,
+    show_default=True,
+    help="Seconds between detection passes (ignored when --once is set).",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Print anomalies to stdout without filing GitHub issues.",
+)
+def monitor_cmd(repo: str | None, once: bool, interval: int, dry_run: bool) -> None:
+    """Watch bead and repo state for aberrations and file bug issues."""
+    repo_ref = _resolve_repo(repo)
+    if not repo_ref:
+        raise click.UsageError(
+            "Could not determine repository. Pass --repo <owner/repo> or run from a git repo."
+        )
+
+    config = load_config(github_repo=repo_ref, target_repo=repo_ref)
+    store = make_bead_store(config, repo_ref)
+
+    monitor.run_monitor(store, repo_ref, once=once, interval=interval, dry_run=dry_run)

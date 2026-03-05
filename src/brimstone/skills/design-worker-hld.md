@@ -41,9 +41,37 @@ cat docs/specs/*.md
 cat CLAUDE.md 2>/dev/null || true
 ```
 
+### Step 1.5 — Read the Previous HLD (skip only for the very first milestone)
+
+```bash
+# List all existing design milestones in sorted order
+ls docs/design/ 2>/dev/null | sort -V
+
+# Read the most recent prior HLD
+cat docs/design/<previous-milestone>/HLD.md 2>/dev/null \
+  || echo "No prior HLD found — this is the first milestone."
+```
+
+You will integrate the prior HLD in Step 2.
+
 ### Step 2 — Write the HLD
 
 Create `docs/design/<milestone>/HLD.md` in the local checkout.
+
+**The HLD is a complete system snapshot, never a delta.**
+
+- **First milestone only** (no prior HLD exists): write from scratch using the sections below.
+- **All subsequent milestones**: read the previous HLD (Step 1.5), then produce a
+  **complete system snapshot** for the current version. Pull forward all retained
+  architecture, design decisions, module descriptions, cross-cutting concerns, and
+  data flow from the previous HLD. Integrate the new additions throughout.
+  A reader must be able to understand the entire current system from this document
+  alone — without consulting any prior version.
+
+**Common mistakes to avoid:**
+- Do NOT write "v0.2.0 adds X and Y" and stop — describe the full system at this version.
+- Do NOT omit foundational design decisions from earlier milestones; carry them forward.
+- Do NOT write the System Overview as a list of changes from the last version; describe the system as it exists now.
 
 The HLD must cover:
 

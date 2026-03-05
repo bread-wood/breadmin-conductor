@@ -283,6 +283,7 @@ class TestRunGates:
             return [MagicMock(state="open")] if kw.get("stage") == "impl" else []
 
         mock_store.list_work_beads.side_effect = _beads
+        mock_store.scope_needs_rerun.return_value = False  # scope already complete
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
@@ -418,6 +419,8 @@ class TestRunScopeStage:
 
     def test_impl_runs_when_impl_issues_exist(self, tmp_path: Path) -> None:
         calls: list[str] = []
+        mock_store = MagicMock()
+        mock_store.list_work_beads.return_value = [MagicMock()]  # impl bead exists → gate passes
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
@@ -425,7 +428,7 @@ class TestRunScopeStage:
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
                 patch("brimstone.cli._doc_exists_on_default_branch", return_value=True),
-                patch("brimstone.cli._count_open_issues_by_label", return_value=2),
+                patch("brimstone.cli.make_bead_store", return_value=mock_store),
                 patch(
                     "brimstone.cli.startup_sequence",
                     return_value=(object(), object(), object()),
@@ -552,13 +555,15 @@ class TestStageFlag:
     def test_stage_impl_invokes_impl_worker(self, tmp_path: Path) -> None:
         """--stage impl must invoke _run_impl_worker."""
         calls: list[str] = []
+        mock_store = MagicMock()
+        mock_store.list_work_beads.return_value = [MagicMock()]  # impl bead exists → gate passes
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
                 patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
-                patch("brimstone.cli._count_open_issues_by_label", return_value=2),
+                patch("brimstone.cli.make_bead_store", return_value=mock_store),
                 patch(
                     "brimstone.cli.startup_sequence",
                     return_value=(object(), object(), object()),
@@ -651,13 +656,15 @@ class TestStageFlag:
     def test_legacy_impl_flag_still_works(self, tmp_path: Path) -> None:
         """The deprecated --impl flag must still work as before."""
         calls: list[str] = []
+        mock_store = MagicMock()
+        mock_store.list_work_beads.return_value = [MagicMock()]  # impl bead exists → gate passes
 
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
                 patch("brimstone.cli._resolve_repo", return_value=_REPO),
                 patch("brimstone.cli._milestone_exists", return_value=True),
                 patch("brimstone.cli._get_default_branch_for_repo", return_value="main"),
-                patch("brimstone.cli._count_open_issues_by_label", return_value=2),
+                patch("brimstone.cli.make_bead_store", return_value=mock_store),
                 patch(
                     "brimstone.cli.startup_sequence",
                     return_value=(object(), object(), object()),
@@ -817,6 +824,10 @@ class TestCampaignLoop:
                     return 0  # campaign gate: impl is done, advance
             return 3  # completion check: issue exists, run the stage
 
+        # Store returned by startup_sequence — list_work_beads=[] exits campaign polling loop.
+        startup_seq_store = MagicMock()
+        startup_seq_store.list_work_beads.return_value = []
+
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
                 patch("brimstone.cli._resolve_repo", return_value=_REPO),
@@ -834,7 +845,7 @@ class TestCampaignLoop:
                 patch("brimstone.cli.make_bead_store") as mock_make_store,
                 patch(
                     "brimstone.cli.startup_sequence",
-                    return_value=(object(), object(), object()),
+                    return_value=(object(), object(), startup_seq_store),
                 ),
                 patch("brimstone.cli._run_plan", side_effect=fake_plan),
                 patch("brimstone.cli._run_research_worker", side_effect=fake_research),
@@ -842,10 +853,11 @@ class TestCampaignLoop:
                 patch("brimstone.cli._run_plan_issues", side_effect=fake_scope),
                 patch("brimstone.cli._run_impl_worker", side_effect=fake_impl),
             ):
-                # Mock the campaign bead store
+                # Mock the campaign bead store (used for CampaignBead r/w via make_bead_store).
                 mock_store = MagicMock()
                 mock_store.read_campaign_bead.return_value = None
                 mock_store.write_campaign_bead = MagicMock()
+                mock_store.list_work_beads.return_value = []
                 mock_make_store.return_value = mock_store
 
                 runner = CliRunner()
