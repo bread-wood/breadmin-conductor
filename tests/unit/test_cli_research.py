@@ -559,6 +559,7 @@ class TestRunResearchWorkerCompletionGate:
 
         with (
             patch("brimstone.cli._list_open_issues_by_label", return_value=[]),
+            patch("brimstone.cli._list_all_open_issues_by_label", return_value=[]),
             patch("brimstone.cli._run_completion_gate") as mock_gate,
             patch("brimstone.cli.logger.log_conductor_event"),
             patch("brimstone.cli.session.save"),
@@ -583,6 +584,7 @@ class TestRunResearchWorkerCompletionGate:
 
         with (
             patch("brimstone.cli._list_open_issues_by_label", return_value=open_issues),
+            patch("brimstone.cli._list_all_open_issues_by_label", return_value=open_issues),
             patch("brimstone.cli._classify_blocking_issues", return_value=([], open_issues)),
             patch("brimstone.cli._run_completion_gate") as mock_gate,
             patch("brimstone.cli.logger.log_conductor_event"),

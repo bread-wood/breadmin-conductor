@@ -880,6 +880,40 @@ def _list_open_issues_by_label(repo: str, milestone: str, label: str) -> list[di
     ]
 
 
+def _list_all_open_issues_by_label(repo: str, milestone: str, label: str) -> list[dict[str, Any]]:
+    """Return ALL open issues for a stage label — including in-progress ones.
+
+    Unlike ``_list_open_issues_by_label``, this does NOT filter by assignee or
+    ``in-progress`` label. Used by progress gates that need to block until every
+    issue of a stage is actually closed (merged), not just until they've been
+    claimed and dispatched.
+    """
+    result = _gh(
+        [
+            "issue",
+            "list",
+            "--state",
+            "open",
+            "--label",
+            label,
+            "--milestone",
+            milestone,
+            "--json",
+            "number,title,body,labels,assignees,milestone",
+            "--limit",
+            "200",
+        ],
+        repo=repo,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+
 def _seed_work_beads(
     repo: str,
     milestone: str,
@@ -2162,9 +2196,50 @@ def _run_research_worker(
                         dry_run=False,
                     )
                     return True
+                # All blocking beads are in merge_ready state — their PRs are
+                # queued but not yet merged. Drain the merge queue now so the
+                # research loop doesn't stall out and exit prematurely.
+                if all(b.state == "merge_ready" for b in blocking):
+                    _process_merge_queue(
+                        repo=repo,
+                        config=config,
+                        checkpoint=checkpoint,
+                        store=store,
+                        default_branch=default_branch,
+                        repo_root=repo_root,
+                    )
+                    # Re-check after draining
+                    all_beads = store.list_work_beads(milestone=milestone, stage="research")
+                    open_beads = [b for b in all_beads if b.state not in ("closed", "abandoned")]
+                    if not open_beads:
+                        _run_completion_gate(
+                            repo=repo,
+                            milestone=milestone,
+                            open_issues=[],
+                            config=config,
+                            checkpoint=checkpoint,
+                            dry_run=False,
+                        )
+                        return True
+                    blocking = [b for b in open_beads if not b.deferred]
+                    if not blocking:
+                        deferred_issues = [
+                            {"number": b.issue_number, "title": b.title} for b in open_beads
+                        ]
+                        _run_completion_gate(
+                            repo=repo,
+                            milestone=milestone,
+                            open_issues=deferred_issues,
+                            config=config,
+                            checkpoint=checkpoint,
+                            dry_run=False,
+                        )
+                        return True
                 return False
-            # Fallback: no bead store — use GitHub-based completion check
-            open_issues = _list_open_issues_by_label(repo, milestone, RESEARCH_LABEL)
+            # Fallback: no bead store — use GitHub-based completion check.
+            # Use _list_all_open_issues_by_label so in-progress issues (claimed,
+            # PR open but not merged) are not silently excluded.
+            open_issues = _list_all_open_issues_by_label(repo, milestone, RESEARCH_LABEL)
             if not open_issues:
                 _run_completion_gate(
                     repo=repo,
@@ -4483,7 +4558,11 @@ def _run_design_worker(
     # Gate 1: No blocking research issues may remain                     #
     # ------------------------------------------------------------------ #
     if not dry_run:
-        open_research_issues = _list_open_issues_by_label(repo, milestone, RESEARCH_LABEL)
+        # Use _list_all_open_issues_by_label so in-progress research issues (those
+        # with open PRs that haven't merged yet) are included in the blocking check.
+        # _list_open_issues_by_label filters them out, making the gate a no-op when
+        # all research is claimed but nothing has merged yet.
+        open_research_issues = _list_all_open_issues_by_label(repo, milestone, RESEARCH_LABEL)
         blocking, _ = _classify_blocking_issues(
             open_research_issues, repo, milestone, config, checkpoint, store=store
         )

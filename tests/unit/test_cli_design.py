@@ -124,7 +124,7 @@ def make_design_issue(number: int, title: str) -> dict:
 
 _DESIGN_PATCHES = {
     "count_research": "brimstone.cli._count_open_issues_by_label",
-    "list_research": "brimstone.cli._list_open_issues_by_label",
+    "list_research": "brimstone.cli._list_all_open_issues_by_label",
     "classify_blocking": "brimstone.cli._classify_blocking_issues",
     "default_branch": "brimstone.cli._get_default_branch_for_repo",
     "repo_root": "brimstone.cli._get_repo_root",

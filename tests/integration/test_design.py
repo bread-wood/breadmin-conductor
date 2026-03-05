@@ -45,7 +45,7 @@ class TestDesignWorkerGates:
         with (
             patch("brimstone.cli._get_default_branch_for_repo", return_value="mainline"),
             patch(
-                "brimstone.cli._list_open_issues_by_label",
+                "brimstone.cli._list_all_open_issues_by_label",
                 return_value=[make_issue(1, "Blocking research")],
             ),
         ):
@@ -66,7 +66,8 @@ class TestDesignWorkerGates:
 
         with (
             patch("brimstone.cli._get_default_branch_for_repo", return_value="mainline"),
-            patch("brimstone.cli._list_open_issues_by_label", side_effect=[[], [hld]]),
+            patch("brimstone.cli._list_all_open_issues_by_label", return_value=[]),
+            patch("brimstone.cli._list_open_issues_by_label", return_value=[hld]),
             patch("brimstone.cli._doc_exists_on_default_branch", return_value=False),
             patch("brimstone.cli._claim_issue"),
             patch("brimstone.cli._unclaim_issue"),
@@ -105,10 +106,11 @@ class TestDesignWorkerHLDPhase:
         # (LLD recovery checks will not be called since lld_issues is empty)
         with (
             patch("brimstone.cli._get_default_branch_for_repo", return_value="mainline"),
-            # Gate 1 research → []; Phase 1 design → [hld]; Phase 2 LLD → []
+            patch("brimstone.cli._list_all_open_issues_by_label", return_value=[]),
+            # Phase 1 design → [hld]; Phase 2 LLD → []
             patch(
                 "brimstone.cli._list_open_issues_by_label",
-                side_effect=[[], [hld], []],
+                side_effect=[[hld], []],
             ),
             patch(
                 "brimstone.cli._doc_exists_on_default_branch",
@@ -150,7 +152,8 @@ class TestDesignWorkerHLDPhase:
         # doc_exists: HLD already on branch (Phase 1 skip + Gate 2 pass)
         with (
             patch("brimstone.cli._get_default_branch_for_repo", return_value="mainline"),
-            # Call 1: Gate 1 research → []; Gate 2 passes (HLD on branch); Call 2: Phase 2 LLD → []
+            patch("brimstone.cli._list_all_open_issues_by_label", return_value=[]),
+            # Gate 2 passes (HLD on branch); Phase 2 LLD → []
             patch("brimstone.cli._list_open_issues_by_label", return_value=[]),
             patch("brimstone.cli._doc_exists_on_default_branch", return_value=True),
             patch("brimstone.cli._dispatch_design_agent", side_effect=spy_dispatch),
@@ -189,8 +192,9 @@ class TestDesignWorkerLLDPhase:
         # 4. LLD recovery for "runner"→ False (not yet merged)
         with (
             patch("brimstone.cli._get_default_branch_for_repo", return_value="mainline"),
-            # Call 1: Gate 1 research → []; Call 2: Phase 2 LLD listing → llds
-            patch("brimstone.cli._list_open_issues_by_label", side_effect=[[], llds]),
+            patch("brimstone.cli._list_all_open_issues_by_label", return_value=[]),
+            # Phase 2 LLD listing → llds
+            patch("brimstone.cli._list_open_issues_by_label", return_value=llds),
             patch(
                 "brimstone.cli._doc_exists_on_default_branch",
                 side_effect=[True, True, False, False],
