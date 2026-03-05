@@ -135,40 +135,19 @@ Writers must never open `cost.jsonl` with mode `"w"` (truncate). The only permit
 
 ### 3.4 Subscription Mode: Cost Estimation
 
-When `auth_mode` is `subscription`, `result.total_cost_usd` is `null` or `0`. In this case `total_cost_usd` must be computed from token counts using the following formula (prices as of March 2026 for `claude-sonnet-4-6`):
+When `auth_mode` is `subscription`, `result.total_cost_usd` is `null` or `0`. In this case `total_cost_usd` is computed from token counts via `_estimate_cost_usd(usage, model)`. Pricing is generation-aware: Opus 4.5/4.6 is $5/$25 (not the legacy $15/$75), and Haiku 4.5 is $1/$5 (not the older $0.80/$4).
 
-```python
-SONNET_PRICES = {
-    "input_per_mtok": 3.00,
-    "output_per_mtok": 15.00,
-    "cache_write_per_mtok": 3.75,   # 125% of input
-    "cache_read_per_mtok": 0.30,    # 10% of input
-}
-OPUS_MULTIPLIER = 5.0  # claude-opus-4-6 is ~5x Sonnet 4.6
+**Per-model-generation pricing (March 2026, USD per million tokens):**
 
+| Model key | Model strings matched | Input | Output | Cache write | Cache read |
+|-----------|----------------------|-------|--------|-------------|------------|
+| `haiku-4` | `haiku` + `4-5`/`4-6` | $1.00 | $5.00 | $1.25 | $0.10 |
+| `haiku-3` | `haiku` (older) | $0.80 | $4.00 | $1.00 | $0.08 |
+| `sonnet` | `sonnet` (any gen) | $3.00 | $15.00 | $3.75 | $0.30 |
+| `opus-4-5` | `opus` + `4-5`/`4-6` | $5.00 | $25.00 | $6.25 | $0.50 |
+| `opus-legacy` | `opus` (older) | $15.00 | $75.00 | $18.75 | $1.50 |
 
-def _estimate_cost_usd(usage: dict, model: str) -> float:
-    p = SONNET_PRICES
-    mult = OPUS_MULTIPLIER if "opus" in model.lower() else 1.0
-    return round((
-        usage.get("input_tokens", 0) / 1_000_000 * p["input_per_mtok"]
-        + usage.get("output_tokens", 0) / 1_000_000 * p["output_per_mtok"]
-        + usage.get("cache_creation_input_tokens", 0) / 1_000_000 * p["cache_write_per_mtok"]
-        + usage.get("cache_read_input_tokens", 0) / 1_000_000 * p["cache_read_per_mtok"]
-    ) * mult, 6)
-```
-
-If the model string is unrecognized and a multiplier cannot be determined, write `total_cost_usd: null` and log a warning to the conductor log.
-
-**Prompt cache pricing tiers (as of March 2026):**
-
-| Token type | Sonnet 4.6 price per MTok | Notes |
-|------------|--------------------------|-------|
-| Input (regular) | $3.00 | Full billing rate |
-| Output | $15.00 | Full billing rate |
-| Cache write (`cache_creation_input_tokens`) | $3.75 | 125% of input (cache population overhead) |
-| Cache read (`cache_read_input_tokens`) | $0.30 | 10% of input (cache hit discount) |
-| Opus 4.6 multiplier | ~5x | Apply across all token types |
+If the model string is unrecognized, write `total_cost_usd: null` and emit a warning.
 
 Cache read tokens are the most cost-effective. Long-running agents that re-read the same
 CLAUDE.md and skill files on every turn benefit most from prompt caching. Cost estimates

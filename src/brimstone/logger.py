@@ -68,9 +68,17 @@ BRIMSTONE_EVENT_TYPES: frozenset[str] = frozenset(
     }
 )
 
-# Per-model-family pricing (March 2026, USD per million tokens).
+# Per-model-generation pricing (March 2026, USD per million tokens).
+# Opus 4.5/4.6 repriced at $5/$25 (down from $15/$75 for Opus 3).
+# Haiku 4.5 at $1/$5 (up from $0.80/$4 for Haiku 3.5).
 _MODEL_PRICES: dict[str, dict[str, float]] = {
-    "haiku": {
+    "haiku-4": {
+        "input_per_mtok": 1.00,
+        "output_per_mtok": 5.00,
+        "cache_write_per_mtok": 1.25,
+        "cache_read_per_mtok": 0.10,
+    },
+    "haiku-3": {
         "input_per_mtok": 0.80,
         "output_per_mtok": 4.00,
         "cache_write_per_mtok": 1.00,
@@ -82,7 +90,13 @@ _MODEL_PRICES: dict[str, dict[str, float]] = {
         "cache_write_per_mtok": 3.75,
         "cache_read_per_mtok": 0.30,
     },
-    "opus": {
+    "opus-4-5": {
+        "input_per_mtok": 5.00,
+        "output_per_mtok": 25.00,
+        "cache_write_per_mtok": 6.25,
+        "cache_read_per_mtok": 0.50,
+    },
+    "opus-legacy": {
         "input_per_mtok": 15.00,
         "output_per_mtok": 75.00,
         "cache_write_per_mtok": 18.75,
@@ -150,11 +164,19 @@ def _estimate_cost_usd(usage: dict, model: str) -> float | None:
     """
     model_lower = model.lower()
     if "opus" in model_lower:
-        p = _MODEL_PRICES["opus"]
+        # claude-opus-4-5 and claude-opus-4-6 are $5/$25; older opus is $15/$75
+        if "4-5" in model_lower or "4-6" in model_lower:
+            p = _MODEL_PRICES["opus-4-5"]
+        else:
+            p = _MODEL_PRICES["opus-legacy"]
     elif "sonnet" in model_lower:
         p = _MODEL_PRICES["sonnet"]
     elif "haiku" in model_lower:
-        p = _MODEL_PRICES["haiku"]
+        # claude-haiku-4-5 is $1/$5; haiku-3.5 and earlier is $0.80/$4
+        if "4-5" in model_lower or "4-6" in model_lower:
+            p = _MODEL_PRICES["haiku-4"]
+        else:
+            p = _MODEL_PRICES["haiku-3"]
     else:
         return None
 
