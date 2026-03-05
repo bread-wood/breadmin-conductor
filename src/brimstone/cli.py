@@ -3153,6 +3153,27 @@ def _process_merge_queue(
     """
     checkpoint_path = config.checkpoint_dir.expanduser() / "current.json"
     queue = store.read_merge_queue()
+
+    # Self-heal: re-enqueue any merge_ready PRBeads that are not in the queue.
+    # This recovers from sessions that updated bead state but crashed or exited
+    # before writing the merge queue entry (e.g. temp repo_root was cleaned up).
+    queued_pr_numbers = {e.pr_number for e in queue.queue}
+    orphaned = [
+        b for b in store.list_pr_beads(state="merge_ready") if b.pr_number not in queued_pr_numbers
+    ]
+    if orphaned:
+        now_str = datetime.now(UTC).isoformat()
+        for pr_bead in orphaned:
+            queue.queue.append(
+                MergeQueueEntry(
+                    pr_number=pr_bead.pr_number,
+                    issue_number=pr_bead.issue_number,
+                    branch=pr_bead.branch,
+                    enqueued_at=now_str,
+                )
+            )
+        store.write_merge_queue(queue)
+
     if not queue.queue:
         return
 
