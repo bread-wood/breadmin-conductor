@@ -4039,6 +4039,7 @@ def _ensure_impl_scaffold(
     repo: str,
     milestone: str,
     store: BeadStore,
+    default_branch: str = "main",
 ) -> int | None:
     """Ensure a scaffold impl issue exists and all other impl beads block on it.
 
@@ -4046,8 +4047,13 @@ def _ensure_impl_scaffold(
     uses its number. Otherwise creates one. Then ensures every non-scaffold impl
     bead has the scaffold issue number in its ``blocked_by`` list.
 
+    Skips scaffold creation entirely when ``pyproject.toml`` already exists on
+    the default branch — the project is already set up (v0.2.0+).
+
     Returns the scaffold issue number, or None on failure.
     """
+    if _doc_exists_on_default_branch(repo, "pyproject.toml", default_branch):
+        return None
     result = _gh(
         [
             "issue",
@@ -4200,7 +4206,9 @@ def _run_impl_worker(
         )
         _startup_dep_checks(_list_open_issues_by_label(repo, milestone, IMPL_LABEL), repo)
         if store is not None:
-            _ensure_impl_scaffold(repo=repo, milestone=milestone, store=store)
+            _ensure_impl_scaffold(
+                repo=repo, milestone=milestone, store=store, default_branch=default_branch
+            )
 
     if dry_run:
         if store is not None:
