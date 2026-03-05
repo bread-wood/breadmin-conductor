@@ -3,6 +3,34 @@
 `brimstone` is a Python CLI package. Source lives in `src/brimstone/`.
 Tests live in `tests/`. Default branch: `mainline`.
 
+## Bead Architecture — Source of Truth
+
+**Beads are the canonical source of truth for all task accounting.** GitHub issues and PRs are inputs/outputs; beads are the internal ledger.
+
+### Bead types
+
+| File | Type | Purpose |
+|------|------|---------|
+| `~/.brimstone/beads/<owner>/<repo>/work/<N>.json` | `WorkBead` | Issue lifecycle: `open → claimed → merge_ready → closed` (or `abandoned`) |
+| `~/.brimstone/beads/<owner>/<repo>/prs/pr-<N>.json` | `PRBead` | PR + feedback triage state |
+| `~/.brimstone/beads/<owner>/<repo>/merge-queue.json` | `MergeQueue` | Sequential merge ordering |
+| `~/.brimstone/beads/<owner>/<repo>/campaign.json` | `CampaignBead` | Multi-milestone campaign progress |
+
+### Invariants
+
+1. **Beads lead, GitHub follows.** When checking what work exists, query beads first. GitHub issue state is eventually consistent; bead state is immediately consistent.
+2. **Every tracked issue has a bead.** Before dispatching any agent, a `WorkBead` must exist with `state="open"`. Create the bead before (or atomically with) the GitHub issue.
+3. **Dedup against beads, not GitHub issues.** When checking if a work item already exists (e.g. LLD for a module), check `store.list_work_beads()` — not `gh issue list`. GitHub may have stale, closed, or cross-milestone matches.
+4. **Stage gates use beads.** Skip a stage only when all beads for that stage/milestone have `state` in `{"closed", "abandoned"}`. Do not rely on GitHub issue counts alone.
+5. **Abandoned beads close PRs.** When a bead transitions to `abandoned`, any open PR for that branch must be closed. Do not leave open PRs for abandoned beads.
+6. **`in-progress` label mirrors `claimed` bead state.** A GitHub issue carries `in-progress` if and only if its bead is `claimed`. On startup, reconcile: remove stale `in-progress` labels from issues whose bead is not `claimed`.
+
+### When to create beads
+
+- **Research/impl issues**: seeded in bulk by `_seed_work_beads` at stage startup.
+- **Design LLD issues**: created by `_run_design_worker` Phase 2 self-heal — parse `### Module:` headings from the merged HLD, call `_file_design_issue_if_missing` for each missing module, then `_seed_work_beads` to create the bead. Always check existing beads first, not GitHub issues.
+- **Never** create a bead for an issue that has `state="closed"` or `state="abandoned"` — those are terminal.
+
 ## Module Isolation
 
 One agent per module at a time. Each agent may only modify files within its assigned module:
