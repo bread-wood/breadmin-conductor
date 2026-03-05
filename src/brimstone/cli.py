@@ -3924,6 +3924,22 @@ def _ensure_impl_scaffold(
         None,
     )
     if scaffold is None:
+        # Ensure `infra` label exists (may be absent in repos initialized before it
+        # was added to _REQUIRED_LABELS).
+        _gh(
+            [
+                "label",
+                "create",
+                "infra",
+                "--color",
+                "bfd4f2",
+                "--description",
+                "Infrastructure and tooling work",
+                "--force",
+            ],
+            repo=repo,
+            check=False,
+        )
         create = _gh(
             [
                 "issue",
@@ -5274,6 +5290,7 @@ _REQUIRED_LABELS: list[tuple[str, str, str]] = [
     ("wont-research", "eeeeee", "Closed by orchestrator — out of scope or duplicate"),
     ("pipeline", "006b75", "Pipeline stage transition tracking"),
     ("bug", "ee0701", "Defect filed by QA or reported post-release"),
+    ("infra", "bfd4f2", "Infrastructure and tooling work"),
 ]
 
 
