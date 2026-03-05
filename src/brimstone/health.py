@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
+from brimstone.beads import BeadStore, make_bead_store
 from brimstone.config import Config
 from brimstone.session import Checkpoint, is_backing_off
 
@@ -466,116 +467,59 @@ def _check_worktrees() -> CheckResult:
 
 
 def _check_orphaned_issues(config: Config) -> CheckResult:
-    """Check 6: No stale in-progress issues."""
-    max_orphaned: int = getattr(config, "max_orphaned_issues", 5)
+    """Check 6: Claimed beads with no active PR bead.
 
-    # Get in-progress issues
-    issues_result = subprocess.run(
-        [
-            "gh",
-            "issue",
-            "list",
-            "--label",
-            "in-progress",
-            "--state",
-            "open",
-            "--json",
-            "number,title",
-            "--limit",
-            "100",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if issues_result.returncode != 0:
+    Beads are the source of truth — no GitHub API is consulted.
+    Claimed beads without a PR bead are always recoverable: ``_resume_stale_issues``
+    resets them to ``open`` on the next run. This check only warns; it never fails.
+    """
+    github_repo: str | None = getattr(config, "github_repo", None)
+    if not github_repo:
         return CheckResult(
             name="No stale in-progress issues",
-            status="warn",
-            message="Could not list in-progress issues via gh.",
-            remediation=None,
+            status="pass",
+            message="No bead store configured — check skipped.",
         )
 
     try:
-        issues: list[dict] = json.loads(issues_result.stdout)
-    except json.JSONDecodeError:
+        store: BeadStore = make_bead_store(config, github_repo)
+    except Exception as exc:
         return CheckResult(
             name="No stale in-progress issues",
             status="warn",
-            message="Could not parse gh issue list output.",
-            remediation=None,
+            message=f"Could not open bead store: {exc}",
         )
 
-    if not issues:
+    claimed_beads = store.list_work_beads(state="claimed")
+    if not claimed_beads:
         return CheckResult(
             name="No stale in-progress issues",
             status="pass",
-            message="No in-progress issues found.",
+            message="No claimed beads found.",
         )
 
-    # Get open PRs to cross-reference by branch naming convention
-    pr_result = subprocess.run(
-        [
-            "gh",
-            "pr",
-            "list",
-            "--state",
-            "open",
-            "--json",
-            "number,headRefName",
-            "--limit",
-            "100",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    open_prs: list[dict] = []
-    if pr_result.returncode == 0:
-        try:
-            open_prs = json.loads(pr_result.stdout)
-        except json.JSONDecodeError:
-            pass
+    issues_with_pr_bead: set[int] = {
+        pb.issue_number
+        for pb in store.list_pr_beads()
+        if pb.state not in ("merged", "abandoned")
+    }
 
-    # Build set of issue numbers that have a corresponding open PR
-    issues_with_prs: set[int] = set()
-    for pr in open_prs:
-        head_ref: str = pr.get("headRefName", "")
-        parts = head_ref.split("-", 1)
-        if parts[0].isdigit():
-            issues_with_prs.add(int(parts[0]))
-
-    # Orphaned = in-progress label, no open PR
-    orphaned = [issue for issue in issues if issue["number"] not in issues_with_prs]
-    count = len(orphaned)
-
-    if count == 0:
+    orphaned = [b for b in claimed_beads if b.issue_number not in issues_with_pr_bead]
+    if not orphaned:
         return CheckResult(
             name="No stale in-progress issues",
             status="pass",
-            message=f"{len(issues)} in-progress issue(s) all have open PRs.",
+            message=f"{len(claimed_beads)} claimed bead(s) all have active PR beads.",
         )
 
-    if count > max_orphaned:
-        return CheckResult(
-            name="No stale in-progress issues",
-            status="fail",
-            message=(
-                f"Too many orphaned in-progress issues: {count} with no open PR "
-                f"(threshold: {max_orphaned})."
-            ),
-            remediation=(
-                f"Too many orphaned in-progress issues ({count} > {max_orphaned}). "
-                "Clear stale labels before starting a new run."
-            ),
-        )
-
-    issue_list = ", ".join(f"#{i['number']} '{i['title']}'" for i in orphaned)
+    issue_list = ", ".join(f"#{b.issue_number}" for b in orphaned)
     return CheckResult(
         name="No stale in-progress issues",
         status="warn",
-        message=f"{count} in-progress issue(s) with no open PR: {issue_list}.",
+        message=f"{len(orphaned)} claimed bead(s) with no PR bead: {issue_list}.",
         remediation=(
-            f"In-progress issues with no open PR: {issue_list}. "
-            "Inspect and remove the 'in-progress' label if stale."
+            "These beads will be reset to 'open' automatically when `brimstone run` resumes. "
+            "No manual action needed."
         ),
     )
 

@@ -2203,6 +2203,8 @@ class TestEndOfRunCostSummary:
         object.__setattr__(config, "log_dir", log_dir)
         checkpoint = make_checkpoint()
 
+        mock_store = MagicMock()
+        mock_store.list_work_beads.return_value = [MagicMock()]  # non-empty → gate passes
         with patch.dict("os.environ", MINIMAL_ENV, clear=False):
             with (
                 patch("brimstone.cli._resolve_repo", return_value=_REPO),
@@ -2213,6 +2215,7 @@ class TestEndOfRunCostSummary:
                 ),
                 patch("brimstone.cli._count_open_issues_by_label", return_value=2),
                 patch("brimstone.cli._ensure_labels"),
+                patch("brimstone.cli.make_bead_store", return_value=mock_store),
                 patch(
                     "brimstone.cli.startup_sequence",
                     return_value=(config, checkpoint, MagicMock()),

@@ -903,8 +903,8 @@ class TestRunResearchWorkerRateLimit:
 
 
 class TestRunResearchWorkerErrorHandling:
-    def test_escalates_after_max_retries(self, tmp_path: Path) -> None:
-        """After MAX_RETRIES failures, a human_escalate event is logged."""
+    def test_nuclear_restart_after_max_retries(self, tmp_path: Path) -> None:
+        """After MAX_RETRIES failures, agent_nuclear_restart is logged (not human_escalate)."""
         config = make_config()
         object.__setattr__(config, "checkpoint_dir", tmp_path)
         object.__setattr__(config, "log_dir", tmp_path / "logs")
@@ -916,7 +916,7 @@ class TestRunResearchWorkerErrorHandling:
         dispatch_calls = {"count": 0}
 
         def open_issues_side_effect(repo, milestone, label):
-            # Return the issue enough times to exhaust retries, then stop
+            # Return the issue enough times to trigger one restart cycle, then stop
             dispatch_calls["count"] += 1
             if dispatch_calls["count"] <= 4:
                 return [blocking_issue]
@@ -946,6 +946,7 @@ class TestRunResearchWorkerErrorHandling:
             patch("brimstone.cli._unclaim_issue"),
             patch("brimstone.cli._create_worktree", return_value="/tmp/fake-worktree"),
             patch("brimstone.cli._remove_worktree"),
+            patch("brimstone.cli._delete_remote_branch"),
             patch("brimstone.cli.runner.run", return_value=error_result),
             patch("brimstone.cli._run_completion_gate"),
             patch("brimstone.cli.build_subprocess_env", return_value={}),
@@ -959,6 +960,68 @@ class TestRunResearchWorkerErrorHandling:
                 checkpoint=checkpoint,
             )
 
+        assert "agent_nuclear_restart" in logged_events
+        assert "human_escalate" not in logged_events
+
+    def test_escalates_after_max_retries(self, tmp_path: Path) -> None:
+        """After 2 nuclear restarts + final MAX_RETRIES failures, human_escalate is logged."""
+        config = make_config()
+        object.__setattr__(config, "checkpoint_dir", tmp_path)
+        object.__setattr__(config, "log_dir", tmp_path / "logs")
+        checkpoint = make_checkpoint()
+
+        blocking_issue = make_issue(1, body="[BLOCKS_IMPL]")
+        error_result = make_run_result(is_error=True, subtype="error_during_execution")
+
+        dispatch_calls = {"count": 0}
+
+        def open_issues_side_effect(repo, milestone, label):
+            # Return the issue enough times to exhaust 2 restarts (3 × MAX_RETRIES = 9), then stop
+            dispatch_calls["count"] += 1
+            if dispatch_calls["count"] <= 12:
+                return [blocking_issue]
+            return []
+
+        classify_calls = {"count": 0}
+
+        def classify_side_effect(
+            open_issues, repo, milestone, config, checkpoint, dry_run=False, store=None
+        ):
+            classify_calls["count"] += 1
+            if classify_calls["count"] <= 12:
+                return ([blocking_issue], [])
+            return ([], [])
+
+        logged_events: list[str] = []
+
+        def capture_event(**kwargs):
+            logged_events.append(kwargs.get("event_type", ""))
+
+        with (
+            patch("brimstone.cli._list_open_issues_by_label", side_effect=open_issues_side_effect),
+            patch("brimstone.cli._classify_blocking_issues", side_effect=classify_side_effect),
+            patch("brimstone.cli._filter_unblocked", return_value=[blocking_issue]),
+            patch("brimstone.cli._sort_issues", return_value=[blocking_issue]),
+            patch("brimstone.cli._claim_issue"),
+            patch("brimstone.cli._unclaim_issue"),
+            patch("brimstone.cli._create_worktree", return_value="/tmp/fake-worktree"),
+            patch("brimstone.cli._remove_worktree"),
+            patch("brimstone.cli._delete_remote_branch"),
+            patch("brimstone.cli._exhaust_issue"),
+            patch("brimstone.cli.runner.run", return_value=error_result),
+            patch("brimstone.cli._run_completion_gate"),
+            patch("brimstone.cli.build_subprocess_env", return_value={}),
+            patch("brimstone.cli.logger.log_conductor_event", side_effect=capture_event),
+            patch("brimstone.cli.session.save"),
+        ):
+            _run_research_worker(
+                repo="owner/repo",
+                milestone="MVP Research",
+                config=config,
+                checkpoint=checkpoint,
+            )
+
+        assert "agent_nuclear_restart" in logged_events
         assert "human_escalate" in logged_events
 
     def test_unclaims_issue_on_error(self, tmp_path: Path) -> None:

@@ -70,17 +70,39 @@ gh issue list --state closed --milestone "<milestone>" --label "stage/impl" --li
   --json number,title,labels --repo <owner>/<repo>
 ```
 
-Build a set of normalized titles to skip during Step 3.
+Build **two** skip sets from all returned issues (open + closed):
 
-### Step 3 — File Scaffold Issue First
+1. **Normalized titles** — lowercase the title, strip all punctuation and the milestone
+   suffix (e.g. `" (v0.3.0)"`), collapse whitespace. If a proposed title normalizes to
+   the same string as an existing issue, skip it.
 
-Before planning any module-level impl issues, always file a project scaffold issue that
-covers shared project-wide files. This **must** be filed as the very first issue and all
-other impl issues must depend on it.
+2. **Covered modules** — extract the module name from each existing issue title.
+   Any word that matches a module name from the LLD list (e.g. `lexer`, `parser`,
+   `evaluator`, `errors`, `cli`) counts as "covered".
+   If the module you are about to file an issue for is already covered by any existing
+   `stage/impl` issue (regardless of title format), **skip it entirely**.
+
+A proposed issue is skipped if **either** condition matches.
+This prevents duplicate module issues even when title phrasing differs between runs.
+
+### Step 3 — File Scaffold Issue First (initial milestone only)
+
+**First, check whether the project is already bootstrapped:**
+```bash
+gh api repos/<owner>/<repo>/contents/pyproject.toml 2>/dev/null && echo EXISTS || echo MISSING
+```
+
+If `pyproject.toml` **already exists** on the default branch, the project is already
+scaffolded from a prior milestone. **Skip this entire step** — do not file a scaffold
+issue, do not create scaffold dependencies. Proceed directly to Step 3b.
+
+If `pyproject.toml` is **missing**, file a scaffold issue as the very first issue.
+All other impl issues must depend on it.
 
 **Why:** Impl workers run in parallel. If each worker independently creates `pyproject.toml`
 or `src/<pkg>/__init__.py`, every PR will have merge conflicts. The scaffold issue claims
-these shared files so parallel workers never touch them.
+these shared files so parallel workers never touch them. On subsequent milestones the
+scaffold already exists — filing it again wastes an agent run and produces a no-op PR.
 
 File the scaffold issue:
 ```bash
@@ -124,8 +146,11 @@ EOF
 )"
 ```
 
-Record the scaffold issue number. **Every other impl issue filed in Step 3 must include
+Record the scaffold issue number. **Every other impl issue filed in Step 3b must include
 `Depends on: #<scaffold-issue>` in its body.**
+
+If Step 3 was skipped (project already bootstrapped), do **not** add scaffold dependencies
+to any issue — there is no scaffold issue for this milestone.
 
 ### Step 3b — Plan Module Implementation Issues
 
@@ -135,19 +160,17 @@ For each logical unit of work needed to implement what the design docs specify:
    Each issue must be scoped to exactly one module from the module isolation table.
    One issue per logical unit per module.
 
-2. **Write acceptance criteria** — concrete, testable, binary conditions for "done".
-   Use "must" language only; avoid "should" and "might".
-   At least two criteria per issue.
+2. **Write acceptance criteria** — 2–4 binary, observable conditions for "done".
+   These describe external behaviour changes, not implementation steps.
+   Do NOT copy test cases, diffs, or function signatures from the LLD.
 
-3. **Write test requirements** — what unit tests must exist, what integration tests (if any).
-   Reference specific function or class names where the design doc names them.
-
-4. **Identify dependencies** — which other impl issues (by title or anticipated number)
+3. **Identify dependencies** — which other impl issues (by title or anticipated number)
    must complete before this one can start?
-   **Every module issue must depend on the scaffold issue filed in Step 3 at minimum.**
+   **If a scaffold issue was filed in Step 3, every module issue must depend on it.**
+   If Step 3 was skipped (project already bootstrapped), do not add scaffold dependencies.
    Check for circular dependencies before proceeding.
 
-5. **Assign label** — use the appropriate `feat:*` label from CLAUDE.md:
+4. **Assign label** — use the appropriate `feat:*` label from CLAUDE.md:
    - `feat:config` — `src/brimstone/config.py`
    - `feat:runner` — `src/brimstone/runner.py`, `src/brimstone/session.py`
    - `feat:health` — `src/brimstone/health.py`
@@ -155,8 +178,11 @@ For each logical unit of work needed to implement what the design docs specify:
    - `feat:cli` — `src/brimstone/cli.py`, `src/brimstone/skills/`
    - `infra` — `pyproject.toml`, `.github/`, `CLAUDE.md`, `README.md`
 
-6. **Skip if duplicate** — if a normalized version of the proposed title matches an existing
-   issue title, log the skip and move on.
+5. **Skip if duplicate** — skip the issue if ANY of the following is true:
+   - A normalized version of the proposed title matches an existing issue title.
+   - The module this issue targets is already covered by any existing `stage/impl`
+     issue for this milestone (check the "covered modules" set from Step 2).
+   Log the skip reason and move on. **Never file two issues for the same module.**
 
 If `--dry-run` is set, print each planned issue (title, label, scope, criteria summary, deps)
 to stdout and STOP — do not call `gh issue create`.
@@ -165,35 +191,30 @@ Otherwise, file each issue:
 ```bash
 gh issue create \
   --repo <owner>/<repo> \
-  --title "<imperative verb phrase>" \
+  --title "impl: <module> — <one-line summary of what changes>" \
   --label "<feat:*>,stage/impl,P2" \
   --milestone "<milestone>" \
   --body "$(cat <<'EOF'
-## Context
-<1-2 sentences: what design doc section this implements and why it is needed>
+## Module
+`<module>` — `<primary file(s)>`
+
+## LLD Reference
+`docs/design/<milestone>/lld/<module>.md`
+The impl agent must read this document in full before writing any code.
 
 ## Acceptance Criteria
-- [ ] <concrete, testable criterion 1>
-- [ ] <concrete, testable criterion 2>
-- [ ] ...
-
-## Scope
-Files to create or modify:
-- `<path>` — <what changes>
-
-## Test Requirements
-- <what must be unit-tested>
-- <what must be integration-tested (if any)>
+- [ ] <binary, testable criterion — what "done" looks like from the outside>
+- [ ] <one criterion per observable behaviour change; 2–4 total>
+- [ ] All existing tests pass; new tests added per the LLD test strategy
 
 ## Dependencies
 <Depends on: #N, or "None">
-
-## Key Design Decisions
-<Bullet list of non-obvious decisions made by the design docs, so the impl agent
-does not re-litigate them. Reference the relevant LLD section if helpful.>
 EOF
 )"
 ```
+
+**Do not include** diffs, code snippets, test cases, or step-by-step implementation notes.
+The impl agent reads the LLD directly — the issue body is routing metadata, not a spec.
 
 Record each filed issue number for the dependency step.
 

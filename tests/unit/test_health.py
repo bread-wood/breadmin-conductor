@@ -590,80 +590,90 @@ def test_check_worktrees_warn_when_removal_fails(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_check_orphaned_issues_pass_no_issues(tmp_path: Path) -> None:
-    """Returns pass when no in-progress issues."""
-    config = make_config(tmp_path)
-    with patch("subprocess.run", return_value=_subprocess_result(returncode=0, stdout="[]")):
-        result = _check_orphaned_issues(config)
+def test_check_orphaned_issues_pass_no_github_repo(tmp_path: Path) -> None:
+    """Returns pass (skipped) when no github_repo is configured."""
+    config = make_config(tmp_path)  # no github_repo
+    result = _check_orphaned_issues(config)
     assert result.status == "pass"
+    assert "skipped" in result.message
 
 
-def test_check_orphaned_issues_pass_all_have_prs(tmp_path: Path) -> None:
-    """Returns pass when all in-progress issues have open PRs."""
-    config = make_config(tmp_path)
-    issues = json.dumps([{"number": 10, "title": "feat: thing"}])
-    prs = json.dumps([{"number": 42, "headRefName": "10-feat-thing"}])
+def test_check_orphaned_issues_pass_no_claimed_beads(tmp_path: Path) -> None:
+    """Returns pass when bead store has no claimed beads."""
+    from brimstone.beads import make_bead_store
 
-    call_count = 0
+    config = make_config(tmp_path, github_repo="owner/repo", beads_dir=tmp_path / "beads")
+    store = make_bead_store(config, "owner/repo")
+    # Write an open (not claimed) bead to confirm it isn't counted
+    from brimstone.beads import WorkBead
 
-    def side_effect(cmd, **kwargs):  # noqa: ANN001
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return _subprocess_result(returncode=0, stdout=issues)
-        return _subprocess_result(returncode=0, stdout=prs)
-
-    with patch("subprocess.run", side_effect=side_effect):
-        result = _check_orphaned_issues(config)
-    assert result.status == "pass"
-
-
-def test_check_orphaned_issues_warn_below_threshold(tmp_path: Path) -> None:
-    """Returns warn when orphaned count is at or below max_orphaned_issues."""
-    config = make_config(tmp_path, max_orphaned_issues=5)
-    issues = json.dumps([{"number": 10, "title": "feat: thing"}])
-    prs = json.dumps([])  # No open PRs → orphaned
-
-    call_count = 0
-
-    def side_effect(cmd, **kwargs):  # noqa: ANN001
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return _subprocess_result(returncode=0, stdout=issues)
-        return _subprocess_result(returncode=0, stdout=prs)
-
-    with patch("subprocess.run", side_effect=side_effect):
-        result = _check_orphaned_issues(config)
-    assert result.status == "warn"
-    assert result.remediation is not None
-
-
-def test_check_orphaned_issues_fail_above_threshold(tmp_path: Path) -> None:
-    """Returns fail when orphaned count exceeds max_orphaned_issues."""
-    config = make_config(tmp_path, max_orphaned_issues=2)
-    issues = json.dumps(
-        [
-            {"number": 10, "title": "one"},
-            {"number": 11, "title": "two"},
-            {"number": 12, "title": "three"},
-        ]
+    store.write_work_bead(
+        WorkBead(
+            v=1,
+            issue_number=1,
+            title="open issue",
+            milestone="v1",
+            stage="impl",
+            module="config",
+            priority="P2",
+            state="open",
+            branch="1-open-issue",
+        )
     )
-    prs = json.dumps([])
+    result = _check_orphaned_issues(config)
+    assert result.status == "pass"
 
-    call_count = 0
 
-    def side_effect(cmd, **kwargs):  # noqa: ANN001
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return _subprocess_result(returncode=0, stdout=issues)
-        return _subprocess_result(returncode=0, stdout=prs)
+def test_check_orphaned_issues_pass_all_have_pr_beads(tmp_path: Path) -> None:
+    """Returns pass when all claimed beads have active PR beads."""
+    from brimstone.beads import PRBead, WorkBead, make_bead_store
 
-    with patch("subprocess.run", side_effect=side_effect):
-        result = _check_orphaned_issues(config)
-    assert result.status == "fail"
-    assert "3 >" in (result.message + (result.remediation or ""))
+    config = make_config(tmp_path, github_repo="owner/repo", beads_dir=tmp_path / "beads")
+    store = make_bead_store(config, "owner/repo")
+    store.write_work_bead(
+        WorkBead(
+            v=1,
+            issue_number=10,
+            title="feat: thing",
+            milestone="v1",
+            stage="impl",
+            module="config",
+            priority="P2",
+            state="claimed",
+            branch="10-feat-thing",
+        )
+    )
+    store.write_pr_bead(
+        PRBead(v=1, pr_number=42, issue_number=10, branch="10-feat-thing", state="open")
+    )
+    result = _check_orphaned_issues(config)
+    assert result.status == "pass"
+
+
+def test_check_orphaned_issues_warn_no_pr_bead(tmp_path: Path) -> None:
+    """Returns warn when a claimed bead has no active PR bead."""
+    from brimstone.beads import WorkBead, make_bead_store
+
+    config = make_config(tmp_path, github_repo="owner/repo", beads_dir=tmp_path / "beads")
+    store = make_bead_store(config, "owner/repo")
+    store.write_work_bead(
+        WorkBead(
+            v=1,
+            issue_number=10,
+            title="feat: thing",
+            milestone="v1",
+            stage="impl",
+            module="config",
+            priority="P2",
+            state="claimed",
+            branch="10-feat-thing",
+        )
+    )
+    # No PR bead written → orphaned
+    result = _check_orphaned_issues(config)
+    assert result.status == "warn"
+    assert "#10" in result.message
+    assert result.remediation is not None
 
 
 # ---------------------------------------------------------------------------

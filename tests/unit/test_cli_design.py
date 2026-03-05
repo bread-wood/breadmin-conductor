@@ -366,12 +366,11 @@ class TestDesignWorkerPhase1:
             patch(_DESIGN_PATCHES["log_event"]),
             patch(_DESIGN_PATCHES["save_session"]),
             patch(_DESIGN_PATCHES["slugify"], return_value="design-hld-v1"),
-            # Gate 1 calls _list_open_issues_by_label for research before _classify_blocking_issues
+            # Phase 1 calls _list_open_issues_by_label once after _file_design_issue_if_missing
             patch(
                 "brimstone.cli._list_open_issues_by_label",
                 side_effect=[
-                    [],  # Gate 1: research check (classify_blocking patched → ([], []))
-                    [hld_issue],  # Phase 1: finding HLD issue
+                    [hld_issue],  # Phase 1: finding HLD issue after create
                     [lld_issue],  # Phase 2: finding LLD issues
                 ],
             ),
