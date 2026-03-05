@@ -1806,7 +1806,12 @@ def _prune_stale_dependencies(
             state = (state_result.stdout or "").strip().upper()
             if state != "CLOSED":
                 continue
-            # Remove the stale dependency from the issue body
+            # Remove from WorkBead first (bead leads GitHub)
+            _dep_bead = store.read_work_bead(issue_number)
+            if _dep_bead is not None and ref in _dep_bead.blocked_by:
+                _dep_bead.blocked_by.remove(ref)
+                store.write_work_bead(_dep_bead)
+            # Then remove the stale dependency from the issue body
             new_body = re.sub(rf"\nDepends on: #{ref}", "", body)
             _gh(
                 ["issue", "edit", str(issue_number), "--body", new_body],
@@ -1814,11 +1819,6 @@ def _prune_stale_dependencies(
                 check=False,
             )
             body = new_body  # update for subsequent iterations
-            # Remove from WorkBead
-            _dep_bead = store.read_work_bead(issue_number)
-            if _dep_bead is not None and ref in _dep_bead.blocked_by:
-                _dep_bead.blocked_by.remove(ref)
-                store.write_work_bead(_dep_bead)
             logger.log_conductor_event(
                 run_id=checkpoint.run_id,
                 phase="stall",
@@ -2611,6 +2611,12 @@ def _run_completion_gate(
                     if dry_run:
                         click.echo(f"[dry-run] Would migrate #{issue_num} to milestone '{next_ms}'")
                     else:
+                        # Update bead milestone before the GitHub API call
+                        if store is not None:
+                            _mig_bead = store.read_work_bead(issue_num)
+                            if _mig_bead is not None:
+                                _mig_bead.milestone = next_ms
+                                store.write_work_bead(_mig_bead)
                         ok = _migrate_issue_to_milestone(repo, issue_num, next_ms)
                         if ok:
                             click.echo(f"Migrated #{issue_num} to milestone '{next_ms}'")
