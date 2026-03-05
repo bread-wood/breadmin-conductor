@@ -829,13 +829,14 @@ def _resume_stale_issues(
                     _remove_worktree(wt_path, repo_root)
             handled.add(stale_number)
         elif _pr_merged_for_issue(repo, stale_number):
-            _gh(["issue", "close", str(stale_number)], repo=repo, check=False)
             if store is not None:
                 _stale_bead = store.read_work_bead(stale_number)
                 if _stale_bead is not None and _stale_bead.state not in ("closed", "abandoned"):
                     _stale_bead.state = "closed"
                     _stale_bead.closed_at = datetime.now(UTC).isoformat()
                     store.write_work_bead(_stale_bead)
+                    store.flush(f"brimstone: #{stale_number} closed — merged PR found")
+            _gh(["issue", "close", str(stale_number)], repo=repo, check=False)
             click.echo(
                 f"{log_prefix} Closed #{stale_number} — merged PR found, issue was not auto-closed",
                 err=True,
@@ -5398,6 +5399,13 @@ def _run_design_worker(
         lld_path = f"docs/design/{milestone}/lld/{module}.md"
         if _doc_exists_on_default_branch(repo, lld_path, default_branch):
             click.echo(f"LLD for {module!r} already merged — skipping")
+            if store is not None:
+                _lld_bead = store.read_work_bead(issue["number"])
+                if _lld_bead is not None and _lld_bead.state not in ("closed", "abandoned"):
+                    _lld_bead.state = "closed"
+                    _lld_bead.closed_at = datetime.now(UTC).isoformat()
+                    store.write_work_bead(_lld_bead)
+                    store.flush(f"brimstone: #{issue['number']} closed — LLD already merged")
             _gh(["issue", "close", str(issue["number"])], repo=repo, check=False)
         else:
             pending.append((module, issue))
