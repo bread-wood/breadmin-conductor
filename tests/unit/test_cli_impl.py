@@ -1858,6 +1858,300 @@ class TestWatchdogScan:
 
         mock_dispatch.assert_not_called()
 
+    def test_pre_pr_zombie_unclaims_issue(self, tmp_path: Path) -> None:
+        """A claimed bead with no pr_id, elapsed > timeout, not active → unclaimed."""
+        from datetime import UTC, datetime, timedelta
+
+        from brimstone.beads import WorkBead
+        from brimstone.cli import _watchdog_scan
+
+        old_claimed_at = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+        work_bead = WorkBead(
+            v=1,
+            issue_number=42,
+            title="Zombie pre-PR issue",
+            milestone="v0.1.0",
+            stage="impl",
+            module="cli",
+            priority="P2",
+            state="claimed",
+            branch="42-feature",
+            pr_id=None,  # no PR created yet — pre-PR zombie
+            retry_count=0,
+            claimed_at=old_claimed_at,
+            closed_at=None,
+        )
+        store = MagicMock()
+        store.list_pr_beads.return_value = []
+        store.list_work_beads.return_value = [work_bead]
+        store.read_merge_queue.return_value = MagicMock(queue=[])
+        config = make_config(log_dir=tmp_path)
+        checkpoint = make_checkpoint()
+
+        with (
+            patch("brimstone.cli._unclaim_issue") as mock_unclaim,
+            patch("brimstone.cli.logger.log_conductor_event") as mock_log,
+        ):
+            _watchdog_scan(
+                repo="owner/repo",
+                config=config,
+                checkpoint=checkpoint,
+                store=store,
+                active_issue_numbers=set(),
+                default_branch="mainline",
+            )
+
+        mock_unclaim.assert_called_once_with("owner/repo", 42, store)
+        # zombie_detected event logged with reason="pre_pr_zombie"
+        event_types = [call.kwargs.get("event_type") for call in mock_log.call_args_list]
+        assert "zombie_detected" in event_types
+        zombie_call = next(
+            c for c in mock_log.call_args_list if c.kwargs.get("event_type") == "zombie_detected"
+        )
+        assert zombie_call.kwargs["payload"]["reason"] == "pre_pr_zombie"
+
+    def test_pre_pr_zombie_active_issue_skipped(self, tmp_path: Path) -> None:
+        """A pre-PR zombie whose issue is still active is NOT unclaimed."""
+        from datetime import UTC, datetime, timedelta
+
+        from brimstone.beads import WorkBead
+        from brimstone.cli import _watchdog_scan
+
+        old_claimed_at = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+        work_bead = WorkBead(
+            v=1,
+            issue_number=42,
+            title="Active pre-PR bead",
+            milestone="v0.1.0",
+            stage="impl",
+            module="cli",
+            priority="P2",
+            state="claimed",
+            branch="42-feature",
+            pr_id=None,
+            retry_count=0,
+            claimed_at=old_claimed_at,
+            closed_at=None,
+        )
+        store = MagicMock()
+        store.list_pr_beads.return_value = []
+        store.list_work_beads.return_value = [work_bead]
+        store.read_merge_queue.return_value = MagicMock(queue=[])
+        config = make_config(log_dir=tmp_path)
+        checkpoint = make_checkpoint()
+
+        with patch("brimstone.cli._unclaim_issue") as mock_unclaim:
+            _watchdog_scan(
+                repo="owner/repo",
+                config=config,
+                checkpoint=checkpoint,
+                store=store,
+                active_issue_numbers={42},  # still active
+                default_branch="mainline",
+            )
+
+        mock_unclaim.assert_not_called()
+
+    def test_pre_pr_zombie_with_pr_id_skipped(self, tmp_path: Path) -> None:
+        """A claimed bead with pr_id set is NOT treated as a pre-PR zombie."""
+        from datetime import UTC, datetime, timedelta
+
+        from brimstone.beads import WorkBead
+        from brimstone.cli import _watchdog_scan
+
+        old_claimed_at = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+        work_bead = WorkBead(
+            v=1,
+            issue_number=42,
+            title="Has PR already",
+            milestone="v0.1.0",
+            stage="impl",
+            module="cli",
+            priority="P2",
+            state="claimed",
+            branch="42-feature",
+            pr_id="pr-99",  # already has a PR
+            retry_count=0,
+            claimed_at=old_claimed_at,
+            closed_at=None,
+        )
+        store = MagicMock()
+        store.list_pr_beads.return_value = []
+        store.list_work_beads.return_value = [work_bead]
+        store.read_merge_queue.return_value = MagicMock(queue=[])
+        config = make_config(log_dir=tmp_path)
+        checkpoint = make_checkpoint()
+
+        with patch("brimstone.cli._unclaim_issue") as mock_unclaim:
+            _watchdog_scan(
+                repo="owner/repo",
+                config=config,
+                checkpoint=checkpoint,
+                store=store,
+                active_issue_numbers=set(),
+                default_branch="mainline",
+            )
+
+        mock_unclaim.assert_not_called()
+
+    def test_conflict_state_resets_to_open(self, tmp_path: Path) -> None:
+        """A PRBead with state='conflict' is reset to open, not dispatched."""
+        from brimstone.beads import PRBead
+        from brimstone.cli import _watchdog_scan
+
+        pr_bead = PRBead(
+            v=1,
+            pr_number=77,
+            issue_number=7,
+            branch="7-feature",
+            state="conflict",
+            ci_state=None,
+            conflict_state="rebase_failed",
+            fix_attempts=2,
+            feedback=[],
+            created_at="2026-03-04T00:00:00+00:00",
+            merged_at=None,
+        )
+        work_bead = self._make_work_bead(issue_number=7)
+        store = MagicMock()
+        store.list_pr_beads.return_value = [pr_bead]
+        store.read_work_bead.return_value = work_bead
+        store.list_work_beads.return_value = []
+        store.read_merge_queue.return_value = MagicMock(queue=[])
+        config = make_config(log_dir=tmp_path)
+        checkpoint = make_checkpoint()
+
+        with (
+            patch("brimstone.cli._dispatch_recovery_agent") as mock_dispatch,
+            patch("brimstone.cli._exhaust_issue") as mock_exhaust,
+            patch("brimstone.cli.logger.log_conductor_event") as mock_log,
+        ):
+            _watchdog_scan(
+                repo="owner/repo",
+                config=config,
+                checkpoint=checkpoint,
+                store=store,
+                active_issue_numbers=set(),
+                default_branch="mainline",
+            )
+
+        # Recovery agent must NOT be dispatched
+        mock_dispatch.assert_not_called()
+        mock_exhaust.assert_not_called()
+
+        # PRBead must be reset to open with fix_attempts=0
+        store.write_pr_bead.assert_called_once()
+        written_bead = store.write_pr_bead.call_args[0][0]
+        assert written_bead.state == "open"
+        assert written_bead.fix_attempts == 0
+
+        # conflict_reset event logged
+        event_types = [call.kwargs.get("event_type") for call in mock_log.call_args_list]
+        assert "conflict_reset" in event_types
+
+    def test_merge_queue_stuck_escalates(self, tmp_path: Path) -> None:
+        """When the merge queue head is stale, a human_escalate event is logged."""
+        from datetime import UTC, datetime, timedelta
+
+        from brimstone.beads import MergeQueue, MergeQueueEntry
+        from brimstone.cli import _watchdog_scan
+
+        old_enqueued_at = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+        entry = MergeQueueEntry(
+            pr_number=88,
+            issue_number=9,
+            branch="9-feature",
+            enqueued_at=old_enqueued_at,
+        )
+        queue = MergeQueue(v=1, queue=[entry])
+
+        store = MagicMock()
+        store.list_pr_beads.return_value = []
+        store.list_work_beads.return_value = []
+        store.read_merge_queue.return_value = queue
+        config = make_config(log_dir=tmp_path)
+        checkpoint = make_checkpoint()
+
+        with patch("brimstone.cli.logger.log_conductor_event") as mock_log:
+            _watchdog_scan(
+                repo="owner/repo",
+                config=config,
+                checkpoint=checkpoint,
+                store=store,
+                active_issue_numbers=set(),
+                default_branch="mainline",
+            )
+
+        event_types = [call.kwargs.get("event_type") for call in mock_log.call_args_list]
+        assert "human_escalate" in event_types
+        escalate_call = next(
+            c for c in mock_log.call_args_list if c.kwargs.get("event_type") == "human_escalate"
+        )
+        assert escalate_call.kwargs["payload"]["reason"] == "merge queue head stuck"
+        assert escalate_call.kwargs["payload"]["pr_number"] == 88
+        assert escalate_call.kwargs["payload"]["issue_number"] == 9
+
+    def test_merge_queue_recent_no_escalation(self, tmp_path: Path) -> None:
+        """A recently enqueued merge queue entry does NOT trigger escalation."""
+        from datetime import UTC, datetime, timedelta
+
+        from brimstone.beads import MergeQueue, MergeQueueEntry
+        from brimstone.cli import _watchdog_scan
+
+        recent_enqueued_at = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+        entry = MergeQueueEntry(
+            pr_number=88,
+            issue_number=9,
+            branch="9-feature",
+            enqueued_at=recent_enqueued_at,
+        )
+        queue = MergeQueue(v=1, queue=[entry])
+
+        store = MagicMock()
+        store.list_pr_beads.return_value = []
+        store.list_work_beads.return_value = []
+        store.read_merge_queue.return_value = queue
+        config = make_config(log_dir=tmp_path)
+        checkpoint = make_checkpoint()
+
+        with patch("brimstone.cli.logger.log_conductor_event") as mock_log:
+            _watchdog_scan(
+                repo="owner/repo",
+                config=config,
+                checkpoint=checkpoint,
+                store=store,
+                active_issue_numbers=set(),
+                default_branch="mainline",
+            )
+
+        event_types = [call.kwargs.get("event_type") for call in mock_log.call_args_list]
+        assert "human_escalate" not in event_types
+
+    def test_merge_queue_empty_no_escalation(self, tmp_path: Path) -> None:
+        """An empty merge queue does not trigger escalation."""
+        from brimstone.beads import MergeQueue
+        from brimstone.cli import _watchdog_scan
+
+        store = MagicMock()
+        store.list_pr_beads.return_value = []
+        store.list_work_beads.return_value = []
+        store.read_merge_queue.return_value = MergeQueue(v=1, queue=[])
+        config = make_config(log_dir=tmp_path)
+        checkpoint = make_checkpoint()
+
+        with patch("brimstone.cli.logger.log_conductor_event") as mock_log:
+            _watchdog_scan(
+                repo="owner/repo",
+                config=config,
+                checkpoint=checkpoint,
+                store=store,
+                active_issue_numbers=set(),
+                default_branch="mainline",
+            )
+
+        event_types = [call.kwargs.get("event_type") for call in mock_log.call_args_list]
+        assert "human_escalate" not in event_types
+
 
 # ---------------------------------------------------------------------------
 # End-of-run cost summary

@@ -3294,9 +3294,17 @@ def _watchdog_scan(
     than :data:`WATCHDOG_TIMEOUT_MINUTES` whose ``issue_number`` is NOT in the
     set of currently-active futures.
 
-    For each zombie:
-    - If ``pr_bead.fix_attempts >= WATCHDOG_MAX_FIX_ATTEMPTS``: exhaust the issue.
-    - Otherwise: dispatch a recovery agent via :func:`_dispatch_recovery_agent`.
+    Three scan passes are performed:
+
+    1. **PRBead zombies** — claimed beads that have a PR but the agent is gone.
+       If ``pr_bead.state == "conflict"``, reset to open for ``_resume_stale_issues``
+       to retry.  Otherwise, dispatch a recovery agent or exhaust the issue.
+
+    2. **Pre-PR zombies** — claimed beads that never created a PR.  These are
+       unclaimed so the scheduler can re-queue the issue.
+
+    3. **Stuck merge queue** — escalate to a human if the queue head has not
+       advanced within :data:`WATCHDOG_TIMEOUT_MINUTES`.
 
     Args:
         repo:                 Repository in ``owner/repo`` format.
@@ -3335,11 +3343,82 @@ def _watchdog_scan(
             log_dir=config.log_dir.expanduser(),
         )
 
+        # Gap 2 — Conflict state mismatch: reset instead of dispatching a
+        # recovery agent.  _resume_stale_issues will pick this up and retry
+        # conflict resolution correctly.
+        if pr_bead.state == "conflict":
+            pr_bead.fix_attempts = 0
+            pr_bead.state = "open"
+            store.write_pr_bead(pr_bead)
+            logger.log_conductor_event(
+                run_id=checkpoint.run_id,
+                phase="watchdog",
+                event_type="conflict_reset",
+                payload={
+                    "issue_number": pr_bead.issue_number,
+                    "pr_number": pr_bead.pr_number,
+                },
+                log_dir=config.log_dir.expanduser(),
+            )
+            continue
+
         if pr_bead.fix_attempts >= WATCHDOG_MAX_FIX_ATTEMPTS:
             reason = f"watchdog: max fix attempts ({WATCHDOG_MAX_FIX_ATTEMPTS}) exceeded"
             _exhaust_issue(repo, pr_bead.issue_number, reason, store)
         else:
             _dispatch_recovery_agent(pr_bead, work_bead, repo, config, checkpoint, store)
+
+    # Gap 1 — Pre-PR zombies: claimed beads that never created a PR.
+    # These agents died before opening a PR, so there is no PRBead to scan
+    # above.  Unclaim the issue so the scheduler can re-queue it.
+    for work_bead in store.list_work_beads(state="claimed"):
+        if work_bead.issue_number in active_issue_numbers:
+            continue
+        if work_bead.pr_id is not None:
+            continue  # has a PR — already covered by the PRBead loop above
+        if not work_bead.claimed_at:
+            continue
+        claimed_dt = datetime.fromisoformat(work_bead.claimed_at)
+        elapsed_min = (datetime.now(UTC) - claimed_dt).total_seconds() / 60
+        if elapsed_min < WATCHDOG_TIMEOUT_MINUTES:
+            continue
+
+        logger.log_conductor_event(
+            run_id=checkpoint.run_id,
+            phase="watchdog",
+            event_type="zombie_detected",
+            payload={
+                "issue_number": work_bead.issue_number,
+                "pr_number": None,
+                "elapsed_minutes": round(elapsed_min, 1),
+                "reason": "pre_pr_zombie",
+            },
+            log_dir=config.log_dir.expanduser(),
+        )
+        _unclaim_issue(repo, work_bead.issue_number, store)
+
+    # Gap 3 — Stuck merge queue: escalate if the head entry has not advanced
+    # within WATCHDOG_TIMEOUT_MINUTES.
+    queue = store.read_merge_queue()
+    if queue.queue:
+        try:
+            oldest_dt = datetime.fromisoformat(queue.queue[0].enqueued_at)
+            stuck_min = (datetime.now(UTC) - oldest_dt).total_seconds() / 60
+            if stuck_min > WATCHDOG_TIMEOUT_MINUTES:
+                logger.log_conductor_event(
+                    run_id=checkpoint.run_id,
+                    phase="watchdog",
+                    event_type="human_escalate",
+                    payload={
+                        "reason": "merge queue head stuck",
+                        "pr_number": queue.queue[0].pr_number,
+                        "issue_number": queue.queue[0].issue_number,
+                        "stuck_minutes": round(stuck_min, 1),
+                    },
+                    log_dir=config.log_dir.expanduser(),
+                )
+        except (ValueError, AttributeError, TypeError):
+            pass
 
 
 def _create_worktree(branch: str, repo_root: str, default_branch: str = "main") -> str | None:
