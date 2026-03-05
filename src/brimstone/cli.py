@@ -1153,6 +1153,27 @@ def _extract_module_from_design_issue(issue: dict[str, Any]) -> str:
     return _slugify(title)
 
 
+def _parse_modules_from_hld(repo: str, hld_path: str, default_branch: str) -> list[str]:
+    """Return module names parsed from ``### Module: <name>`` headings in the HLD.
+
+    Fetches the HLD from GitHub and extracts every ``### Module: <name>`` line.
+    Returns an empty list if the doc cannot be fetched or has no module headings.
+    """
+    import base64
+
+    result = _gh(
+        ["api", f"repos/{repo}/contents/{hld_path}?ref={default_branch}"],
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    try:
+        content = base64.b64decode(json.loads(result.stdout)["content"]).decode()
+    except (json.JSONDecodeError, KeyError, Exception):
+        return []
+    return re.findall(r"^###\s+Module:\s+(.+)$", content, re.MULTILINE)
+
+
 def _parse_dependencies(body: str) -> list[int]:
     """Parse ``Depends on: #N`` references from an issue body.
 
@@ -4834,15 +4855,50 @@ def _run_design_worker(
         click.echo(f"[dry-run] Would dispatch LLD agents in parallel for milestone {milestone!r}")
         return
 
-    # LLD issues were filed by the HLD agent; pick up all open ones
+    # LLD issues were filed by the HLD agent; pick up all open ones.
+    # Self-heal: compare open issues against modules declared in the HLD and
+    # create any that are missing — handles both the "none filed" case and the
+    # "some but not all filed" partial case.
     all_design_issues = _list_open_issues_by_label(repo, milestone, DESIGN_LABEL)
     lld_issues = [i for i in all_design_issues if i["title"] != hld_issue_title]
 
+    modules_from_hld = _parse_modules_from_hld(repo, hld_doc_path, default_branch)
+    if modules_from_hld:
+        filed_titles = {i["title"] for i in lld_issues}
+        missing = [m for m in modules_from_hld if f"Design: LLD for {m}" not in filed_titles]
+        if missing:
+            click.echo(
+                f"[design-worker] Self-healing: filing {len(missing)} missing LLD issue(s): "
+                + ", ".join(missing),
+                err=True,
+            )
+            for module in missing:
+                _file_design_issue_if_missing(
+                    repo,
+                    milestone,
+                    f"Design: LLD for {module}",
+                    (
+                        f"## Deliverable\n"
+                        f"`docs/design/{milestone}/lld/{module}.md`\n\n"
+                        f"## Inputs\n"
+                        f"- HLD: `docs/design/{milestone}/HLD.md`\n"
+                        f"- Research docs: `docs/research/{milestone}/`\n\n"
+                        f"## Acceptance Criteria\n"
+                        f"The LLD must cover: data structures, key algorithms, "
+                        f"public API/interfaces, error handling, and test strategy "
+                        f"for this module."
+                    ),
+                )
+            # Re-seed beads and re-fetch to include newly created issues
+            if store is not None:
+                _seed_work_beads(repo, milestone, DESIGN_LABEL, "design", store)
+            all_design_issues = _list_open_issues_by_label(repo, milestone, DESIGN_LABEL)
+            lld_issues = [i for i in all_design_issues if i["title"] != hld_issue_title]
+
     if not lld_issues:
         click.echo(
-            "No open LLD design issues found. "
-            "The HLD agent should have filed them. "
-            "Check the HLD doc and file 'Design: LLD for <module>' issues manually.",
+            f"Error: No LLD issues found and could not parse modules from {hld_doc_path!r}. "
+            "File LLD issues manually.",
             err=True,
         )
         raise SystemExit(1)
